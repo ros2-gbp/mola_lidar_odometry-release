@@ -29,16 +29,13 @@
  */
 #pragma once
 
-// Uncomment after ROS release cycle
-//#define HAVE_MOLA_KERNEL_RELOCALIZE_API
-
 // MOLA interfaces:
 #include <mola_kernel/interfaces/FrontEndBase.h>
 #include <mola_kernel/interfaces/LocalizationSourceBase.h>
+#include <mola_kernel/interfaces/MapServer.h>
 #include <mola_kernel/interfaces/MapSourceBase.h>
-#ifdef HAVE_MOLA_KERNEL_RELOCALIZE_API
 #include <mola_kernel/interfaces/Relocalization.h>
-#endif
+#include <mola_kernel/version.h>
 
 // Other packages:
 #include <mola_navstate_fuse/NavStateFuse.h>
@@ -76,11 +73,9 @@ namespace mola
  */
 class LidarOdometry : public mola::FrontEndBase,
                       public mola::LocalizationSourceBase,
-                      public mola::MapSourceBase
-#ifdef HAVE_MOLA_KERNEL_RELOCALIZE_API
-,
+                      public mola::MapSourceBase,
+                      public mola::MapServer,
                       public mola::Relocalization
-#endif
 {
   DEFINE_MRPT_OBJECT(LidarOdometry, mola)
 
@@ -110,7 +105,8 @@ public:
   enum class InitLocalization : uint8_t
   {
     FixedPose = 0,
-    FromGNSS
+    FromGNSS_Static,
+    FromGNSS_Motion,
   };
 
   struct Parameters : public mp2p_icp::Parameterizable
@@ -230,6 +226,8 @@ public:
     {
       int map_update_decimation = 10;
       bool show_trajectory = true;
+      bool show_ground_grid = true;
+      float ground_grid_spacing = 5.0f;
       bool show_current_observation = true;
       double current_pose_corner_size = 1.5;  //! [m]
       float local_map_point_size = 3.0f;
@@ -372,6 +370,10 @@ public:
       InitLocalization method = InitLocalization::FixedPose;
 
       mrpt::math::TPose3D fixed_initial_pose;
+      std::optional<mrpt::math::CMatrixDouble66> initial_pose_cov;
+
+      // Right after a re-localization, do not update the pose state estimator for a few iterations
+      uint32_t additional_uncertainty_after_reloc_how_many_timesteps = 5;
 
       void initialize(const Yaml & c);
     };
@@ -409,6 +411,14 @@ public:
      */
   mrpt::poses::CPose3DInterpolator estimatedTrajectory() const;
 
+  /** Returns the last estimated kinematic state: pose of the vehicle in the LiDAR odometry
+   *  frame, and its estimated local (body-frame) twist vector.
+   *  This method will block if LO is running in another thread, until it is safe to get the data.
+   *  It will return std::nullopt if pose information is not available yet, e.g. still initializing.
+   */
+  std::optional<std::tuple<mrpt::poses::CPose3DPDFGaussian, mrpt::math::TTwist3D>>
+  lastEstimatedState() const;
+
   /** Returns a copy of the estimated simplemap.
      * Multi-thread safe to call.
      */
@@ -427,7 +437,6 @@ public:
 
   /** @} */
 
-#ifdef HAVE_MOLA_KERNEL_RELOCALIZE_API
   /** @name Virtual interface of Relocalization
      *{ */
 
@@ -443,7 +452,36 @@ public:
   void relocalize_from_gnss() override;
 
   /** @} */
+
+  /** @name Virtual interface of MapServer
+     *{ */
+
+  /** Loads a map from file(s) and sets it as active current map.
+     * Different implementations may use one or more files to store map as
+     * files.
+     *
+     *  \param[in] path File name(s) prefix for the map to load. Do not add file
+     * extension.
+     */
+  MapServer::ReturnStatus map_load(const std::string & path) override;
+
+  /** Saves a map from file(s) and sets it as active current map.
+     * Different implementations may use one or more files to store map as
+     * files.
+     *
+     *  \param[in] path File name(s) prefix for the map to save. Do not add file
+     * extension.
+     */
+  MapServer::ReturnStatus map_save(const std::string & path) override;
+
+  /** @} */
+
+protected:
+#if MOLA_VERSION_CHECK(1, 4, 0)  // Parameters added in MOLA v1.4.0
+  // See docs in base class.
+  void onParameterUpdate(const mrpt::containers::yaml & names_values) override;
 #endif
+  void onExposeParameters();  // called after initialization
 
 private:
   const std::string NAVSTATE_LIODOM_FRAME = "liodom";
@@ -534,6 +572,9 @@ private:
     /// To update the map in the viz only if really needed
     bool local_map_needs_viz_update = true;
 
+    /// To handle post-re-localization. >0 means we are "recovering" from a request to re-localize:
+    uint32_t step_counter_post_relocalization = 0;
+
     // GNSS: keep a list of recent observations to later on search the one
     // closest to each LIDAR observation:
     std::map<mrpt::Clock::time_point, std::shared_ptr<mrpt::obs::CObservationGPS>> last_gnss_;
@@ -571,6 +612,9 @@ private:
     nanogui::Label * lbSensorRange = nullptr;
     nanogui::Label * lbTime = nullptr;
     nanogui::Label * lbSpeed = nullptr;
+    nanogui::CheckBox * cbActive = nullptr;
+    nanogui::CheckBox * cbMapping = nullptr;
+    nanogui::CheckBox * cbSaveSimplemap = nullptr;
   };
 
   StateUI gui_;
