@@ -11,15 +11,16 @@ modules:
   # =====================
   - name: viz
     type: mola::MolaViz
-    #verbosity_level: DEBUG
+    enabled: ${MOLA_WITH_GUI|true}
+    verbosity_level: '${MOLA_VERBOSITY_MOLA_VIZ|INFO}'
     params: ~ # none
 
   # =====================
   # LidarOdometry
   # =====================
-  - name: icp_odom
+  - name: lidar_odom
     type: mola::LidarOdometry
-    #verbosity_level: DEBUG
+    verbosity_level: '${MOLA_VERBOSITY_MOLA_LO|INFO}'
     raw_data_source: 'ros2_bridge'
     # This includes here a whole block "params: (...)"
     # with the LIDAR-Odometry pipeline configuration:
@@ -30,16 +31,17 @@ modules:
   # =====================
   - type: mola::BridgeROS2
     name: ros2_bridge
+    verbosity_level: '${MOLA_VERBOSITY_BRIDGE_ROS2|INFO}'
     # In BridgeROS2, this execution rate (Hz) determines the
     # rate of publishing odometry observations, if enabled.
     # All other subscribed sensors are forwarded to the MOLA
     # system without delay as they are received from ROS.
     execution_rate: 20 # Hz
-    #verbosity_level: INFO
 
     gui_preview_sensors:
       - raw_sensor_label: ${MOLA_LIDAR_NAME|lidar}
         decimation: 1
+        enabled: ${MOLA_WITH_GUI|true}
         win_pos: 5 5 400 400
 
     params:
@@ -58,6 +60,11 @@ modules:
       # do not publish to /tf from ground_truth, if available
       publish_tf_from_robot_pose_observations: false
 
+      # If not empty, this defines a topic name (type: geometry_msgs/PoseWithCovarianceStamped)
+      # to subscribe to. Each received message will map to requests to re-localize to MOLA modules
+      # in the system implementing `mola::Relocalization`:
+      relocalize_from_topic: '/initialpose'
+
       # Everything published to ROS2 will have timestamps from:
       #  - true: the original dataset timestamps.
       #  - false: the wall-clock time.
@@ -69,21 +76,32 @@ modules:
       # Period [s] to publish the updated map to ROS2 from the MOLA SLAM solution:
       period_publish_new_map: 3.0 # [s]
 
+      # A placeholder for optional flags from "ros2 launch", captured
+      # as all cli arguments after "--ros-args":
+      ros_args: '${ROS_ARGS|"[]"}'
+
       # ROS2 topics to be forwarded to the MOLA system:
       subscribe:
         - topic: ${MOLA_LIDAR_TOPIC|/ouster/points}
           msg_type: PointCloud2
           output_sensor_label: ${MOLA_LIDAR_NAME|lidar}
           # If present, this will override whatever /tf tells about the sensor pose:
-          fixed_sensor_pose: "0 0 0 0 0 0"  # 'x y z yaw_deg pitch_deg roll_deg''
+          fixed_sensor_pose: "${LIDAR_POSE_X|0} ${LIDAR_POSE_Y|0} ${LIDAR_POSE_Z|0} ${LIDAR_POSE_YAW|0} ${LIDAR_POSE_PITCH|0} ${LIDAR_POSE_ROLL|0}"  # 'x y z yaw_deg pitch_deg roll_deg''
           use_fixed_sensor_pose: ${MOLA_USE_FIXED_LIDAR_POSE|false}
 
         - topic: ${MOLA_GNSS_TOPIC|/gps}
           msg_type: NavSatFix
           output_sensor_label: 'gps'
           # If present, this will override whatever /tf tells about the sensor pose:
-          fixed_sensor_pose: "0 0 0 0 0 0"  # 'x y z yaw_deg pitch_deg roll_deg''
+          fixed_sensor_pose: "${GNSS_POSE_X|0} ${GNSS_POSE_Y|0} ${GNSS_POSE_Z|0} ${GNSS_POSE_YAW|0} ${GNSS_POSE_PITCH|0} ${GNSS_POSE_ROLL|0}"  # 'x y z yaw_deg pitch_deg roll_deg''
           use_fixed_sensor_pose: ${MOLA_USE_FIXED_GNSS_POSE|true}
+
+        - topic: ${MOLA_IMU_TOPIC|/imu}
+          msg_type: Imu
+          output_sensor_label: 'imu'
+          # If present, this will override whatever /tf tells about the sensor pose:
+          fixed_sensor_pose: "${IMU_POSE_X|0} ${IMU_POSE_Y|0} ${IMU_POSE_Z|0} ${IMU_POSE_YAW|0} ${IMU_POSE_PITCH|0} ${IMU_POSE_ROLL|0}"  # 'x y z yaw_deg pitch_deg roll_deg''
+          use_fixed_sensor_pose: ${MOLA_USE_FIXED_IMU_POSE|true}
 
         #- topic: /odom
         #  msg_type: Odometry

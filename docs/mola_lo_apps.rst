@@ -57,6 +57,8 @@ The labeled parts in the GUI are:
 
 |
 
+.. _mola-lo-gui-kitti:
+
 1.1. mola-lo-gui-kitti
 ------------------------------
 Runs MOLA-LO on a sequence of the KITTI odometry dataset :cite:`geiger2013vision`.
@@ -103,15 +105,61 @@ Runs MOLA-LO on a sequence of the KITTI odometry dataset :cite:`geiger2013vision
 
 1.2. mola-lo-gui-kitti360
 ------------------------------
-xxx
+Runs MOLA-LO on a sequence of the KITTI-360 dataset.
 
 
 |
 
 
+.. _mola_lo_gui_mulran:
+
+
 1.3. mola-lo-gui-mulran
 ------------------------------
-xxx
+Runs MOLA-LO on a sequence of the Mulran dataset.
+
+.. dropdown:: How to run it
+   :icon: checklist
+
+    - Download the MulRan dataset (:cite:`gskim-2020-mulran`) from their `website <https://sites.google.com/view/mulran-pr/>`_,
+      and extract the files anywhere in your system such as the files layout is as expected by :ref:`mola::MulranDataset <doxid-classmola_1_1_mulran_dataset>`.
+
+    - Set the environment variable ``MULRAN_BASE_DIR`` to the root directory of your dataset, for example: 
+
+    .. code-block:: bash
+
+        export MULRAN_BASE_DIR=/home/myuser/mulran/
+
+    - And run it for the desired sequence:
+
+    .. code-block:: bash
+
+        # mola-lo-gui-mulran SEQUENCE
+        # SEQUENCE: KAIST01, KAIST02,..., DCC03,...
+        
+        # Example:
+        mola-lo-gui-mulran KAIST01
+
+        # Example using the 3D-NDT alternative pipeline:
+        PIPELINE_YAML=$(ros2 pkg prefix mola_lidar_odometry)/share/mola_lidar_odometry/pipelines/lidar3d-ndt.yaml \
+        MOLA_LOCAL_VOXELMAP_RESOLUTION=5.0 \
+        mola-lo-gui-mulran KAIST01
+
+.. raw:: html
+
+   <div style="width: 100%; overflow: hidden;">
+     <video controls autoplay loop muted style="width: 100%;">
+       <source src="https://mrpt.github.io/videos/mola-slam-mulran-demo-ndt.mp4" type="video/mp4">
+     </video>
+   </div>
+
+
+
+.. dropdown:: Inner workings
+   :icon: light-bulb
+
+   - mola-cli launch file: `mola-cli-launchs/lidar_odometry_from_mulran.yaml <https://github.com/MOLAorg/mola_lidar_odometry/blob/develop/mola-cli-launchs/lidar_odometry_from_mulran.yaml>`_
+   - Dataset C++ MOLA module: :ref:`mola::MulranDataset <doxid-classmola_1_1_mulran_dataset>`
 
 
 |
@@ -119,7 +167,25 @@ xxx
 
 1.4. mola-lo-gui-rawlog
 ------------------------------
-xxx
+This command will open the mola_viz GUI and build a map from dataset stored as a ``.rawlog`` file.
+
+Environment variables specific for ``mola-lo-gui-rawlog``:
+
+.. dropdown:: See complete mola launch YAML listing
+    :icon: code-review
+
+    File: `mola-cli-launchs/lidar_odometry_from_rawlog.yaml <https://github.com/MOLAorg/mola_lidar_odometry/blob/develop/mola-cli-launchs/lidar_odometry_from_rawlog.yaml>`_
+
+    .. literalinclude:: ../../../mola_lidar_odometry/mola-cli-launchs/lidar_odometry_from_rawlog.yaml
+       :language: yaml
+
+|
+
+- ``MOLA_TIME_WARP`` (Default: 1.0): Time wrapping for rosbag replay.
+
+- ``MOLA_DATASET_START_PAUSED`` (Default: false): Start with replay paused. Then can be resumed from the GUI.
+
+- ``MOLA_INPUT_RAWLOG_READ_ALL_FIRST`` (Default: ``false``): Set to ``true`` to load the whole .rawlog file at start up, enabling the use of the dataset timeline slider in the UI.
 
 
 |
@@ -174,7 +240,7 @@ Environment variables specific for ``mola-lo-gui-rosbag2``:
 
 - ``MOLA_DATASET_START_PAUSED`` (Default: false): Start with replay paused. Then can be resumed from the GUI.
 
-- ``MOLA_TF_BASE_FOOTPRINT`` (Default: ``base_link``): Set to something else if your ``/tf`` tree does not have a ``base_link`` frame.
+Also, see :ref:`variables to control sensor inputs <mola_lo_ros_mola-cli-env-vars>`.
 
 
 |
@@ -184,8 +250,9 @@ Environment variables specific for ``mola-lo-gui-rosbag2``:
 1.6. Common env variables
 ------------------------------
 
-- ``MOLA_ODOMETRY_PIPELINE_YAML`` (Default: full path to installed ``lidar3d-default.yaml``): Can be set to override
+- ``PIPELINE_YAML`` (Default: full path to installed ``lidar3d-default.yaml``): Can be set to override
   the default pipeline and experiment with custom MOLA-LO systems described through a modified YAML file.
+  Example: see the example for :ref:`mola-lo-gui-mulran <mola_lo_gui_mulran>`.
 
 
 |
@@ -241,6 +308,17 @@ Process a ROS 2 bag
         MOLA_USE_FIXED_LIDAR_POSE=true \
         mola-lidar-odometry-cli \
           [...]  # the rest does not change.
+
+    If you forget adding this flag, tons of errors like this will show up:
+
+    .. code-block:: bash
+
+        [ERROR|mola::Rosbag2Dataset:dataset_input] findOutSensorPose (label='lidar', hesai_lidar<-base_link): "base_link" passed to lookupTransform argument target_frame does not exist. 
+        [ERROR|mola::Rosbag2Dataset:dataset_input] Exception while processing topic message (ignore if the error stops later one, e.g. missing /tf):
+        ==== MRPT exception ====
+        Message:  Assert condition failed: sensorPoseOK
+
+
 
 .. dropdown:: Want to visualize the output in real-time?
     :icon: light-bulb
@@ -299,10 +377,10 @@ Then, set the ``KITTI_BASE_DIR`` environment variable and launch the desired seq
                                     <Number of dataset entries to skip>]
                                     [--only-first-n <Number of dataset entries to
                                     run>] [--output-simplemap
-                                    <output-map.simplemap>] [--output-tum-path
+                                    <output-map.simplemap>] [--output-twist
+                                    <output-twist.txt>] [--output-tum-path
                                     <output-trajectory.txt>] [-l <foobar.so>] [-v
                                     <INFO>] -c <demo.yml> [--] [--version] [-h]
-
 
         Where: 
 
@@ -341,6 +419,9 @@ Then, set the ``KITTI_BASE_DIR`` environment variable and launch the desired seq
 
         --output-simplemap <output-map.simplemap>
             Enables building and saving the simplemap for the mapping session
+
+        --output-twist <output-twist.txt>
+            Save the estimated twist as a TXT file
 
         --output-tum-path <output-trajectory.txt>
             Save the estimated path as a TXT file using the TUM file format (see
@@ -384,8 +465,13 @@ are already working and publishing ROS topics.
     (for example, if you only launched the LiDAR driver node) you must then set the environment variable ``MOLA_USE_FIXED_LIDAR_POSE=true``
     to use the default (identity) sensor pose on the vehicle.
 
+3.1. ROS 2 launch file: live LiDAR odometry
+--------------------------------------------------
+It is documented :ref:`here <ros2_node_lo_docs>`.
 
-3.1. ROS 2 launch file: LiDAR odometry for KITTI
+|
+
+3.2. ROS 2 launch file: LiDAR odometry for KITTI
 --------------------------------------------------
 
 This demo launch file (`view sources <https://github.com/MOLAorg/mola_lidar_odometry/blob/develop/ros2-launchs/ros2-lidar-odometry-kitti.launch.py>`_)
@@ -417,39 +503,6 @@ runs **MOLA-LO** on a sequence of the KITTI odometry dataset :cite:`geiger2013vi
 
 |
 
-3.2. ROS 2 launch file: live LiDAR odometry
---------------------------------------------------
-
-This launch file (`view sources <https://github.com/MOLAorg/mola_lidar_odometry/blob/develop/ros2-launchs/ros2-lidar-odometry.launch.py>`_)
-runs **MOLA-LO** live on point clouds received from a ROS 2 topic, **demonstrating a few features**:
-
-* Launching and visualizing LO in both, ``mola_viz`` and ``RViz2`` (or use FoxGlove if preferred).
-* How MOLA ``mola_lidar_odometry``publishes the local map,
-  the estimated trajectory, and `/tf` for the estimated odometry.
-
-.. image:: https://mrpt.github.io/imgs/mola-lo-ros2-launch-demo-live-forest.png
-
-.. dropdown:: How to run it
-   :icon: checklist
-
-   .. code-block:: bash
-
-      # Basic usage (requires correct LiDAR sensor /tf):
-      ros2 launch mola_lidar_odometry ros2-lidar-odometry.launch.py \
-        lidar_topic_name:=/ouster/points
-
-      # Usage without sensor /tf:
-      ros2 launch mola_lidar_odometry ros2-lidar-odometry.launch.py \
-        lidar_topic_name:=/ouster/points \
-        ignore_lidar_pose_from_tf:=True
-
-.. dropdown:: More parameters
-    :icon: list-unordered
-
-    The ``lidar3d-default.yaml`` pipeline file defines plenty of :ref:`additional parameters and options <mola_3d_default_pipeline>` that you can explore.
-
-
-|
 
 .. _mola_lo_ros1:
 
@@ -459,11 +512,5 @@ runs **MOLA-LO** live on point clouds received from a ROS 2 topic, **demonstrati
 ROS 1 bags are not directly supported by MOLA-LO. However, given the large amount of public datasets
 already published in this format, we provide two pathways to parse them.
 
-4.1. Porting to ROS 2 bags
----------------------------------
-Write me!
-
-
-4.2. Converting to MRPT rawlog
----------------------------------
-Write me!
+- Porting to ROS 2 bags:  :ref:`ros1_to_ros2`.
+- Converting to MRPT rawlog: :ref:`rosbag2rawlog`
