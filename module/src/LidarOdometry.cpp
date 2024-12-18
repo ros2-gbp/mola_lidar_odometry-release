@@ -51,6 +51,7 @@
 #include <mrpt/obs/CObservationPointCloud.h>
 #include <mrpt/obs/CRawlog.h>
 #include <mrpt/opengl/CAssimpModel.h>
+#include <mrpt/opengl/CGridPlaneXY.h>
 #include <mrpt/opengl/COpenGLScene.h>
 #include <mrpt/opengl/CText.h>
 #include <mrpt/opengl/stock_objects.h>
@@ -136,6 +137,8 @@ void LidarOdometry::Parameters::Visualization::initialize(const Yaml & cfg)
   YAML_LOAD_OPT(map_update_decimation, int);
   YAML_LOAD_OPT(show_trajectory, bool);
   YAML_LOAD_OPT(show_current_observation, bool);
+  YAML_LOAD_OPT(show_ground_grid, bool);
+  YAML_LOAD_OPT(ground_grid_spacing, float);
   YAML_LOAD_OPT(show_console_messages, bool);
   YAML_LOAD_OPT(current_pose_corner_size, double);
   YAML_LOAD_OPT(local_map_point_size, float);
@@ -221,6 +224,9 @@ void LidarOdometry::Parameters::TraceOutputOptions::initialize(const Yaml & cfg)
 void LidarOdometry::Parameters::InitialLocalizationOptions::initialize(const Yaml & cfg)
 {
   YAML_LOAD_OPT(enabled, bool);
+
+  YAML_LOAD_OPT(additional_uncertainty_after_reloc_how_many_timesteps, uint32_t);
+
   // TODO(jlbc): define enum "method"
 
   if (cfg.has("fixed_initial_pose")) {
@@ -476,8 +482,12 @@ void LidarOdometry::initialize_frontend(const Yaml & c)
   state_.initialized = true;
   state_.active = params_.start_active;
 
+  // Make runtime params exposed:
+  onExposeParameters();
+
   MRPT_TRY_END
 }
+
 void LidarOdometry::spinOnce()
 {
   MRPT_TRY_START
@@ -737,10 +747,10 @@ void LidarOdometry::onLidarImpl(const CObservation::Ptr & obs)
 
   tle1b.stop();
 
-  profiler_.enter("onLidar.2.copy_vars");
-
   // Update sensor max range from the obs map layers:
   doUpdateEstimatedMaxSensorRange(*observation);
+
+  profiler_.enter("onLidar.2.copy_vars");
 
   // check observation validity:
   if (bool obsValid = doCheckIsValidObservation(*observation); !obsValid) {
@@ -774,10 +784,16 @@ void LidarOdometry::onLidarImpl(const CObservation::Ptr & obs)
   }
 
   // Handle initial localization options:
-  if (params_.initial_localization.enabled && !state_.initial_localization_done) {
+  if (auto & il = params_.initial_localization; il.enabled && !state_.initial_localization_done) {
     mrpt::poses::CPose3DPDFGaussian initPose;
-    initPose.mean = mrpt::poses::CPose3D(params_.initial_localization.fixed_initial_pose);
-    initPose.cov.setDiagonal(1e-12);
+    initPose.mean = mrpt::poses::CPose3D(il.fixed_initial_pose);
+    if (!il.initial_pose_cov) {
+      initPose.cov.setDiagonal(1e-12);
+    } else {
+      initPose.cov = *il.initial_pose_cov;
+    }
+
+    state_.navstate_fuse.reset();  // needed after a re-localization to forget the past
 
     // Fake an evolution to be able to have an initial velocity estimation:
     const auto t1 = mrpt::Clock::fromDouble(mrpt::Clock::toDouble(this_obs_tim) - 0.2);
@@ -811,7 +827,7 @@ void LidarOdometry::onLidarImpl(const CObservation::Ptr & obs)
 
   tleMotion.stop();
 
-  if (state_.local_map->empty()) {
+  if (state_.local_map->empty() && params_.local_map_updates.enabled) {
     // Skip ICP.
     MRPT_LOG_DEBUG("First pointcloud: skipping ICP and directly adding to local map.");
 
@@ -881,13 +897,16 @@ void LidarOdometry::onLidarImpl(const CObservation::Ptr & obs)
                      << state_.last_motion_model_output->pose.cov_inv.asString());
     } else {
       // Use the last pose without velocity motion model:
-      MRPT_LOG_THROTTLE_WARN_FMT(
-        2.0,
-        "Not able to use velocity motion model for this timestep "
-        "(pathStep=%zu, timestamp=%s UTC)",
-        state_.estimated_trajectory.size(), mrpt::system::dateTimeToString(this_obs_tim).c_str());
-
       in.init_guess_local_wrt_global = state_.last_lidar_pose.mean.asTPose();
+
+      // (Skip the warning message if we are in the first timestep, since that's totally normal and expected, and the warning becomes confusing):
+      if (state_.estimated_trajectory.size() > 1) {
+        MRPT_LOG_THROTTLE_WARN_FMT(
+          2.0,
+          "Not able to use velocity motion model for this timestep "
+          "(pathStep=%zu, timestamp=%s UTC)",
+          state_.estimated_trajectory.size(), mrpt::system::dateTimeToString(this_obs_tim).c_str());
+      }
     }
 
     // If we don't have a valid twist estimation, use a larger ICP
@@ -904,7 +923,7 @@ void LidarOdometry::onLidarImpl(const CObservation::Ptr & obs)
 
     profiler_.leave("onLidar.2c.prepare_icp_in");
 
-    // ------------------------------------------------------
+    // -----------------------------------------------------
     // Run ICP
     // -----------------------------------------------------
     ProfilerEntry tle_icp(profiler_, "onLidar.3.run_icp");
@@ -952,6 +971,13 @@ void LidarOdometry::onLidarImpl(const CObservation::Ptr & obs)
     do {
       icp_params.maxIterations = remainingIcpIters;
 
+      // Skip ICP if we started without map and with mapping disabled:
+      if (state_.local_map->empty()) {
+        ASSERT_(!params_.local_map_updates.enabled);
+        break;
+      }
+
+      // Run ICP:
       icpCase.icp->align(
         *observation, *state_.local_map, current_solution, icp_params, icp_result, in.prior);
 
@@ -1026,9 +1052,19 @@ void LidarOdometry::onLidarImpl(const CObservation::Ptr & obs)
 
     // Update velocity model:
     if (icpIsGood) {
-      state_.navstate_fuse.fuse_pose(
-        this_obs_tim, out.found_pose_to_wrt_from, NAVSTATE_LIODOM_FRAME);
+      // Good ICP, update state estimation filter with new data from ICP:
+
+      if (state_.step_counter_post_relocalization == 0) {
+        // Do integrate info:
+        state_.navstate_fuse.fuse_pose(
+          this_obs_tim, out.found_pose_to_wrt_from, NAVSTATE_LIODOM_FRAME);
+      } else {
+        // Skip during post-relocalization:
+        state_.step_counter_post_relocalization--;
+      }
+
     } else {
+      // Bad ICP:
       state_.navstate_fuse.reset();
     }
 
@@ -1064,8 +1100,7 @@ void LidarOdometry::onLidarImpl(const CObservation::Ptr & obs)
     if (!state_.distance_checker_simplemap)
       state_.distance_checker_simplemap.emplace(params_.simplemap.measure_from_last_kf_only);
 
-    // Create a new KF if the distance since the last one is large
-    // enough:
+    // Create a new KF if the distance since the last one is large enough:
     const auto [isFirstPoseInChecker, distanceToClosest] =
       state_.distance_checker_local_map->check(state_.last_lidar_pose.mean);
 
@@ -1074,17 +1109,17 @@ void LidarOdometry::onLidarImpl(const CObservation::Ptr & obs)
       mrpt::poses::Lie::SO<3>::log(distanceToClosest.getRotationMatrix()).norm();
 
     // clang-format off
-        updateLocalMap =
-            (icpIsGood &&
-            // Only if we are in mapping mode:
-            params_.local_map_updates.enabled &&
-            // skip map update for the special ICP alignment without motion model
-             hasMotionModel &&
-             (isFirstPoseInChecker ||
-              dist_eucl_since_last > params_.local_map_updates.min_translation_between_keyframes ||
-              rot_since_last >
-              mrpt::DEG2RAD(params_.local_map_updates.min_rotation_between_keyframes))
-            );
+    updateLocalMap =
+      (icpIsGood &&
+       // Only if we are in mapping mode:
+       params_.local_map_updates.enabled &&
+       // skip map update for the special ICP alignment without motion model
+       hasMotionModel &&
+       (isFirstPoseInChecker ||
+        dist_eucl_since_last > params_.local_map_updates.min_translation_between_keyframes ||
+        rot_since_last >
+          mrpt::DEG2RAD(params_.local_map_updates.min_rotation_between_keyframes))
+       );
     // clang-format on
 
     if (updateLocalMap) {
@@ -1121,11 +1156,11 @@ void LidarOdometry::onLidarImpl(const CObservation::Ptr & obs)
       rot_since_last_sm > mrpt::DEG2RAD(params_.simplemap.min_rotation_between_keyframes);
 
     // clang-format off
-        updateSimpleMap =
-            params_.simplemap.generate &&
-            (icpIsGood &&
-             (distance_enough_sm || params_.simplemap.add_non_keyframes_too)
-            );
+    updateSimpleMap =
+      params_.simplemap.generate &&
+      (icpIsGood &&
+       (distance_enough_sm || params_.simplemap.add_non_keyframes_too)
+       );
     // clang-format on
 
     if (updateSimpleMap && distance_enough_sm)
@@ -1139,8 +1174,7 @@ void LidarOdometry::onLidarImpl(const CObservation::Ptr & obs)
 
   }  // end: yes, we can do ICP
 
-  // If this was a bad ICP, and we just started with an empty map, re-start
-  // again:
+  // If this was a bad ICP, and we just started with an empty map, re-start again:
   if (!state_.last_icp_was_good && state_.estimated_trajectory.size() == 1) {
     // Re-start the local map:
     state_.local_map->clear();
@@ -1289,9 +1323,9 @@ void LidarOdometry::onLidarImpl(const CObservation::Ptr & obs)
 
   }  // end update simple map
 
-  // In any case, publish the vehicle pose, no matter if it's a keyframe or
-  // not:
-  doPublishUpdatedLocalization(this_obs_tim);
+  // In any case, publish the vehicle pose, no matter if it's a keyframe or not,
+  // but if ICP quality was good enough:
+  if (state_.last_icp_was_good) doPublishUpdatedLocalization(this_obs_tim);
 
   // Publish new local map:
   doPublishUpdatedMap(this_obs_tim);
@@ -1329,6 +1363,18 @@ void LidarOdometry::onIMUImpl(const CObservation::Ptr & o)
   ASSERT_(o);
 
   ProfilerEntry tleg(profiler_, "onIMU");
+
+  auto imu = std::dynamic_pointer_cast<mrpt::obs::CObservationIMU>(o);
+  ASSERTMSG_(
+    imu, mrpt::format(
+           "IMU observation with label '%s' does not have the expected "
+           "type 'mrpt::obs::CObservationIMU', it is '%s' instead",
+           o->sensorLabel.c_str(), o->GetRuntimeClass()->className));
+
+  MRPT_LOG_DEBUG_STREAM(
+    "onIMU called for timestamp=" << mrpt::system::dateTimeLocalToString(imu->timestamp));
+
+  state_.navstate_fuse.fuse_imu(*imu);
 }
 
 void LidarOdometry::onWheelOdometry(const CObservation::Ptr & o)
@@ -1428,6 +1474,19 @@ mrpt::maps::CSimpleMap LidarOdometry::reconstructedMap() const
   return state_.reconstructed_simplemap;
 }
 
+std::optional<std::tuple<mrpt::poses::CPose3DPDFGaussian, mrpt::math::TTwist3D>>
+LidarOdometry::lastEstimatedState() const
+{
+  auto lck = mrpt::lockHelper(state_mtx_);
+
+  if (!state_.initialized || state_.fatal_error) return {};
+
+  if (!state_.last_motion_model_output) return {};
+  const auto & tw = state_.last_motion_model_output->twist;
+  const auto & pose = state_.last_lidar_pose;
+  return {{pose, tw}};
+}
+
 // KISS-ICP adaptive threshold method (MIT License; code adapted to MRPT)
 namespace
 {
@@ -1495,7 +1554,7 @@ void LidarOdometry::doInitializeEstimatedMaxSensorRange(const mrpt::obs::CObserv
   if (pts->empty()) return;
 
   const auto bb = pts->boundingBox();
-  double radius = 0.5 * (bb.max - bb.min).norm();
+  double radius = std::max(bb.max.norm(), bb.min.norm());
 
   mrpt::keep_max(radius, params_.absolute_minimum_sensor_range);
 
@@ -1518,7 +1577,7 @@ void LidarOdometry::doUpdateEstimatedMaxSensorRange(const mp2p_icp::metric_map_t
     if (!pts) continue;
 
     const auto bb = pts->boundingBox();
-    double radius = 0.5 * (bb.max - bb.min).norm();
+    double radius = std::max(bb.max.norm(), bb.min.norm());
 
     mrpt::keep_max(radius, params_.absolute_minimum_sensor_range);
 
@@ -1704,6 +1763,11 @@ void LidarOdometry::updateVisualization(const mp2p_icp::metric_map_t & currentOb
     // and enqueue for updating in the opengl thread:
     updateTasks.emplace_back(
       [=]() { visualizer_->update_3d_object("liodom/cur_obs", glCurrentObservation); });
+  } else {
+    // Remove possible old 3D objects if the user disabled visualization on the fly:
+    auto glCurrentObservation = mrpt::opengl::CSetOfObjects::Create();
+    updateTasks.emplace_back(
+      [=]() { visualizer_->update_3d_object("liodom/cur_obs", glCurrentObservation); });
   }
 
   // Estimated path:
@@ -1773,9 +1837,33 @@ void LidarOdometry::updateVisualization(const mp2p_icp::metric_map_t & currentOb
     rp.points.allLayers.render_voxelmaps_free_space =
       params_.visualization.local_map_render_voxelmap_free_space;
 
+    // ground grid:
+    auto glGroundGrid = mrpt::opengl::CSetOfObjects::Create();
+    if (params_.visualization.show_ground_grid) {
+      auto glGrid = mrpt::opengl::CGridPlaneXY::Create();
+
+      mrpt::math::TBoundingBoxf bbox;
+      bbox.min = {-10.0f, -10.0f, -1.0f};
+      bbox.max = {+10.0f, +10.0f, +1.0f};
+
+      for (const auto & [lyName, lyMap] : state_.local_map->layers) {
+        bbox = bbox.unionWith(lyMap->boundingBox());
+      }
+
+      glGrid->setGridFrequency(params_.visualization.ground_grid_spacing);
+      glGrid->setColor_u8(0xff, 0xff, 0xff, 0x80);
+      glGrid->setPlaneLimits(bbox.min.x, bbox.max.x, bbox.min.y, bbox.max.y);
+
+      glGroundGrid->insert(glGrid);
+    }
+
+    // local map:
     auto glMap = state_.local_map->get_visualization(rp);
 
-    updateTasks.emplace_back([=]() { visualizer_->update_3d_object("liodom/localmap", glMap); });
+    updateTasks.emplace_back([=]() {
+      visualizer_->update_3d_object("liodom/localmap", glMap);
+      visualizer_->update_3d_object("liodom/groundgrid", glGroundGrid);
+    });
   }
 
   // now, update all visual elements at once:
@@ -1807,8 +1895,9 @@ void LidarOdometry::updateVisualization(const mp2p_icp::metric_map_t & currentOb
     mrpt::format("ICP quality: %.01f%%", 100.0 * state_.last_icp_quality));
   gui_.lbSigma->setCaption(mrpt::format("Threshold sigma: %.02f", state_.adapt_thres_sigma));
   if (state_.estimated_sensor_max_range)
-    gui_.lbSensorRange->setCaption(
-      mrpt::format("Est. max range: %.02f m", *state_.estimated_sensor_max_range));
+    gui_.lbSensorRange->setCaption(mrpt::format(
+      "Est. max range: %.02f m (inst: %.02f m)", *state_.estimated_sensor_max_range,
+      state_.instantaneous_sensor_max_range ? *state_.instantaneous_sensor_max_range : .0));
   {
     // const double dt    = profiler_.getLastTime("onLidar");
     const double dtAvr = profiler_.getMeanTime("onLidar");
@@ -1900,14 +1989,14 @@ void LidarOdometry::internalBuildGUI()
   gui_.lbTime = tab1->add<nanogui::Label>(" ");
 
   // tab 2: control
-  auto cbActive = tab2->add<nanogui::CheckBox>("Active");
-  cbActive->setChecked(state_.active);
-  cbActive->setCallback(
+  gui_.cbActive = tab2->add<nanogui::CheckBox>("Active");
+  gui_.cbActive->setChecked(state_.active);
+  gui_.cbActive->setCallback(
     [&](bool checked) { this->enqueue_request([this, checked]() { state_.active = checked; }); });
 
-  auto cbMapping = tab2->add<nanogui::CheckBox>("Mapping enabled");
-  cbMapping->setChecked(params_.local_map_updates.enabled);
-  cbMapping->setCallback([&](bool checked) {
+  gui_.cbMapping = tab2->add<nanogui::CheckBox>("Mapping enabled");
+  gui_.cbMapping->setChecked(params_.local_map_updates.enabled);
+  gui_.cbMapping->setCallback([&](bool checked) {
     this->enqueue_request([this, checked]() { params_.local_map_updates.enabled = checked; });
   });
 
@@ -1944,9 +2033,9 @@ void LidarOdometry::internalBuildGUI()
     panel->setLayout(
       new nanogui::BoxLayout(nanogui::Orientation::Horizontal, nanogui::Alignment::Maximum, 1, 1));
 
-    auto * cbSaveSimplemap = panel->add<nanogui::CheckBox>("Generate simplemap");
-    cbSaveSimplemap->setChecked(params_.simplemap.generate);
-    cbSaveSimplemap->setCallback([this](bool checked) {
+    gui_.cbSaveSimplemap = panel->add<nanogui::CheckBox>("Generate simplemap");
+    gui_.cbSaveSimplemap->setChecked(params_.simplemap.generate);
+    gui_.cbSaveSimplemap->setCallback([this](bool checked) {
       this->enqueue_request([this, checked]() { params_.simplemap.generate = checked; });
     });
 
@@ -2052,6 +2141,9 @@ void LidarOdometry::doPublishUpdatedLocalization(const mrpt::Clock::time_point &
   lu.timestamp = this_obs_tim;
   lu.pose = state_.last_lidar_pose.mean.asTPose();
   lu.cov = state_.last_lidar_pose.cov;
+#if MOLA_VERSION_CHECK(1, 4, 0)
+  lu.quality = state_.last_icp_quality;
+#endif
 
   advertiseUpdatedLocalization(lu);
 }
@@ -2183,17 +2275,107 @@ void LidarOdometry::enqueue_request(const std::function<void()> & userRequest)
   requests_.push_back(userRequest);
 }
 
-#ifdef HAVE_MOLA_KERNEL_RELOCALIZE_API
 void LidarOdometry::relocalize_near_pose_pdf(const mrpt::poses::CPose3DPDFGaussian & p)
 {
-  //TODO!
+  auto lckState = mrpt::lockHelper(state_mtx_);
+
+  auto & il = params_.initial_localization;
+
+  // Enforce re-localizatio on the next iteration:
+  il.enabled = true;
+  state_.initial_localization_done = false;
+  // In this pose:
+  il.fixed_initial_pose = p.mean.asTPose();
+  il.initial_pose_cov = p.cov;
+
+  // Reset adaptative sigma to initial value:
+  state_.adapt_thres_sigma = std::sqrt(p.cov.asEigen().block<2, 2>(0, 0).trace());
+
+  // Handle uncertainty in next steps:
+  state_.step_counter_post_relocalization =
+    il.additional_uncertainty_after_reloc_how_many_timesteps;
+
+  MRPT_LOG_INFO_STREAM(
+    "relocalize_near_pose_pdf(): Using thres_sigma="  //
+    << state_.adapt_thres_sigma << " to relocalize near: " << p.mean);
 }
 
 void LidarOdometry::relocalize_from_gnss()
 {
   //TODO!
+  MRPT_LOG_WARN("relocalize_from_gnss() not implemented yet!");
 }
-#endif
+
+MapServer::ReturnStatus LidarOdometry::map_load(const std::string & path)
+{
+  using namespace std::string_literals;
+
+  auto lckState = mrpt::lockHelper(state_mtx_);
+
+  MapServer::ReturnStatus ret;
+
+  const auto mmFile = path + ".mm"s;
+  const auto smFile = path + ".simplemap"s;
+
+  MRPT_LOG_INFO_STREAM("[map_load] Trying to load mm: " << mmFile << " and sm: " << smFile);
+
+  bool mmLoadOk = false;
+  try {
+    mmLoadOk = state_.local_map->load_from_file(mmFile);
+  } catch (const std::exception &) {
+  }
+
+  bool smLoadOk = false;
+  try {
+    smLoadOk = state_.reconstructed_simplemap.loadFromFile(smFile);
+  } catch (const std::exception &) {
+  }
+
+  ret.success = mmLoadOk;  // smLoadOk: not mandatory
+
+  if (!mmLoadOk) ret.error_message = "Error loading metric local map from: "s + mmFile + ". ";
+  if (!smLoadOk)
+    ret.error_message = "Warning: no simplemap (keyframes) file found (expected: '"s + smFile +
+                        "'). Required for multisession mapping. ";
+
+  if (ret.success) {
+    state_.local_map_needs_viz_update = true;  // refresh map in GUI, if enabled
+
+    MRPT_LOG_INFO_STREAM("[map_load] Successful.");
+  } else
+    MRPT_LOG_ERROR_STREAM("[map_load] Error loading from map prefix: " << path);
+
+  return ret;
+}
+
+MapServer::ReturnStatus LidarOdometry::map_save(const std::string & path)
+{
+  using namespace std::string_literals;
+
+  auto lckState = mrpt::lockHelper(state_mtx_);
+
+  MapServer::ReturnStatus ret;
+
+  const auto mmFile = path + ".mm"s;
+  const auto smFile = path + ".simplemap"s;
+
+  MRPT_LOG_INFO_STREAM("[map_save] Trying to save mm: " << mmFile << " and sm: " << smFile);
+
+  bool mmSaveOk = state_.local_map->save_to_file(mmFile);
+  bool smSaveOk = state_.reconstructed_simplemap.saveToFile(smFile);
+
+  ret.success = mmSaveOk && smSaveOk;
+
+  if (!mmSaveOk) ret.error_message = "Error saving metric local map from: "s + mmFile + ". ";
+  if (!smSaveOk) ret.error_message = "Error saving simplemap (keyframes) from: "s + smFile + ". ";
+
+  if (ret.success)
+    MRPT_LOG_INFO_STREAM("[map_save] Successful.");
+  else
+    MRPT_LOG_ERROR_STREAM("[map_save] Error saving map to map prefix: " << path);
+
+  return ret;
+}
 
 void LidarOdometry::processPendingUserRequests()
 {
@@ -2245,4 +2427,42 @@ void LidarOdometry::doWriteDebugTracesFile(const mrpt::Clock::time_point & this_
   for (const auto & [name, value] : vars)  //
     of << mrpt::format("%f,", value);
   of << "\n";
+}
+
+#if MOLA_VERSION_CHECK(1, 4, 0)
+void LidarOdometry::onParameterUpdate(const mrpt::containers::yaml & names_values)
+{
+  if (names_values.isNullNode() || names_values.empty()) return;
+
+  ASSERT_(names_values.isMap());
+
+  auto lckState = mrpt::lockHelper(state_mtx_);
+
+  // Load parameters:
+  state_.active = names_values.getOrDefault("active", state_.active);
+  params_.local_map_updates.enabled =
+    names_values.getOrDefault("mapping_enabled", params_.local_map_updates.enabled);
+  params_.simplemap.generate =
+    names_values.getOrDefault("generate_simplemap", params_.simplemap.generate);
+
+  // and reflect changes in the GUI, if used.
+  this->enqueue_request([this]() {
+    if (gui_.cbActive) {
+      gui_.cbActive->setChecked(state_.active);
+      gui_.cbMapping->setChecked(params_.local_map_updates.enabled);
+      gui_.cbSaveSimplemap->setChecked(params_.simplemap.generate);
+    }
+  });
+}
+#endif
+
+void LidarOdometry::onExposeParameters()
+{
+#if MOLA_VERSION_CHECK(1, 4, 0)
+  mrpt::containers::yaml nv = mrpt::containers::yaml::Map();
+  nv["active"] = state_.active;
+  nv["mapping_enabled"] = params_.local_map_updates.enabled;
+  nv["generate_simplemap"] = params_.simplemap.generate;
+  this->exposeParameters(nv);
+#endif
 }
