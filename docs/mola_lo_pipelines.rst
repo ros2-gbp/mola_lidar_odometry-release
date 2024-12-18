@@ -4,10 +4,15 @@
 LiDAR odometry pipelines
 ============================
 
+____________________________________________
+
 .. contents::
    :depth: 1
    :local:
    :backlinks: none
+
+____________________________________________
+
 
 Most :ref:`parts <mola-internal-arch>` of the MOLA-LO system are **configured dynamically** from a YAML file.
 Basically, the whole design about how many **local map layers** exist, the pointcloud **processing pipelines**,
@@ -27,7 +32,7 @@ In case of doubts, do not hesitate in `opening an issue <https://github.com/MOLA
 
     MOLA-LO uses the C++ library ``mola_yaml`` to parse YAML files, hence all YAML language extensions defined there
     applies to input YAML files used anywhere in a MOLA-LO system, e.g. ``${VAR|default}`` means "replace by environment
-    variable ``VAR`` or, if it does not exist, by ``default``".
+    variable ``VAR`` or, if it does not exist, by ``default``". Read all about :ref:`MOLA YAML extensions <yaml_extensions>`.
 
 .. dropdown:: Specifying the pipeline file in MOLA-LO apps
    :icon: checklist
@@ -36,10 +41,15 @@ In case of doubts, do not hesitate in `opening an issue <https://github.com/MOLA
    defined below. To use the alternative 2D pipeline or any other custom pipeline, please set the corresponding environment
    variable before invoking the :ref:`GUI application <mola_lo_apps>` (or derive your own script by copying and modifying the provided ones).
 
-   If you use the `CLI interface <mola_lidar_odometry_cli>`, the pipeline file to use needs to be always explicitly specified, there is none by default.
+   If you use the `CLI interface <mola_lidar_odometry_cli>`_, the pipeline file to use needs to be always explicitly specified, there is none by default.
 
 
 |
+
+____________________________________________
+
+|
+
 
 .. _mola_3d_default_pipeline:
 
@@ -64,9 +74,53 @@ and filtering pipelines to **downsample** incoming raw LiDAR data.
     .. literalinclude:: ../../../mola_lidar_odometry/pipelines/lidar3d-default.yaml
        :language: yaml
 
+
 |
 
-2. Pipeline for 2D LiDAR (``lidar2d.yaml``)
+____________________________________________
+
+|
+
+
+.. _mola_3d_ndt_pipeline:
+
+2. 3D mapping pipeline using 3D-NDT (``lidar3d-ndt.yaml``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+This is an **alternative configuration** for 3D mapping used in the MOLA-LO paper, and should also work great
+out of the box for most common situations where, *at least*, part of the environment has flat surfaces.
+
+As described in the paper :cite:`blanco2024mola_lo`, this pipeline uses an NDT-like :cite:`magnusson2007scan` local map, based on **3D voxels**
+whose contents switch between bare points and Gaussians depending on how planar and how many points are.
+This pipeline exploits the **point-to-plane pairings**.
+
+.. raw:: html
+
+   <div style="width: 100%; overflow: hidden;">
+     <video controls autoplay loop muted style="width: 100%;">
+       <source src="https://mrpt.github.io/videos/mola-slam-mulran-demo-ndt.mp4" type="video/mp4">
+     </video>
+   </div>
+
+.. note::
+
+   See: :ref:`pipelines_env_vars`
+
+.. dropdown:: YAML listing
+    :icon: code-review
+
+    File: `mola_lidar_odometry/pipelines/lidar3d-ndt.yaml <https://github.com/MOLAorg/mola_lidar_odometry/blob/develop/pipelines/lidar3d-ndt.yaml>`_
+
+    .. literalinclude:: ../../../mola_lidar_odometry/pipelines/lidar3d-ndt.yaml
+       :language: yaml
+
+
+|
+____________________________________________
+
+|
+
+
+3. Pipeline for 2D LiDAR (``lidar2d.yaml``)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 This alternative configuration uses an **occupancy voxel map** instead of point clouds
 as local map, and performs **ray-tracing** to accumulate evidence about the freeness
@@ -90,6 +144,10 @@ If it recommended to use wheels-based odometry to help the mapping process.
 
 |
 
+____________________________________________
+
+|
+
 .. _pipelines_env_vars:
 
 Configuring pipelines via environment variables
@@ -110,8 +168,8 @@ Unless said otherwise, all variables are valid for all the pipelines described a
 
 .. _mola_lo_pipeline_sensor_inputs:
 
-Sensor inputs
-^^^^^^^^^^^^^
+Sensor inputs: LiDAR
+^^^^^^^^^^^^^^^^^^^^^
 
 - ``MOLA_LIDAR_NAME`` (Default: ``['lidar', '/ouster/points']``): A **sensor label** (maybe including a regular expression) of what
   observations are to be treated as input LiDAR point clouds. For most dataset sources, the default ``lidar`` is enough.
@@ -132,11 +190,20 @@ Sensor inputs
 - ``MOLA_MINIMUM_RANGE_FILTER`` (Default: 3% of max sensor range). Minimum range for 3D points. This removes points from 
   the robot/vehicle itself.
 
+Sensor inputs: Wheels odometry
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
 - ``MOLA_ODOMETRY_NAME`` (Default: ``odometry``): **Sensor label** (or regex) of the observations
   with wheels odometry, if it exists.
 
-- ``MOLA_GPS_NAME`` (Default: ``gps``): **Sensor label** (or regex) of the observations to be treated as
+Sensor inputs: GPS (GNSS)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+- ``MOLA_GNSS_TOPIC`` (Default: ``/gps``): For ROS 2 live node or rosbags, the **topic name** to be treated as
   GNSS data. Used only for storage in simple-maps for post-processing (geo-referencing, etc.).
+
+MOLA_USE_FIXED_IMU_POSE
+
 
 Scan de-skew options
 ^^^^^^^^^^^^^^^^^^^^^^
@@ -159,12 +226,6 @@ General options
 - ``MOLA_LOAD_MM`` (Default: none): An optional path to a metric map (``*.mm``) file with a prebuilt metric map. Useful for
   multisession mapping or localization-only mode.
 
-- ``MOLA_MIN_XYZ_BETWEEN_MAP_UPDATES`` (Default: a heuristic formula, see YAML file): Minimum distance in meters between updates to
-  the local map.
-
-- ``MOLA_MIN_ROT_BETWEEN_MAP_UPDATES`` (In degrees. Default: a heuristic formula, see YAML file): Minimum angle in degrees between updates to
-  the local map.
-
 - ``MOLA_MINIMUM_ICP_QUALITY`` (Default: ``0.25``): Minimum quality (from the ``mpcp_icp`` quality evaluators), in the range [0,1], to
   consider an ICP optimization to be valid.
 
@@ -176,6 +237,22 @@ General options
 
 - ``MOLA_START_ACTIVE`` (default: ``true``): If set to ``false``, the odometry pipeline will ignore incoming observations
   until active is set to true (e.g. via the GUI).
+
+
+Local map update
+^^^^^^^^^^^^^^^^^^^^^^
+
+- ``MOLA_MIN_XYZ_BETWEEN_MAP_UPDATES`` (Default: a heuristic formula, see YAML file): Minimum distance in meters between updates to
+  the local map.
+
+- ``MOLA_MIN_ROT_BETWEEN_MAP_UPDATES`` (In degrees. Default: a heuristic formula, see YAML file): Minimum angle in degrees between updates to
+  the local map.
+
+- ``MOLA_LOCAL_MAP_MAX_SIZE`` (In meters; default: heuristic formula, see YAML file): Parts of the local metric map farther away then this 
+  distance, measured from the current robot pose, will be removed. This is to both, save memory usage, and to avoid inconsistencies 
+  before closing loops (which shall be processed outside of the LO module).
+
+- ``MOLA_LOCAL_VOXELMAP_RESOLUTION`` (In meters; default: heuristic formula, see YAML file): Size of voxels for the local map.
 
 
 Simple-map generation
@@ -225,6 +302,8 @@ A constant velocity motion model is used by default, provided by the ``mola_navs
 - ``MOLA_NAVSTATE_SIGMA_RANDOM_WALK_LINACC`` (Default: 1.0 m/s²): Linear acceleration standard deviation.
 - ``MOLA_NAVSTATE_SIGMA_RANDOM_WALK_ANGACC`` (Default: 10.0 rad/s²): Angular acceleration standard deviation.
 
+
+.. _pipeline_icp_log_files:
 
 ICP log files
 ^^^^^^^^^^^^^^^^^^^^^^
