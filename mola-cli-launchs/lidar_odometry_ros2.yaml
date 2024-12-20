@@ -48,9 +48,18 @@ modules:
       # Whenever a MOLA odometry/SLAM system publishes a new pose estimate
       # it will be forwarded to /tf as a transformation between: 
       # `reference_frame` -> `base_link_frame`
+      reference_frame: '${MOLA_TF_MAP|map}'
       base_link_frame: '${MOLA_TF_BASE_FOOTPRINT|base_link}'
-      odom_frame: odom
-      
+      odom_frame: '${MOLA_TF_ESTIMATED_ODOMETRY|odom}'
+
+      # Direct mode (false):
+      #  reference_frame ("map") -> base_link ("base_link")
+      #
+      # Indirect mode (true), following ROS REP 105 https://ros.org/reps/rep-0105.html
+      #  map -> odom  (such as "map -> odom -> base_link" = "map -> base_link")
+      #
+      publish_localization_following_rep105: ${MOLA_LOCALIZ_USE_REP105|true}
+
       # If true, the /tf 'odom_frame'->'base_link_frame' will be forwarded to MOLA as CObservationOdometry.
       forward_ros_tf_as_mola_odometry_observations: false
 
