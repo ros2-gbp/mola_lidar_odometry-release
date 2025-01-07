@@ -26,7 +26,6 @@ find_package(mrpt-tclap REQUIRED)
 find_mola_package(mola_kernel)
 find_mola_package(mp2p_icp)
 find_mola_package(mp2p_icp_filters)
-find_mola_package(mola_navstate_fuse)
 find_mola_package(mola_pose_list)
 
 # -----------------------
@@ -42,7 +41,6 @@ mola_add_library(
     mola::mola_kernel
     mola::mp2p_icp
     mola::mp2p_icp_filters
-    mola::mola_navstate_fuse
     mola::mola_pose_list
 # PRIVATE_LINK_LIBRARIES
 #  mrpt::maps
@@ -50,7 +48,6 @@ mola_add_library(
     mola_kernel
     mp2p_icp
     mp2p_icp_filters
-    mola_navstate_fuse
     mrpt-maps
 )
 
@@ -73,6 +70,7 @@ find_package(mola_input_mulran_dataset) # optional
 find_package(mola_input_rawlog) # optional
 find_package(mola_input_rosbag2) # optional
 find_package(mola_input_paris_luco_dataset) # optional
+find_package(mola_state_estimation_simple) # optional
 
 mola_add_executable(
   TARGET  mola-lidar-odometry-cli
@@ -82,6 +80,14 @@ mola_add_executable(
   mrpt::maps
   mrpt::tclap
 )
+if(mola_state_estimation_simple_FOUND)
+  message(STATUS "mola-lidar-odometry-cli: With mola_state_estimation_simple = YES")
+  target_link_libraries(mola-lidar-odometry-cli mola::mola_state_estimation_simple)
+  target_compile_definitions(mola-lidar-odometry-cli PRIVATE HAVE_MOLA_SE_SIMPLE)
+else()
+  message(STATUS "mola-lidar-odometry-cli: With mola_state_estimation_simple = NO")
+endif()
+
 if(mola_input_kitti_dataset_FOUND)
   message(STATUS "mola-lidar-odometry-cli: With Kitti = YES")
   target_link_libraries(mola-lidar-odometry-cli mola::mola_input_kitti_dataset)
@@ -138,6 +144,7 @@ install(
     pipelines
     ros2-launchs
     rviz2
+    state-estimator-params
   DESTINATION
     share/${PROJECT_NAME}
 )
