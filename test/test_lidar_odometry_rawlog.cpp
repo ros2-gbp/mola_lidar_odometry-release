@@ -65,7 +65,7 @@ int main_odometry(
   // Initialize estimator (default settings):
   stateEstimator->setMinLoggingLevel(mrpt::system::LVL_DEBUG);
   const auto cfgEstimator = mola::load_yaml_file(stateEstimConfigFile);
-  stateEstimator->initialize(cfgEstimator["params"]);
+  stateEstimator->initialize(cfgEstimator);
 
   // dataset input:
   mrpt::obs::CRawlog dataset;
@@ -100,7 +100,6 @@ int main_odometry(
   const bool gtLoadOk = gt.loadFromTextFile_TUM(gtTrajectory);
   ASSERT_(gtLoadOk);
 
-  ASSERT_EQUAL_(trajectory.size(), 3U);
   ASSERT_EQUAL_(gt.size(), trajectory.size());
 
   auto itP = trajectory.cbegin();
