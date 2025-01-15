@@ -5,7 +5,7 @@
 -->
 <package format="3">
   <name>mola_lidar_odometry</name>
-  <version>0.5.2</version>
+  <version>0.5.3</version>
   <description>LIDAR odometry system based on MOLA and MRPT components</description>
 
   <maintainer email="joseluisblancoc@gmail.com">Jose-Luis Blanco-Claraco</maintainer>
@@ -48,7 +48,9 @@
   <test_depend>ament_cmake_gtest</test_depend>
   
   <!-- for C++ unit tests -->
-  <test_depend>mola_state_estimation_simple</test_depend>
+  <!-- <test_depend>mola_state_estimation_simple</test_depend> -->
+  <!-- for it to be detected and used as default s.e. in the cli -->
+  <depend>mola_state_estimation_simple</depend>
 
   <!-- Needed by the mola-lo-* scripts: -->
   <exec_depend>mola_launcher</exec_depend>
