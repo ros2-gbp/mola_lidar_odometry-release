@@ -62,19 +62,21 @@ modules:
 
     execution_rate: 20 # Hz
 
-    #verbosity_level: INFO
     params:
       # Whenever a MOLA odometry/SLAM system publishes a new pose estimate
       # it will be forwarded to /tf as a transformation between: 
       # `reference_frame` -> `base_link_frame`
       base_link_frame: base_link
-      reference_frame: map
+      reference_frame: odom
 
       # If true, an nav_msgs/Odometry message will be also published from SLAM solution:
       publish_odometry_msgs_from_slam: true
 
       # do not publish to /tf from ground_truth
       publish_tf_from_robot_pose_observations: false
+
+      # Kitti does not have an "odom" frame, so it's OK for MOLA-LO to publish /tf: "map" -> "base_link"
+      publish_localization_following_rep105: false
 
       # If true, the original dataset timestamps will be used to publish.
       # Otherwise, the wallclock time will be used.
