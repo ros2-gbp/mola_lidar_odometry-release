@@ -402,6 +402,16 @@ public:
     uint32_t max_worker_thread_queue_before_drop = 500;
 
     uint32_t gnss_queue_max_size = 100;
+
+    /** When publishing pose updates, the reference frame for both, estimated robot poses, and the local map.*/
+    std::string publish_reference_frame = "odom";
+
+    /** When publishing pose updates, the vehicle frame name.*/
+    std::string publish_vehicle_frame = "base_link";
+
+    std::string georef_map_reference_frame = "map";
+    std::string georef_map_utm_frame = "utm";
+    std::string georef_map_enu_frame = "enu";
   };
 
   /** Algorithm parameters */
@@ -487,9 +497,9 @@ protected:
 #endif
   void onExposeParameters();  // called after initialization
 
-private:
-  const std::string NAVSTATE_LIODOM_FRAME = "liodom";
+  void publishMetricMapGeoreferencingData();
 
+private:
   struct ICP_Input
   {
     using Ptr = std::shared_ptr<ICP_Input>;
@@ -575,7 +585,7 @@ private:
 
     /// See check_for_removal_every_n
     uint32_t localmap_check_removal_counter = 0;
-    uint32_t localmap_advertise_updates_counter = 0;
+    uint32_t localmap_advertise_updates_counter = std::numeric_limits<uint32_t>::max();
 
     /// To update the map in the viz only if really needed
     bool local_map_needs_viz_update = true;
