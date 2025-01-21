@@ -63,6 +63,7 @@
 #include <mrpt/system/datetime.h>
 #include <mrpt/system/filesystem.h>
 #include <mrpt/system/string_utils.h>
+#include <mrpt/topography/conversions.h>
 
 // GUI:
 #include <mrpt/gui/CDisplayWindowGUI.h>
@@ -311,6 +312,13 @@ void LidarOdometry::initialize_frontend(const Yaml & c)
   YAML_LOAD_OPT(params_, optimize_twist_rerun_min_rot_deg, double);
   YAML_LOAD_OPT(params_, optimize_twist_max_corrections, size_t);
 
+  YAML_LOAD_OPT(params_, publish_reference_frame, std::string);
+  YAML_LOAD_OPT(params_, publish_vehicle_frame, std::string);
+
+  YAML_LOAD_OPT(params_, georef_map_reference_frame, std::string);
+  YAML_LOAD_OPT(params_, georef_map_utm_frame, std::string);
+  YAML_LOAD_OPT(params_, georef_map_enu_frame, std::string);
+
   if (cfg.has("adaptive_threshold"))
     params_.adaptive_threshold.initialize(cfg["adaptive_threshold"]);
 
@@ -470,6 +478,8 @@ void LidarOdometry::initialize_frontend(const Yaml & c)
     bool loadOk =
       state_.local_map->load_from_file(params_.local_map_updates.load_existing_local_map);
     ASSERT_(loadOk);
+    // Publish geo-referenced data for the map, if applicable.
+    publishMetricMapGeoreferencingData();
   }
 
   if (!params_.simplemap.load_existing_simple_map.empty()) {
@@ -818,8 +828,8 @@ void LidarOdometry::onLidarImpl(const CObservation::Ptr & obs)
     // Fake an evolution to be able to have an initial velocity estimation:
     const auto t1 = mrpt::Clock::fromDouble(mrpt::Clock::toDouble(this_obs_tim) - 0.2);
     const auto t2 = mrpt::Clock::fromDouble(mrpt::Clock::toDouble(this_obs_tim) - 0.1);
-    state_.navstate_fuse->fuse_pose(t1, initPose, NAVSTATE_LIODOM_FRAME);
-    state_.navstate_fuse->fuse_pose(t2, initPose, NAVSTATE_LIODOM_FRAME);
+    state_.navstate_fuse->fuse_pose(t1, initPose, params_.publish_reference_frame);
+    state_.navstate_fuse->fuse_pose(t2, initPose, params_.publish_reference_frame);
 
     MRPT_LOG_INFO_STREAM("Initial re-localization done with pose: " << initPose.mean);
 
@@ -841,7 +851,7 @@ void LidarOdometry::onLidarImpl(const CObservation::Ptr & obs)
   ProfilerEntry tleMotion(profiler_, "onLidar.2b.estimated_navstate");
 
   state_.last_motion_model_output =
-    state_.navstate_fuse->estimated_navstate(this_obs_tim, NAVSTATE_LIODOM_FRAME);
+    state_.navstate_fuse->estimated_navstate(this_obs_tim, params_.publish_reference_frame);
 
   const bool hasMotionModel = state_.last_motion_model_output.has_value();
 
@@ -868,7 +878,7 @@ void LidarOdometry::onLidarImpl(const CObservation::Ptr & obs)
     initPose.mean = mrpt::poses::CPose3D::Identity();
     initPose.cov.setDiagonal(1e-12);
 
-    state_.navstate_fuse->fuse_pose(this_obs_tim, initPose, NAVSTATE_LIODOM_FRAME);
+    state_.navstate_fuse->fuse_pose(this_obs_tim, initPose, params_.publish_reference_frame);
   } else {
     // Register point clouds using ICP:
     // ------------------------------------
@@ -1077,7 +1087,7 @@ void LidarOdometry::onLidarImpl(const CObservation::Ptr & obs)
       if (state_.step_counter_post_relocalization == 0) {
         // Do integrate info:
         state_.navstate_fuse->fuse_pose(
-          this_obs_tim, out.found_pose_to_wrt_from, NAVSTATE_LIODOM_FRAME);
+          this_obs_tim, out.found_pose_to_wrt_from, params_.publish_reference_frame);
       } else {
         // Skip during post-relocalization:
         state_.step_counter_post_relocalization--;
@@ -2165,7 +2175,10 @@ void LidarOdometry::doPublishUpdatedLocalization(const mrpt::Clock::time_point &
 
   LocalizationUpdate lu;
   lu.method = "lidar_odometry";
-  lu.reference_frame = "odom";
+  lu.reference_frame = params_.publish_reference_frame;
+#if MOLA_VERSION_CHECK(1, 6, 0)
+  lu.child_frame = params_.publish_vehicle_frame;
+#endif
   lu.timestamp = this_obs_tim;
   lu.pose = state_.last_lidar_pose.mean.asTPose();
   lu.cov = state_.last_lidar_pose.cov;
@@ -2183,14 +2196,17 @@ void LidarOdometry::doPublishUpdatedMap(const mrpt::Clock::time_point & this_obs
     params_.local_map_updates.publish_map_updates_every_n)
     return;
 
-  if (!anyUpdateMapSubscriber()) return;
+  if (!anyUpdateMapSubscriber()) {
+    MRPT_LOG_DEBUG("doPublishUpdatedMap: Skipping, since we have no subscriber.");
+    return;
+  }
 
   ProfilerEntry tleCleanup(profiler_, "advertiseMap");
   state_.localmap_advertise_updates_counter = 0;
 
   MapUpdate mu;
   mu.method = "lidar_odometry";
-  mu.reference_frame = "map";
+  mu.reference_frame = params_.publish_reference_frame;
   mu.timestamp = this_obs_tim;
 
   // publish all local map layers:
@@ -2349,12 +2365,18 @@ MapServer::ReturnStatus LidarOdometry::map_load(const std::string & path)
 
   bool mmLoadOk = false;
   try {
+    // do not show the default error msg for this simple error, which is long and may intimidate newest users:
+    if (!mrpt::system::fileExists(mmFile)) throw std::runtime_error("");
+
     mmLoadOk = state_.local_map->load_from_file(mmFile);
   } catch (const std::exception &) {
   }
 
   bool smLoadOk = false;
   try {
+    // do not show the default error msg for this simple error, which is long and may intimidate newest users:
+    if (!mrpt::system::fileExists(smFile)) throw std::runtime_error("");
+
     smLoadOk = state_.reconstructed_simplemap.loadFromFile(smFile);
   } catch (const std::exception &) {
   }
@@ -2365,6 +2387,14 @@ MapServer::ReturnStatus LidarOdometry::map_load(const std::string & path)
   if (!smLoadOk)
     ret.error_message = "Warning: no simplemap (keyframes) file found (expected: '"s + smFile +
                         "'). Required for multisession mapping. ";
+
+  if (mmLoadOk) {
+    // Publish geo-referenced data for the map, if applicable.
+    publishMetricMapGeoreferencingData();
+    // And update the GUI and publish the map, even if we are not being fed with incoming obs:
+    auto dummy = mrpt::obs::CObservationComment::Create();
+    onNewObservation(dummy);
+  }
 
   if (ret.success) {
     state_.local_map_needs_viz_update = true;  // refresh map in GUI, if enabled
@@ -2492,5 +2522,61 @@ void LidarOdometry::onExposeParameters()
   nv["mapping_enabled"] = params_.local_map_updates.enabled;
   nv["generate_simplemap"] = params_.simplemap.generate;
   this->exposeParameters(nv);
+#endif
+}
+
+void LidarOdometry::publishMetricMapGeoreferencingData()
+{
+#if MOLA_VERSION_CHECK(1, 6, 0)  // we need lu.child_frame
+
+  ASSERT_(state_.local_map);
+  //TODO: Define new mola_kernel API for sending out geo-ref data and publish as mrpt_nav_interfaces::msg::GeoreferencingMetadata.
+
+  if (!state_.local_map->georeferencing.has_value()) return;  // no geo-ref data
+
+  const auto & g = state_.local_map->georeferencing.value();
+
+  MRPT_LOG_INFO_STREAM(
+    "Publishing map georeferencing metadata: T_enu_to_map="
+    << g.T_enu_to_map.asString()                           //
+    << " geo_coord.lat=" << g.geo_coord.lat.getAsString()  //
+    << " geo_coord.lon=" << g.geo_coord.lon.getAsString()  //
+    << " geo_coord.height=" << g.geo_coord.height          //
+  );
+
+  // ENU -> MAP
+  {
+    LocalizationUpdate lu;
+
+    const auto & T_enu_to_map = g.T_enu_to_map.mean;
+
+    lu.method = "map_server";
+    lu.reference_frame = params_.georef_map_enu_frame;    // "enu"
+    lu.child_frame = params_.georef_map_reference_frame;  // "map"
+    lu.timestamp = mrpt::Clock::now();                    // Anything better?
+    lu.pose = T_enu_to_map.asTPose();
+
+    advertiseUpdatedLocalization(lu);
+  }
+
+  // ENU -> UTM
+  {
+    LocalizationUpdate lu;
+    mrpt::topography::TUTMCoords utmCoordsOfENU;
+    int utmZone = 0;
+    char utmBand = 0;
+    mrpt::topography::GeodeticToUTM(g.geo_coord, utmCoordsOfENU, utmZone, utmBand);
+
+    // T_enu_to_utm = - utmCoordsOfENU  (without rotation, both are "ENU")
+    const auto T_enu_to_utm = mrpt::poses::CPose3D::FromTranslation(-utmCoordsOfENU);
+
+    lu.method = "map_server";
+    lu.reference_frame = params_.georef_map_enu_frame;  // "enu"
+    lu.child_frame = params_.georef_map_utm_frame;      // "utm"
+    lu.timestamp = mrpt::Clock::now();                  // Anything better?
+    lu.pose = T_enu_to_utm.asTPose();
+
+    advertiseUpdatedLocalization(lu);
+  }
 #endif
 }
