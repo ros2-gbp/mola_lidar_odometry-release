@@ -58,17 +58,27 @@ def generate_launch_description():
     start_mapping_enabled_arg = DeclareLaunchArgument(
         "start_mapping_enabled", default_value="True", description="Whether MOLA-LO should start with map update enabled (true), or in localization-only mode (false)")
     start_mapping_enabled_env_var = SetEnvironmentVariable(
-        name='MOLA_MAPPING_ENABLE', value=LaunchConfiguration('start_mapping_enabled'))
+        name='MOLA_MAPPING_ENABLED', value=LaunchConfiguration('start_mapping_enabled'))
     # ~~~~~~~~~~~~
     start_active_arg = DeclareLaunchArgument(
         "start_active", default_value="True", description="Whether MOLA-LO should start active, that is, processing incoming sensor data (true), or ignoring them (false)")
     start_active_env_var = SetEnvironmentVariable(
-        name='MOLA_START_ACTIVE', value=LaunchConfiguration('start_mapping_enabled'))
+        name='MOLA_START_ACTIVE', value=LaunchConfiguration('start_active'))
     # ~~~~~~~~~~~~
     mola_lo_reference_frame_arg = DeclareLaunchArgument(
         "mola_lo_reference_frame", default_value="map", description="The /tf frame name to be used for MOLA-LO localization updates")
     mola_lo_reference_frame_env_var = SetEnvironmentVariable(
         name='MOLA_LO_PUBLISH_REF_FRAME', value=LaunchConfiguration('mola_lo_reference_frame'))
+    # ~~~~~~~~~~~~
+    mola_lo_pipeline_arg = DeclareLaunchArgument(
+        "mola_lo_pipeline", default_value="../pipelines/lidar3d-default.yaml", description="The LiDAR-Odometry pipeline configuration YAML file defining the LO system. Absolute path, or relative to 'mola-cli-launchs/lidar_odometry_ros2.yaml'. Default is the 'lidar3d-default.yaml' system described in the IJRR 2025 paper.")
+    mola_lo_pipeline_arg_env_var = SetEnvironmentVariable(
+        name='MOLA_ODOMETRY_PIPELINE_YAML', value=LaunchConfiguration('mola_lo_pipeline'))
+    # ~~~~~~~~~~~~
+    generate_simplemap_arg = DeclareLaunchArgument(
+        "generate_simplemap", default_value="False", description="Whether to create a '.simplemap', useful for map post-processing. Refer to online tutorials.")
+    generate_simplemap_env_var = SetEnvironmentVariable(
+        name='MOLA_GENERATE_SIMPLEMAP', value=LaunchConfiguration('generate_simplemap'))
     # ~~~~~~~~~~~~
 
     # Namespace (Based on Nav2's bring-up launch file!)
@@ -150,6 +160,10 @@ def generate_launch_description():
         start_active_env_var,
         mola_lo_reference_frame_arg,
         mola_lo_reference_frame_env_var,
+        mola_lo_pipeline_arg,
+        mola_lo_pipeline_arg_env_var,
+        generate_simplemap_arg,
+        generate_simplemap_env_var,
         use_rviz_arg,
         node_group
     ])
