@@ -1,3 +1,26 @@
+## mola_lidar_odometry (humble) - 0.6.2-1
+
+The packages in the `mola_lidar_odometry` repository were released into the `humble` distro by running `/usr/bin/bloom-release -r humble -y mola_lidar_odometry` on `Thu, 13 Feb 2025 16:41:02 -0000`
+
+The `mola_lidar_odometry` package was released.
+
+Version of package(s) in repository `mola_lidar_odometry`:
+
+- upstream repository: https://github.com/MOLAorg/mola_lidar_odometry.git
+- release repository: https://github.com/ros2-gbp/mola_lidar_odometry-release.git
+- rosdistro version: `0.6.1-1`
+- old version: `0.6.1-1`
+- new version: `0.6.2-1`
+
+Versions of tools used:
+
+- bloom version: `0.12.0`
+- catkin_pkg version: `1.0.0`
+- rosdep version: `0.25.1`
+- rosdistro version: `1.0.1`
+- vcstools version: `0.1.42`
+
+
 ## mola_lidar_odometry (rolling) - 0.6.1-1
 
 The packages in the `mola_lidar_odometry` repository were released into the `rolling` distro by running `/home/jlblanco/code/bloom-venv/bin/bloom-release -r rolling -y mola_lidar_odometry` on `Sun, 26 Jan 2025 19:27:46 -0000`
