@@ -75,6 +75,9 @@ class CheckBox;
 
 namespace mola
 {
+template <std::size_t N, typename T>
+constexpr std::array<T, N> create_array(const T & value);
+
 /** LIDAR-inertial odometry based on ICP against a local metric map model.
  */
 class LidarOdometry : public mola::FrontEndBase,
@@ -399,7 +402,7 @@ public:
 
     bool start_active = true;
 
-    uint32_t max_worker_thread_queue_before_drop = 500;
+    int32_t max_lidar_queue_before_drop = 15;
 
     uint32_t gnss_queue_max_size = 100;
 
@@ -414,6 +417,9 @@ public:
   Parameters params_;
 
   bool isBusy() const;
+
+  bool isActive() const;
+  void setActive(const bool active);
 
   /** Returns a copy of the estimated trajectory, with timestamps for each
      * lidar observation.
@@ -524,17 +530,28 @@ private:
   {
     MethodState() = default;
 
+    // ------ these flags are protected by state_flags_mtx_  ---------
     bool initialized = false;
     bool fatal_error = false;
+    bool active = true;  //!< whether to process or ignore incoming sensors
+    // ------ ^^^ end of these flags are protected ^^^^      ---------
+
+    // ------ these vars are protected by is_busy_mtx_  ---------
+    int worker_tasks_lidar = 0;
+    int worker_tasks_others = 0;
+
+    static constexpr std::size_t DROP_STATS_WINDOW_LENGHT = 128;
+    std::array<bool, DROP_STATS_WINDOW_LENGHT> drop_frames_stats_good =
+      create_array<DROP_STATS_WINDOW_LENGHT>(true);
+    std::array<bool, DROP_STATS_WINDOW_LENGHT> drop_frames_stats_dropped =
+      create_array<DROP_STATS_WINDOW_LENGHT>(false);
+    std::size_t drop_frames_stats_next_index = 0;
+    // ------ ^^^ end of these flags are protected ^^^^      ---------
+
+    // All other fields are protected by state_mtx_
 
     // will be true after the first incoming LiDAR frame and re-localization is enabled and run
     bool initial_localization_done = false;
-
-    /// if false, input observations will be just ignored.
-    /// Useful for real-time execution on robots.
-    bool active = true;
-
-    int worker_tasks = 0;
 
     mrpt::poses::CPose3DPDFGaussian last_lidar_pose;  //!< in local map
 
@@ -586,12 +603,15 @@ private:
     /// To update the map in the viz only if really needed
     bool local_map_needs_viz_update = true;
     bool local_map_needs_publish = true;
+    bool local_map_georef_needs_publish = true;
 
     void mark_local_map_as_updated()
     {
       local_map_needs_viz_update = true;
       local_map_needs_publish = true;
     }
+
+    void mark_local_map_georef_as_updated() { local_map_georef_needs_publish = true; }
 
     /// To handle post-re-localization. >0 means we are "recovering" from a request to re-localize:
     uint32_t step_counter_post_relocalization = 0;
@@ -610,7 +630,8 @@ private:
     // 2) Using a dataset source that supports lazy-load:
     mutable std::map<mrpt::Clock::time_point, mrpt::obs::CSensoryFrame::Ptr>
       past_simplemaps_observations;
-  };
+
+  };  // end of MethodState
 
   /** The worker thread pool with 1 thread for processing incomming
      * IMU or LIDAR observations*/
@@ -633,6 +654,7 @@ private:
     nanogui::Label * lbSensorRange = nullptr;
     nanogui::Label * lbTime = nullptr;
     nanogui::Label * lbSpeed = nullptr;
+    nanogui::Label * lbLidarQueue = nullptr;
     nanogui::CheckBox * cbActive = nullptr;
     nanogui::CheckBox * cbMapping = nullptr;
     nanogui::CheckBox * cbSaveSimplemap = nullptr;
@@ -645,6 +667,7 @@ private:
 
   bool destructor_called_ = false;
   mutable std::mutex is_busy_mtx_;
+  mutable std::mutex state_flags_mtx_;
   mutable std::recursive_mutex state_mtx_;
   mutable std::mutex state_trajectory_mtx_;
   mutable std::recursive_mutex state_simplemap_mtx_;
@@ -652,6 +675,12 @@ private:
   /// The list of pending tasks from enqueue_request():
   std::vector<std::function<void()>> requests_;
   std::mutex requests_mtx_;
+
+  /// Must be called from a scope with state_flags_mtx_ already adquired!
+  void addDropStats(bool frame_is_dropped);
+
+  /// Returns the ratio [0,1] of lidar frames dropped due to slow processing in the last few seconds.
+  double getDropStats() const;
 
   // Process requests_(), at the spinOnce() rate.
   void processPendingUserRequests();
@@ -694,6 +723,23 @@ private:
   void unloadPastSimplemapObservations(const size_t maxSizeUnloadQueue) const;
 
   void handleUnloadSinglePastObservation(CObservation::Ptr & o) const;
+
+  void onPublishDiagnostics();
 };
 
+namespace detail
+{
+template <typename T, std::size_t... Is>
+constexpr std::array<T, sizeof...(Is)> create_array(T value, std::index_sequence<Is...>)
+{
+  // cast Is to void to remove the warning: unused value
+  return {{(static_cast<void>(Is), value)...}};
+}
+}  // namespace detail
+
+template <std::size_t N, typename T>
+constexpr std::array<T, N> create_array(const T & value)
+{
+  return detail::create_array(value, std::make_index_sequence<N>());
+}
 }  // namespace mola
