@@ -2,14 +2,14 @@
 # ROS 2 launch file
 
 from launch import LaunchDescription
-from launch.substitutions import TextSubstitution
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch.conditions import IfCondition
 from launch_ros.actions import Node
 from launch_ros.actions import PushRosNamespace
 from launch.actions import DeclareLaunchArgument
 from launch.actions import SetEnvironmentVariable
 from launch.actions import GroupAction
+from launch.actions import Shutdown
 from ament_index_python import get_package_share_directory
 import os
 
@@ -81,14 +81,61 @@ def generate_launch_description():
         name='MOLA_GENERATE_SIMPLEMAP', value=LaunchConfiguration('generate_simplemap'))
     # ~~~~~~~~~~~~
     mola_initial_map_mm_file_arg = DeclareLaunchArgument(
-        "mola_initial_map_mm_file", default_value="", description="Can be used to provide a metric map '.mm' file to be loaded as initial map. Refer to online tutorials.")
+        "mola_initial_map_mm_file", default_value="\"\"", description="Can be used to provide a metric map '.mm' file to be loaded as initial map. Refer to online tutorials.")
     mola_initial_map_mm_file_env_var = SetEnvironmentVariable(
         name='MOLA_LOAD_MM', value=LaunchConfiguration('mola_initial_map_mm_file'))
     # ~~~~~~~~~~~~
     mola_initial_map_sm_file_arg = DeclareLaunchArgument(
-        "mola_initial_map_sm_file", default_value="", description="Can be used to provide a keyframes map '.simplemap' file to be loaded as initial map. Refer to online tutorials.")
+        "mola_initial_map_sm_file", default_value="\"\"", description="Can be used to provide a keyframes map '.simplemap' file to be loaded as initial map. Refer to online tutorials.")
     mola_initial_map_sm_file_env_var = SetEnvironmentVariable(
         name='MOLA_LOAD_SM', value=LaunchConfiguration('mola_initial_map_sm_file'))
+    # ~~~~~~~~~~~~
+    mola_footprint_to_base_link_tf_arg = DeclareLaunchArgument(
+        "mola_footprint_to_base_link_tf", default_value="[0, 0, 0, 0, 0, 0]", description="Can be used to define a custom transformation between base_footprint and base_link. The coordinates are [x, y, z, yaw_deg, pitch_deg, roll_deg].")
+    mola_footprint_to_base_link_tf_env_var = SetEnvironmentVariable(
+        name='MOLA_TF_FOOTPRINT_TO_BASE_LINK', value=LaunchConfiguration('mola_footprint_to_base_link_tf'))
+    # ~~~~~~~~~~~~
+    enforce_planar_motion_arg = DeclareLaunchArgument(
+        "enforce_planar_motion", default_value="False", description="Whether to enforce z, pitch, and roll to be zero.")
+    enforce_planar_motion_env_var = SetEnvironmentVariable(
+        name='MOLA_NAVSTATE_ENFORCE_PLANAR_MOTION', value=LaunchConfiguration('enforce_planar_motion'))
+    # ~~~~~~~~~~~~
+    use_state_estimator_arg = DeclareLaunchArgument(
+        "use_state_estimator",
+        default_value="False",
+        description="If false, the basic state estimator 'mola::state_estimation_simple::StateEstimationSimple' will be used. If true, 'mola::state_estimation_smoother::StateEstimationSmoother' is used instead."
+    )
+    state_estimator_env_var = SetEnvironmentVariable(
+        name='MOLA_STATE_ESTIMATOR', value=PythonExpression(
+            ["'mola::state_estimation_simple::StateEstimationSmoother' if ",
+             LaunchConfiguration(
+                 'use_state_estimator'),
+             " else 'mola::state_estimation_smoother::StateEstimationSimple'"
+             ]))
+    localization_publish_tf_source_env_var = SetEnvironmentVariable(
+        name='MOLA_LOCALIZATION_PUBLISH_TF_SOURCE',
+        value=PythonExpression([
+            "'state_estimator' if ", LaunchConfiguration(
+                'use_state_estimator'), " else 'lidar_odometry'"
+        ])
+    )
+    localization_publish_odom_source_env_var = SetEnvironmentVariable(
+        name='MOLA_LOCALIZATION_PUBLISH_ODOM_MSGS_SOURCE',
+        value=PythonExpression([
+            "'state_estimator' if ", LaunchConfiguration(
+                'use_state_estimator'), " else 'lidar_odometry'"
+        ])
+    )
+    state_estimator_config_yaml_arg = DeclareLaunchArgument(
+        "state_estimator_config_yaml", default_value=PythonExpression(
+            ["'../state-estimator-params/state-estimation-smoother.yaml' if ",
+             LaunchConfiguration(
+                 'use_state_estimator'),
+             " else '../state-estimator-params/state-estimation-simple.yaml'"
+             ]),
+        description="A YAML file with settings for the state estimator. Absolute path or relative to 'mola-cli-launchs/lidar_odometry_ros2.yaml'")
+    state_estimator_config_yaml_env_var = SetEnvironmentVariable(
+        name='MOLA_STATE_ESTIMATOR_YAML', value=LaunchConfiguration('state_estimator_config_yaml'))
     # ~~~~~~~~~~~~
 
     # Namespace (Based on Nav2's bring-up launch file!)
@@ -135,7 +182,8 @@ def generate_launch_description():
             executable='mola-cli',
             output='screen',
             remappings=tf_remaps,
-            arguments=[mola_system_yaml_file]
+            arguments=[mola_system_yaml_file],
+            on_exit=Shutdown()
         ),
 
         Node(
@@ -178,6 +226,16 @@ def generate_launch_description():
         mola_initial_map_mm_file_env_var,
         mola_initial_map_sm_file_arg,
         mola_initial_map_sm_file_env_var,
+        mola_footprint_to_base_link_tf_arg,
+        mola_footprint_to_base_link_tf_env_var,
+        enforce_planar_motion_arg,
+        enforce_planar_motion_env_var,
+        use_state_estimator_arg,
+        state_estimator_env_var,
+        state_estimator_config_yaml_arg,
+        state_estimator_config_yaml_env_var,
+        localization_publish_odom_source_env_var,
+        localization_publish_tf_source_env_var,
         use_rviz_arg,
         node_group
     ])
