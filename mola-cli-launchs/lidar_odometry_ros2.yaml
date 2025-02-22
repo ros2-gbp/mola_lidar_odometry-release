@@ -33,6 +33,10 @@ modules:
     type: '${MOLA_STATE_ESTIMATOR|mola::state_estimation_simple::StateEstimationSimple}'
     verbosity_level: '${MOLA_VERBOSITY_MOLA_STATE_ESTIMATOR|INFO}'
 
+    # When using StateEstimationSmoother, this execution rate (Hz) determines the
+    # rate of publishing filtered pose estimations.
+    execution_rate: ${MOLA_STATE_ESTIMATOR_PUBLISH_RATE|10}  # Hz
+
     # This includes here a whole block "params: (...)":
     params: '${MOLA_STATE_ESTIMATOR_YAML|../state-estimator-params/state-estimation-simple.yaml}'
 
@@ -61,10 +65,10 @@ modules:
       # SLAM/localization results (read below).
       base_link_frame: '${MOLA_TF_BASE_LINK|base_link}'
 
-      # If not empty, the node will broadcast a static /tf from base_link to
-      # base_footprint with the TF base_footprint_to_base_link_tf at start up.
-      #base_footprint_frame: 'base_footprint'
-      #base_footprint_to_base_link_tf: '[x y z yaw_deg pitch_deg roll_deg]'
+      # If not empty, the node will broadcast a static /tf from base_footprint to
+      # base_link with the TF base_footprint_to_base_link_tf at start up.
+      base_footprint_frame: '${MOLA_TF_FOOTPRINT_LINK|base_footprint}'
+      base_footprint_to_base_link_tf: '${MOLA_TF_FOOTPRINT_TO_BASE_LINK|[0, 0, 0, 0, 0, 0]}'  # [x, y, z, yaw_deg, pitch_deg, roll_deg]
 
       # Used for:
       # (a) importing odometry to MOLA if ``forward_ros_tf_as_mola_odometry_observations=true``
@@ -81,7 +85,7 @@ modules:
       # How to publish localization to /tf:
       # - ``false``(direct mode): reference_frame ("map") -> base_link ("base_link")
       #   Note that reference_frame in this case comes from the localization source module
-      #   (e.g. mola_lida_odometry), it is not configured here.
+      #   (e.g. mola_lidar_odometry), it is not configured here.
       #
       #  - ``true`` (indirect mode), following ROS [REP
       #  105](https://ros.org/reps/rep-0105.html):
@@ -94,10 +98,16 @@ modules:
 
       # If enabled, SLAM/Localization results will be published as nav_msgs/Odometry messages.
       publish_odometry_msgs_from_slam: ${MOLA_LOCALIZATION_PUBLISH_ODOM_MSGS|true}
+      
+      # If the flag above is true, this allows fine tuning which localization source will be actually forwarded (MOLA module name). Empty=any.
+      publish_odometry_msgs_from_slam_source: ${MOLA_LOCALIZATION_PUBLISH_ODOM_MSGS_SOURCE|""}  # alternative: 'state_estimation_smoother'
 
       # If enabled, SLAM/Localization results will be published as tf messages, for frames
       # according to explained above for `publish_localization_following_rep105`.
       publish_tf_from_slam: ${MOLA_LOCALIZATION_PUBLISH_TF|true}
+
+      # If the flag above is true, this allows fine tuning which localization source will be actually forwarded (MOLA module name). Empty=any.
+      publish_tf_from_slam_source: ${MOLA_LOCALIZATION_PUBLISH_TF_SOURCE|""}  # alternative: 'state_estimation_smoother'
 
       # If enabled, robot pose observations (typically, ground truth from datasets), will be
       # forwarded to ROS as /tf messages: ``${reference_frame} => ${base_link}``
@@ -114,10 +124,13 @@ modules:
       publish_in_sim_time: false
 
       # Period [s] to publish new localization estimates to ROS2 from the MOLA SLAM solution:
-      period_publish_new_localization: 0.1 # [s]
+      # Note that no repeated localization are published. This is just the period for checking if new
+      # estimates are available and waiting to be published.
+      period_publish_new_localization: 0.020 # [s]
 
       # Period [s] to publish the updated map to ROS2 from the MOLA SLAM solution:
-      period_publish_new_map: 3.0 # [s]
+      # Note that no repeated maps are published. This is just the period for checking the need to republish.
+      period_publish_new_map: 1.0 # [s]
 
       # A placeholder for optional flags from "ros2 launch", captured
       # as all cli arguments after "--ros-args":
