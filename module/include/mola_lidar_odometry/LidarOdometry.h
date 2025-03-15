@@ -50,14 +50,16 @@
 // MRPT
 #include <mrpt/core/WorkerThreadsPool.h>
 #include <mrpt/maps/CSimpleMap.h>
-#include <mrpt/maps/CSimplePointsMap.h>
 #include <mrpt/obs/obs_frwds.h>
 #include <mrpt/opengl/CSetOfLines.h>
 #include <mrpt/opengl/CSetOfObjects.h>
 #include <mrpt/poses/CPose3DInterpolator.h>
-#include <mrpt/serialization/CSerializable.h>
+#include <mrpt/typemeta/TEnumType.h>
 
 // STD:
+#include <array>
+#include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <limits>
 #include <map>
@@ -78,6 +80,16 @@ namespace mola
 template <std::size_t N, typename T>
 constexpr std::array<T, N> create_array(const T & value);
 
+enum class InitLocalization : uint8_t
+{
+  /// Initialize around a given SE(3) pose with covariance:
+  FixedPose = 0,
+  /// Initialize from the external state estimator, with an optional maximum uncertainty threshold
+  FromStateEstimator,
+  /// Initialize pitch & roll from a short IMU sequence, assuming sensor is roughly stationary at startup
+  PitchAndRollFromIMU,
+};
+
 /** LIDAR-inertial odometry based on ICP against a local metric map model.
  */
 class LidarOdometry : public mola::FrontEndBase,
@@ -90,7 +102,7 @@ class LidarOdometry : public mola::FrontEndBase,
 
 public:
   LidarOdometry();
-  ~LidarOdometry();
+  ~LidarOdometry() override;
 
   /** @name Main API
      * @{ */
@@ -111,13 +123,6 @@ public:
     NoMotionModel
   };
 
-  enum class InitLocalization : uint8_t
-  {
-    FixedPose = 0,
-    FromGNSS_Static,
-    FromGNSS_Motion,
-  };
-
   struct Parameters : public mp2p_icp::Parameterizable
   {
     /** List of sensor labels or regex's to be matched to input observations
@@ -129,11 +134,6 @@ public:
          *  to be used as raw IMU observations.
          */
     std::optional<std::regex> imu_sensor_label;
-
-    /** Sensor labels or regex to be matched to input observations
-         *  to be used as wheel odometry observations.
-         */
-    std::optional<std::regex> wheel_odometry_sensor_label;
 
     /** Sensor labels or regex to be matched to input observations
          *  to be used as GNSS (GPS) observations.
@@ -373,7 +373,6 @@ public:
     {
       InitialLocalizationOptions() = default;
 
-      bool enabled = false;
       InitLocalization method = InitLocalization::FixedPose;
 
       mrpt::math::TPose3D fixed_initial_pose;
@@ -642,6 +641,7 @@ private:
   const MethodState & state() const { return state_; }
   MethodState stateCopy() const { return state_; }
 
+  // Accessing this struct in gui_ requires adquiring state_gui_mtx_
   struct StateUI
   {
     StateUI() = default;
@@ -660,6 +660,7 @@ private:
     nanogui::CheckBox * cbSaveSimplemap = nullptr;
   };
 
+  // Accessing this struct in gui_ requires adquiring state_gui_mtx_
   StateUI gui_;
 
   /// The configuration used in the last call to initialize()
@@ -671,6 +672,7 @@ private:
   mutable std::recursive_mutex state_mtx_;
   mutable std::mutex state_trajectory_mtx_;
   mutable std::recursive_mutex state_simplemap_mtx_;
+  mutable std::mutex state_gui_mtx_;
 
   /// The list of pending tasks from enqueue_request():
   std::vector<std::function<void()>> requests_;
@@ -686,13 +688,10 @@ private:
   void processPendingUserRequests();
 
   void onLidar(const CObservation::Ptr & o);
-  void onLidarImpl(const CObservation::Ptr & obs);
+  void processLidarScan(const CObservation::Ptr & obs);
 
   void onIMU(const CObservation::Ptr & o);
   void onIMUImpl(const CObservation::Ptr & o);
-
-  void onWheelOdometry(const CObservation::Ptr & o);
-  void onWheelOdometryImpl(const CObservation::Ptr & o);
 
   void onGPS(const CObservation::Ptr & o);
   void onGPSImpl(const CObservation::Ptr & o);
@@ -725,6 +724,7 @@ private:
   void handleUnloadSinglePastObservation(CObservation::Ptr & o) const;
 
   void onPublishDiagnostics();
+  void handleInitialLocalization();
 };
 
 namespace detail
@@ -743,3 +743,9 @@ constexpr std::array<T, N> create_array(const T & value)
   return detail::create_array(value, std::make_index_sequence<N>());
 }
 }  // namespace mola
+
+MRPT_ENUM_TYPE_BEGIN_NAMESPACE(mola, mola::InitLocalization)
+MRPT_FILL_ENUM(InitLocalization::FixedPose);
+MRPT_FILL_ENUM(InitLocalization::FromStateEstimator);
+MRPT_FILL_ENUM(InitLocalization::PitchAndRollFromIMU);
+MRPT_ENUM_TYPE_END()
