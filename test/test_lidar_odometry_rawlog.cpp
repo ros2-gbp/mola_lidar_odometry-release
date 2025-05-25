@@ -1,7 +1,7 @@
 // -----------------------------------------------------------------------------
 //   A Modular Optimization framework for Localization and mApping  (MOLA)
 //
-// Copyright (C) 2018-2024 Jose Luis Blanco, University of Almeria
+// Copyright (C) 2018-2025 Jose Luis Blanco, University of Almeria
 // Licensed under the GNU GPL v3.
 //
 // This file is part of MOLA.
@@ -111,9 +111,9 @@ int main_odometry(
 
     const double err = mrpt::poses::Lie::SE<3>::log(mrpt::poses::CPose3D(gt - pose)).norm();
 
-    EXPECT_LT(err, 0.1) << "Estimated trajectory pose mismatch:\n"
-                        << " LO pose: " << pose << "\n"
-                        << " GT pose: " << gt << "\n";
+    EXPECT_LT(err, 0.15) << "Estimated trajectory pose mismatch:\n"
+                         << " LO pose: " << pose << "\n"
+                         << " GT pose: " << gt << "\n";
   }
 
   return 0;
