@@ -209,11 +209,13 @@ void LidarOdometry::onIMUImpl(const CObservation::Ptr & o)
   // 2) (TODO!) Improved scan de-skewing.
 
   // 1) Initial pitch/roll estimation:
-  const bool do_initial_pitch_roll_estimate = true;
-
-  if (!do_initial_pitch_roll_estimate) {
-    return;
+  {
+    auto lckState = mrpt::lockHelper(state_mtx_);
+    if (state_.imu_averager.has_value()) {
+      state_.imu_averager->add(imu);
+    }
   }
+
   if (
     !imu->has(mrpt::obs::IMU_X_ACC) || !imu->has(mrpt::obs::IMU_Y_ACC) ||
     !imu->has(mrpt::obs::IMU_Z_ACC)) {
@@ -229,7 +231,8 @@ void LidarOdometry::onIMUImpl(const CObservation::Ptr & o)
 
   const auto accel_base_link = accel_sensor.rotated(imu->sensorPose.asTPose());
 
-  MRPT_TODO("Continue");
+  // TODO(jlbc): Continue with scan de-skewing using IMU data
+  (void)accel_base_link;
 }
 
 void LidarOdometry::onGPS(const CObservation::Ptr & o)
