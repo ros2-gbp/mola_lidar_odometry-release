@@ -94,6 +94,7 @@ void LidarOdometry::Parameters::Visualization::initialize(const Yaml & cfg)
   YAML_LOAD_OPT(gui_subwindow_starts_hidden, bool);
   YAML_LOAD_OPT(camera_follows_vehicle, bool);
   YAML_LOAD_OPT(camera_rotates_with_vehicle, bool);
+  YAML_LOAD_OPT(camera_orthographic, bool);
 }
 
 void LidarOdometry::Parameters::SimpleMapOptions::initialize(const Yaml & cfg, Parameters & parent)
@@ -144,6 +145,8 @@ void LidarOdometry::Parameters::InitialLocalizationOptions::initialize(const Yam
   MCP_LOAD_OPT(cfg, method);
 
   YAML_LOAD_OPT(additional_uncertainty_after_reloc_how_many_timesteps, uint32_t);
+  YAML_LOAD_OPT(pitch_and_roll_from_imu_sample_count, uint32_t);
+  YAML_LOAD_OPT(pitch_and_roll_from_imu_max_age, double);
 
   if (cfg.has("fixed_initial_pose")) {
     ASSERT_(
