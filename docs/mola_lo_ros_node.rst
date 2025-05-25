@@ -127,6 +127,10 @@ runs **MOLA-LO** live on point clouds received from a ROS 2 topic, **demonstrati
             Whether to import an existing /tf 'odom'->'base_link' odometry into the MOLA subsystem.
             (default: 'False')
 
+         'initial_localization_method':
+            What method to use for initialization.  See https://docs.mola-slam.org/latest/ros2api.html#initial-localization
+            (default: 'InitLocalization::FixedPose')
+
          'use_state_estimator':
             If false, the basic state estimator 'mola::state_estimation_simple::StateEstimationSimple' will be used. If true, 'mola::state_estimation_smoother::StateEstimationSmoother' is used instead.
             (default: 'False')
@@ -134,6 +138,10 @@ runs **MOLA-LO** live on point clouds received from a ROS 2 topic, **demonstrati
          'state_estimator_config_yaml':
             A YAML file with settings for the state estimator. Absolute path or relative to 'mola-cli-launchs/lidar_odometry_ros2.yaml'
             (default: PythonExpr(''../state-estimator-params/state-estimation-smoother.yaml' if ' + LaunchConfig('use_state_estimator') + ' else '../state-estimator-params/state-estimation-simple.yaml''))
+
+         'mola_state_estimator_reference_frame':
+            The /tf frame name to be used as reference for MOLA State Estimators to publish pose updates
+            (default: 'map')
 
          'use_rviz':
             Whether to launch RViz2 with default lidar-odometry.rviz configuration
