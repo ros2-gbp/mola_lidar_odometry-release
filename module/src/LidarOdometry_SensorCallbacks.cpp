@@ -1,25 +1,16 @@
-// -----------------------------------------------------------------------------
-//   A Modular Optimization framework for Localization and mApping  (MOLA)
-//
-// Copyright (C) 2018-2025 Jose Luis Blanco, University of Almeria
-// Licensed under the GNU GPL v3.
-//
-// This file is part of MOLA.
-// MOLA is free software: you can redistribute it and/or modify it under the
-// terms of the GNU General Public License as published by the Free Software
-// Foundation, either version 3 of the License, or (at your option) any later
-// version.
-//
-// MOLA is distributed in the hope that it will be useful, but WITHOUT ANY
-// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
-// A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License along with
-// MOLA. If not, see <https://www.gnu.org/licenses/>.
-//
-// Closed-source licenses available upon request, for this odometry package
-// alone or in combination with the complete SLAM system.
-// -----------------------------------------------------------------------------
+/*               _
+ _ __ ___   ___ | | __ _
+| '_ ` _ \ / _ \| |/ _` | Modular Optimization framework for
+| | | | | | (_) | | (_| | Localization and mApping (MOLA)
+|_| |_| |_|\___/|_|\__,_| https://github.com/MOLAorg/mola
+
+ Copyright (C) 2018-2025 Jose Luis Blanco, University of Almeria,
+                         and individual contributors.
+ SPDX-License-Identifier: GPL-3.0
+ See LICENSE for full license information.
+ Closed-source licenses available upon request, for this odometry package
+ alone or in combination with the complete SLAM system.
+*/
 
 /**
  * @file   LidarOdometry.cpp
@@ -206,7 +197,7 @@ void LidarOdometry::onIMUImpl(const CObservation::Ptr & o)
 
   // Uses of IMU in MOLA-LO (this class):
   // 1) During special initialization to compensate for pitch/roll;
-  // 2) (TODO!) Improved scan de-skewing.
+  // 2) Improved scan de-skewing.
 
   // 1) Initial pitch/roll estimation:
   {
@@ -216,23 +207,13 @@ void LidarOdometry::onIMUImpl(const CObservation::Ptr & o)
     }
   }
 
-  if (
-    !imu->has(mrpt::obs::IMU_X_ACC) || !imu->has(mrpt::obs::IMU_Y_ACC) ||
-    !imu->has(mrpt::obs::IMU_Z_ACC)) {
-    // No acceleration data:
-    return;
+  // 2) Precise scan de-skewing is done via Generator, which in turns passes the IMU data to the
+  //    LocalVelocityBuffer inside the ParameterSource.
+  {
+    auto lckState = mrpt::lockHelper(state_mtx_);
+    mp2p_icp::metric_map_t dummy_map;
+    mp2p_icp_filters::apply_generators(state_.obs_generators, *imu, dummy_map);
   }
-
-  const auto accel_sensor = mrpt::math::TTwist3D(  //
-    imu->get(mrpt::obs::IMU_X_ACC),                //
-    imu->get(mrpt::obs::IMU_Y_ACC),                //
-    imu->get(mrpt::obs::IMU_Z_ACC),                //
-    0, 0, 0);
-
-  const auto accel_base_link = accel_sensor.rotated(imu->sensorPose.asTPose());
-
-  // TODO(jlbc): Continue with scan de-skewing using IMU data
-  (void)accel_base_link;
 }
 
 void LidarOdometry::onGPS(const CObservation::Ptr & o)
