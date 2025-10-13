@@ -13,6 +13,11 @@ offline datasets.
 ## Build and install
 Refer to: https://docs.mola-slam.org/latest/#installing
 
+Lidar Inertial Odometry (LIO) demo with Oxford Spires:
+![Peek 2025-08-31 11-36](https://github.com/user-attachments/assets/b99d99de-9178-4fda-bf85-cb926f8c5d87)
+
+
+Lidar Odometry (LO) demo with KITTI:
 ![mola-slam-kitti-demo](https://github.com/user-attachments/assets/45255aba-6ea2-44eb-b5e4-4cc52e8e7615)
 
 ## Documentation and tutorials
@@ -38,16 +43,16 @@ The latest publication on MOLA is ([ArXiV](https://arxiv.org/abs/2407.20465)).
 
 ```bibtex
 @article{blanco2025mola_lo,
-    author = {Jose Luis Blanco-Claraco},
-    title ={A flexible framework for accurate LiDAR odometry, map manipulation, and localization},
+    author = {Blanco-Claraco, Jose Luis},
+    title ={{A flexible framework for accurate LiDAR odometry, map manipulation, and localization}},
     journal = {The International Journal of Robotics Research},
-    volume = {0},
-    number = {0},
-    pages = {02783649251316881},
+    volume = {44},
+    number = {9},
+    pages = {1553--1599},
     year = {2025},
     doi = {10.1177/02783649251316881},
     URL = { https://doi.org/10.1177/02783649251316881},
-    eprint = {https://doi.org/10.1177/02783649251316881},
+    eprint = {2407.20465},
 }
 ```
 
