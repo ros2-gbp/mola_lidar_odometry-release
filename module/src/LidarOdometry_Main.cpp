@@ -120,15 +120,13 @@ void LidarOdometry::spinOnce()
     const auto mapStamp =
       state_.last_obs_timestamp ? *state_.last_obs_timestamp : mrpt::Clock::now();
 
-    doPublishUpdatedMap(mapStamp);
+    doPublishUpdatedLocalMap(mapStamp);
   }
 
   // Publish optional regular diagnostics:
-#if MOLA_VERSION_CHECK(1, 6, 2)
   if (module_is_time_to_publish_diagnostics()) {
     onPublishDiagnostics();
   }
-#endif
 
   MRPT_TRY_END
 }
