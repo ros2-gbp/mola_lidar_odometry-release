@@ -15,20 +15,53 @@ runs **MOLA-LO** live on point clouds received from a ROS 2 topic, **demonstrati
 
 .. tab-set::
 
-   .. tab-item:: Basic usage
-      :selected:
+   .. tab-item:: Basic LO usage
 
       .. code-block:: bash
 
-         # Minimal use case (requires correct LiDAR sensor /tf):
+         # Minimal LO use case (requires correct LiDAR sensor /tf):
          ros2 launch mola_lidar_odometry ros2-lidar-odometry.launch.py \
             lidar_topic_name:=ouster/points
 
-         # Usage without sensor /tf:
+         # LO usage without sensor /tf:
          ros2 launch mola_lidar_odometry ros2-lidar-odometry.launch.py \
             lidar_topic_name:=ouster/points \
             ignore_lidar_pose_from_tf:=True \
             publish_localization_following_rep105:=False
+
+   .. tab-item:: LIO usage (Ouster with /tf)
+      :selected:
+
+      This is how to use LiDAR-Inertial Odometry (LIO) by using LiDAR clouds plus an IMU:
+
+      .. code-block:: bash
+
+         # Example LIO usage for Ouster LiDAR + integrated IMU:
+         ros2 launch mola_lidar_odometry ros2-lidar-odometry.launch.py \
+           mola_deskew_method:=MotionCompensationMethod::IMU \
+           lidar_topic_name:=/ouster/points \
+           imu_topic_name:=/ouster/imu \
+           mola_tf_base_link:=os_sensor
+
+   .. tab-item:: LIO usage (No /tf)
+      :selected:
+
+      This is how to use LiDAR-Inertial Odometry (LIO) by using LiDAR clouds plus an IMU,
+      when no /tf is available for the sensor poses so you must manually specify them:
+
+      .. code-block:: bash
+
+         # Example LIO usage for LiDAR + IMU for Oxford Spires Dataset:
+         IMU_POSE_YAW=90 \
+         LIDAR_POSE_YAW=180 \
+         ros2 launch mola_lidar_odometry ros2-lidar-odometry.launch.py \
+           mola_deskew_method:=MotionCompensationMethod::IMU \
+           lidar_topic_name:=/hesai/pandar \
+           imu_topic_name:=/alphasense_driver_ros/imu \
+           ignore_lidar_pose_from_tf:=True \
+           ignore_imu_pose_from_tf:=True \
+           publish_localization_following_rep105:=False
+
 
    .. tab-item:: Robot with NS
       :selected:
@@ -128,7 +161,7 @@ runs **MOLA-LO** live on point clouds received from a ROS 2 topic, **demonstrati
             (default: 'False')
 
          'initial_localization_method':
-            What method to use for initialization.  See https://docs.mola-slam.org/latest/ros2api.html#initial-localization
+            What method to use for initialization. See https://docs.mola-slam.org/latest/ros2api.html#initial-localization
             (default: 'InitLocalization::FixedPose')
 
          'use_state_estimator':
@@ -143,9 +176,22 @@ runs **MOLA-LO** live on point clouds received from a ROS 2 topic, **demonstrati
             The /tf frame name to be used as reference for MOLA State Estimators to publish pose updates
             (default: 'map')
 
+         'lidar_scan_validity_minimum_point_count':
+            Minimum number of points in each LiDAR raw scan for it to be considered valid; otherwise, it is ignored.
+            (default: '100')
+
+         'mola_deskew_method':
+            Which motion-compensation method to use to align LiDAR scans more precisely
+            (default: 'MotionCompensationMethod::Linear')
+
+         'mola_tf_base_link':
+            The /tf frame name for the robot base link.
+            (default: 'base_link')
+
          'use_rviz':
             Whether to launch RViz2 with default lidar-odometry.rviz configuration
             (default: 'True')
+
 
 
 .. _mola_lo_ros_mola-cli-env-vars:
@@ -193,6 +239,8 @@ runs **MOLA-LO** live on point clouds received from a ROS 2 topic, **demonstrati
 .. dropdown:: More LO parameters
     :icon: list-unordered
 
-    The ``lidar3d-default.yaml`` pipeline file defines plenty of :ref:`additional parameters and options <mola_3d_default_pipeline>` that you can explore.
+    If using the default :ref:`pipeline <mola_lo_pipelines>`, the ``lidar3d-gicp.yaml`` pipeline file defines plenty
+    of :ref:`additional parameters and options <mola_3d_gicp_pipeline>` that you can explore.
+
     See also the docs for the :ref:`ROS 2 API <mola_ros2api>` and :ref:`this tutorial <tutorial-mola-lo-map-and-localize>` on how to save and load a map using ROS 2 MOLA-LO nodes.
 
