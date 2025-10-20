@@ -26,6 +26,9 @@
 #include <mrpt/io/CMemoryStream.h>
 #include <mrpt/serialization/CArchive.h>
 
+// MOLA:
+#include <mola_kernel/version.h>
+
 // SFINAE to detect for mp2p_icp map metadata:
 namespace
 {
@@ -48,31 +51,21 @@ void LidarOdometry::doPublishUpdatedLocalization(const mrpt::Clock::time_point &
   LocalizationUpdate lu;
   lu.method = "lidar_odometry";
   lu.reference_frame = params_.publish_reference_frame;
-#if MOLA_VERSION_CHECK(1, 6, 0)
   lu.child_frame = params_.publish_vehicle_frame;
-#endif
   lu.timestamp = this_obs_tim;
   lu.pose = state_.last_lidar_pose.mean.asTPose();
   lu.cov = state_.last_lidar_pose.cov;
-#if MOLA_VERSION_CHECK(1, 4, 0)
   lu.quality = state_.last_icp_quality;
-#endif
 
   advertiseUpdatedLocalization(lu);
 }
 
-void LidarOdometry::doPublishUpdatedMap(const mrpt::Clock::time_point & this_obs_tim)
+void LidarOdometry::doPublishUpdatedLocalMap(const mrpt::Clock::time_point & this_obs_tim)
 {
   // Publish geo-referenced data for the map, if applicable.
   publishMetricMapGeoreferencingData();
 
   if (!state_.local_map_needs_publish) {
-    return;
-  }
-
-  // Don't publish if nobody is listening, OR, if it is still
-  // pending to subscribe to us:
-  if (!anyUpdateMapSubscriber()) {
     return;
   }
 
@@ -82,14 +75,16 @@ void LidarOdometry::doPublishUpdatedMap(const mrpt::Clock::time_point & this_obs
     return;
   }
 
-  state_.local_map_needs_publish = false;
-
+  // Don't publish if nobody is listening, OR, if it is still
+  // pending to subscribe to us:
   if (!anyUpdateMapSubscriber()) {
-    MRPT_LOG_DEBUG("doPublishUpdatedMap: Skipping, since we have no subscriber.");
+    MRPT_LOG_DEBUG("doPublishUpdatedLocalMap: Skipping, since we have no subscriber.");
     return;
   }
 
-  const ProfilerEntry tleCleanup(profiler_, "advertiseMap");
+  state_.local_map_needs_publish = false;
+
+  const ProfilerEntry tleCleanup(profiler_, "doPublishUpdatedLocalMap");
   state_.localmap_advertise_updates_counter = 0;
 
   MapUpdate mu;
@@ -113,8 +108,9 @@ void LidarOdometry::doPublishUpdatedMap(const mrpt::Clock::time_point & this_obs
       mapCopy->insertAnotherMap(mapPts.get(), mrpt::poses::CPose3D::Identity());
 
       mu.map = mapCopy;
-    } else if (auto * auxPts = layerMap->getAsSimplePointsMap();
-               auxPts) {  // classes implementing getAsSimplePointsMap()
+    }
+    // classes implementing getAsSimplePointsMap()
+    else if (auto * auxPts = layerMap->getAsSimplePointsMap(); auxPts) {
       auto mapCopy = mrpt::maps::CSimplePointsMap::Create();
       mapCopy->insertAnotherMap(auxPts, mrpt::poses::CPose3D::Identity());
 
@@ -137,10 +133,8 @@ void LidarOdometry::doPublishUpdatedMap(const mrpt::Clock::time_point & this_obs
     MRPT_LOG_DEBUG_STREAM("Published map layer: '" << layerName << "'");
   }
 
-  // And publish the map metadata, if existing:
-  // (We need mp2p_icp>=1.7.0 for this field to exist)
-  if constexpr (
-    has_metadata_field<mp2p_icp::metric_map_t>::value && has_map_metadata_field<MapUpdate>::value) {
+  // And publish the map metadata (added in mp2p_icp>=1.7.0)
+  {
     std::stringstream ss;
     state_.local_map->metadata.printAsYAML(
       ss, mrpt::containers::YamlEmitOptions{.emitHeader = false});
@@ -148,11 +142,41 @@ void LidarOdometry::doPublishUpdatedMap(const mrpt::Clock::time_point & this_obs
     mu.map_metadata = ss.str();
     mu.map.reset();  // no map, just metadata
     advertiseUpdatedMap(mu);
-  } else {
-    MRPT_LOG_DEBUG(
-      "Not publishing map metadata, since mp2p_icp::metric_map_t::metadata or "
-      "MapUpdate::map_metadata are not available at build time.");
   }
+}
+
+void LidarOdometry::doPublishDeskewedScan(const mrpt::Clock::time_point & this_obs_tim)
+{
+  if (!state_.last_deskewed_scan_for_publishing) {
+    return;
+  }
+
+  const auto deskewedScan = state_.last_deskewed_scan_for_publishing;
+  state_.last_deskewed_scan_for_publishing.reset();
+
+  // Don't publish if nobody is listening, OR, if it is still
+  // pending to subscribe to us:
+  if (!anyUpdateMapSubscriber()) {
+    MRPT_LOG_DEBUG("doPublishDeskewedScan: Skipping, since we have no subscriber.");
+    return;
+  }
+
+  const ProfilerEntry tleCleanup(profiler_, "doPublishDeskewedScan");
+
+  MapUpdate mu;
+  mu.method = "lidar_odometry";
+  mu.reference_frame = params_.publish_reference_frame;
+  mu.timestamp = this_obs_tim;
+  mu.map_name = "deskewed_scan";
+  mu.map = deskewedScan;
+#if MOLA_VERSION_CHECK(2, 1, 0)
+  mu.keep_last_one_only = false;  // Aggregate all scans
+#endif
+
+  // send it out:
+  advertiseUpdatedMap(mu);
+
+  MRPT_LOG_DEBUG("Published deskewed map");
 }
 
 void LidarOdometry::publishMetricMapGeoreferencingData()
@@ -179,7 +203,6 @@ void LidarOdometry::publishMetricMapGeoreferencingData()
 
   state_.local_map_georef_needs_publish = false;
 
-#if MOLA_VERSION_CHECK(1, 6, 1)  // we need mola::Georeference struct
   // This will publish geo-ref data via mola_kernel API as mrpt_nav_interfaces::msg::GeoreferencingMetadata
 
   MRPT_LOG_DEBUG_STREAM(
@@ -202,15 +225,10 @@ void LidarOdometry::publishMetricMapGeoreferencingData()
 
   // send it out:
   advertiseUpdatedMap(mu);
-#else
-  MRPT_LOG_WARN(
-    "Not able to publish georeferencing map metadata due to too old mola_kernel version (!)");
-#endif
 }
 
 void LidarOdometry::onPublishDiagnostics()
 {
-#if MOLA_VERSION_CHECK(1, 6, 2)
   auto lckState = mrpt::lockHelper(state_mtx_);
 
   const auto curStamp = state_.last_obs_timestamp ? *state_.last_obs_timestamp : mrpt::Clock::now();
@@ -230,7 +248,6 @@ void LidarOdometry::onPublishDiagnostics()
   diag.value = diagValues;
 
   module_publish_diagnostics(diag);
-#endif
 }
 
 }  // namespace mola
