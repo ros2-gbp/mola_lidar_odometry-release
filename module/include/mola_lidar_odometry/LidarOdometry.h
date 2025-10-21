@@ -454,6 +454,10 @@ public:
 
     /** When publishing pose updates, the vehicle frame name.*/
     std::string publish_vehicle_frame = "base_link";
+
+    /* If enabled, deskewed scans will be published (so, they will be available as ROS2 messages), mostly for visualization.
+   * This may slow-down the system, so it is disabled by default. */
+    bool publish_deskewed_scans = false;
   };
 
   /** Algorithm parameters */
@@ -654,10 +658,13 @@ private:
     bool local_map_needs_publish = true;
     bool local_map_georef_needs_publish = true;
 
-    void mark_local_map_as_updated()
+    void mark_local_map_as_updated(bool force_republish = false)
     {
       local_map_needs_viz_update = true;
       local_map_needs_publish = true;
+      if (force_republish) {
+        localmap_advertise_updates_counter = std::numeric_limits<uint32_t>::max();
+      }
     }
 
     void mark_local_map_georef_as_updated() { local_map_georef_needs_publish = true; }

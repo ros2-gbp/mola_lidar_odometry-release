@@ -144,6 +144,7 @@ void LidarOdometry::initialize_frontend(const Yaml & c)
 
   YAML_LOAD_OPT(params_, publish_reference_frame, std::string);
   YAML_LOAD_OPT(params_, publish_vehicle_frame, std::string);
+  YAML_LOAD_OPT(params_, publish_deskewed_scans, bool);
 
   if (cfg.has("adaptive_threshold")) {
     params_.adaptive_threshold.initialize(cfg["adaptive_threshold"]);
@@ -315,7 +316,7 @@ void LidarOdometry::initialize_frontend(const Yaml & c)
       state_.local_map->load_from_file(params_.local_map_updates.load_existing_local_map);
     ASSERT_(loadOk);
 
-    state_.mark_local_map_as_updated();
+    state_.mark_local_map_as_updated(true);
     state_.mark_local_map_georef_as_updated();
   }
 
