@@ -45,6 +45,10 @@ params:
   # When publishing pose updates, the vehicle frame name.
   publish_vehicle_frame: "${MOLA_LO_PUBLISH_VEHICLE_FRAME|base_link}"
 
+  # If enabled, deskewed scans will be published (so, they will be available as ROS2 messages), mostly for visualization.
+  # This may slow-down the system, so it is disabled by default.
+  publish_deskewed_scans: "${MOLA_LO_PUBLISH_DESKEWED_SCANS|false}"
+
   # How often to update the local map model:
   local_map_updates:
     enabled: "${MOLA_MAPPING_ENABLED|true}"
@@ -58,6 +62,7 @@ params:
     # Should match the "remove farther than" option of the local metric map. "0" means deletion of distant key-frames is disabled
     max_distance_to_keep_keyframes: "${MOLA_LOCAL_MAP_MAX_SIZE|max(100.0, 1.50*ESTIMATED_SENSOR_MAX_RANGE)}" # [m]
     check_for_removal_every_n: 100
+    publish_map_updates_every_n: ${MOLA_PUBLISH_LOCAL_MAP_UPDATES_EVERY_N|40}
 
   # Minimum ICP quality to insert it into the map:
   min_icp_goodness: ${MOLA_MINIMUM_ICP_QUALITY|0.50}
