@@ -23,17 +23,17 @@ def generate_launch_description():
     # Mandatory
     lidar_topic_name_arg = DeclareLaunchArgument(
         "lidar_topic_name", description="Topic name to listen for PointCloud2 input from the LiDAR (for example '/ouster/points')")
-    topic_env_var = SetEnvironmentVariable(
+    lidar_topic_env_var = SetEnvironmentVariable(
         name='MOLA_LIDAR_TOPIC', value=LaunchConfiguration('lidar_topic_name'))
     # ~~~~~~~~~~~~
     ignore_lidar_pose_from_tf_arg = DeclareLaunchArgument(
         "ignore_lidar_pose_from_tf", default_value="false", description="If true, the LiDAR pose will be assumed to be at the origin (base_link). Set to false (default) if you want to read the actual sensor pose from /tf")
-    fixed_sensorpose_env_var = SetEnvironmentVariable(
+    ignore_lidar_pose_from_tf_env_var = SetEnvironmentVariable(
         name='MOLA_USE_FIXED_LIDAR_POSE', value=LaunchConfiguration('ignore_lidar_pose_from_tf'))
     # ~~~~~~~~~~~~
     ignore_imu_pose_from_tf_arg = DeclareLaunchArgument(
         "ignore_imu_pose_from_tf", default_value="false", description="If true, the IMU pose will be assumed to be at the origin (base_link). Set to false (default) if you want to read the actual sensor pose from /tf")
-    fixed_imu_sensorpose_env_var = SetEnvironmentVariable(
+    ignore_imu_pose_from_tf_env_var = SetEnvironmentVariable(
         name='MOLA_USE_FIXED_IMU_POSE', value=LaunchConfiguration('ignore_imu_pose_from_tf'))
     # ~~~~~~~~~~~~
     gnss_topic_name_arg = DeclareLaunchArgument(
@@ -43,7 +43,7 @@ def generate_launch_description():
     # ~~~~~~~~~~~~
     imu_topic_name_arg = DeclareLaunchArgument(
         "imu_topic_name", default_value="imu", description="Topic name to listen for Imu input (for example '/imu')")
-    imu_topic_env_var = SetEnvironmentVariable(
+    imu_topic_name_env_var = SetEnvironmentVariable(
         name='MOLA_IMU_TOPIC', value=LaunchConfiguration('imu_topic_name'))
     # ~~~~~~~~~~~~
     use_rviz = LaunchConfiguration('use_rviz')
@@ -82,7 +82,7 @@ def generate_launch_description():
     # ~~~~~~~~~~~~
     mola_lo_pipeline_arg = DeclareLaunchArgument(
         "mola_lo_pipeline", default_value="../pipelines/lidar3d-default.yaml", description="The LiDAR-Odometry pipeline configuration YAML file defining the LO system. Absolute path, or relative to 'mola-cli-launchs/lidar_odometry_ros2.yaml'. Default is the 'lidar3d-default.yaml' system described in the IJRR 2025 paper.")
-    mola_lo_pipeline_arg_env_var = SetEnvironmentVariable(
+    mola_lo_pipeline_env_var = SetEnvironmentVariable(
         name='MOLA_ODOMETRY_PIPELINE_YAML', value=LaunchConfiguration('mola_lo_pipeline'))
     # ~~~~~~~~~~~~
     generate_simplemap_arg = DeclareLaunchArgument(
@@ -125,7 +125,7 @@ def generate_launch_description():
         default_value="False",
         description="If false, the basic state estimator 'mola::state_estimation_simple::StateEstimationSimple' will be used. If true, 'mola::state_estimation_smoother::StateEstimationSmoother' is used instead."
     )
-    state_estimator_env_var = SetEnvironmentVariable(
+    use_state_estimator_env_var = SetEnvironmentVariable(
         name='MOLA_STATE_ESTIMATOR', value=PythonExpression(
             ["'mola::state_estimation_smoother::StateEstimationSmoother' if ",
              LaunchConfiguration(
@@ -236,57 +236,59 @@ def generate_launch_description():
     return LaunchDescription([
         declare_namespace_cmd,
         declare_use_namespace_cmd,
-        lidar_topic_name_arg,
-        topic_env_var,
-        ignore_lidar_pose_from_tf_arg,
-        fixed_sensorpose_env_var,
-        gnss_topic_name_arg,
-        gps_topic_env_var,
-        imu_topic_name_arg,
-        imu_topic_env_var,
-        use_mola_gui_arg,
-        use_mola_gui_env_var,
-        publish_localization_following_rep105_arg,
-        publish_localization_following_rep105_env_var,
-        start_mapping_enabled_arg,
-        start_mapping_enabled_env_var,
-        start_active_arg,
-        start_active_env_var,
-        mola_lo_reference_frame_arg,
-        mola_lo_reference_frame_env_var,
-        mola_lo_pipeline_arg,
-        mola_lo_pipeline_arg_env_var,
-        generate_simplemap_arg,
-        generate_simplemap_env_var,
-        mola_initial_map_mm_file_arg,
-        mola_initial_map_mm_file_env_var,
-        mola_initial_map_sm_file_arg,
-        mola_initial_map_sm_file_env_var,
-        mola_footprint_to_base_link_tf_arg,
-        mola_footprint_to_base_link_tf_env_var,
         enforce_planar_motion_arg,
         enforce_planar_motion_env_var,
         forward_ros_tf_odom_to_mola_arg,
         forward_ros_tf_odom_to_mola_env_var,
+        generate_simplemap_arg,
+        generate_simplemap_env_var,
+        gnss_topic_name_arg,
+        gps_topic_env_var,
+        ignore_imu_pose_from_tf_arg,
+        ignore_imu_pose_from_tf_env_var,
+        ignore_lidar_pose_from_tf_arg,
+        ignore_lidar_pose_from_tf_env_var,
+        imu_topic_name_arg,
+        imu_topic_name_env_var,
         initial_localization_method_arg,
         initial_localization_method_env_var,
-        use_state_estimator_arg,
-        state_estimator_env_var,
-        state_estimator_config_yaml_arg,
-        state_estimator_config_yaml_env_var,
-        localization_publish_odom_source_env_var,
-        localization_publish_tf_source_env_var,
-        mola_se_reference_frame_arg,
-        mola_tf_map_env_var,
+        lidar_scan_validity_enable_env_var,
         lidar_scan_validity_minimum_point_count_arg,
         lidar_scan_validity_minimum_point_env_var,
-        lidar_scan_validity_enable_env_var,
+        lidar_topic_env_var,
+        lidar_topic_name_arg,
         mola_deskew_method_arg,
         mola_deskew_method_env_var,
-        ignore_imu_pose_from_tf_arg,
-        fixed_imu_sensorpose_env_var,
+        mola_footprint_to_base_link_tf_arg,
+        mola_footprint_to_base_link_tf_env_var,
+        mola_initial_map_mm_file_arg,
+        mola_initial_map_mm_file_env_var,
+        mola_initial_map_sm_file_arg,
+        mola_initial_map_sm_file_env_var,
+        mola_lo_pipeline_arg,
+        mola_lo_pipeline_env_var,
+        mola_lo_reference_frame_arg,
+        mola_lo_reference_frame_env_var,
+        mola_se_reference_frame_arg,
         mola_tf_base_link_arg,
         mola_tf_base_link_env_var,
+        mola_tf_map_env_var,
+        publish_localization_following_rep105_arg,
+        publish_localization_following_rep105_env_var,
+        start_active_arg,
+        start_active_env_var,
+        start_mapping_enabled_arg,
+        start_mapping_enabled_env_var,
+        use_mola_gui_arg,
+        use_mola_gui_env_var,
         use_rviz_arg,
+        use_state_estimator_arg,
+        use_state_estimator_env_var,
+        # Must come later:
+        state_estimator_config_yaml_arg,
+        state_estimator_config_yaml_env_var,
+        localization_publish_tf_source_env_var,
+        localization_publish_odom_source_env_var,
+        # group
         node_group
     ])
