@@ -330,11 +330,19 @@ void LidarOdometry::updateVisualization(const mp2p_icp::metric_map_t & currentOb
     }
 
     // Colorize by intensity with custom color map?
+#if MRPT_VERSION >= 0x020f00  // 2.15.0
+    if (!org_cloud) {
+      return;
+    }
+    const auto * Is =
+      org_cloud->getPointsBufferRef_float_field(mrpt::maps::CPointsMapXYZI::POINT_FIELD_INTENSITY);
+#else
     if (!org_cloud || !org_cloud->hasField_Intensity()) {
       return;
     }
 
     const auto * Is = org_cloud->getPointsBufferRef_intensity();
+#endif
     ASSERT_(Is);
 
     // Thread-local cache for max intensity
