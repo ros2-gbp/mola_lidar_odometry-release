@@ -4,7 +4,7 @@
 | | | | | | (_) | | (_| | Localization and mApping (MOLA)
 |_| |_| |_|\___/|_|\__,_| https://github.com/MOLAorg/mola
 
- Copyright (C) 2018-2025 Jose Luis Blanco, University of Almeria,
+ Copyright (C) 2018-2026 Jose Luis Blanco, University of Almeria,
                          and individual contributors.
  SPDX-License-Identifier: GPL-3.0
  See LICENSE for full license information.
@@ -61,13 +61,6 @@ void LidarOdometry::handleInitialLocalization()
 
       lambdaInitFromPose(initPose);
       doRemoveCloudsWithDecay();
-
-#if 0
-      // And now, fake a twist estimation with a large covariance to make sure the filter does not become overconfident on it starting with zero velocity:
-      auto twistCov = mrpt::math::CMatrixDouble66::Identity();
-      twistCov *= 1e3;
-      state_.navstate_fuse->fuse_twist(t2, mrpt::math::TTwist3D(), twistCov);
-#endif
 
       MRPT_LOG_INFO_STREAM("Initial re-localization done with pose: " << initPose.mean);
 

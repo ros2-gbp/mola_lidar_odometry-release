@@ -4,7 +4,7 @@
 | | | | | | (_) | | (_| | Localization and mApping (MOLA)
 |_| |_| |_|\___/|_|\__,_| https://github.com/MOLAorg/mola
 
- Copyright (C) 2018-2025 Jose Luis Blanco, University of Almeria,
+ Copyright (C) 2018-2026 Jose Luis Blanco, University of Almeria,
                          and individual contributors.
  SPDX-License-Identifier: GPL-3.0
  See LICENSE for full license information.
@@ -92,6 +92,7 @@ LidarOdometry::~LidarOdometry()
     }
     worker_lidar_.clear();
     worker_others_.clear();
+    worker_viz_.clear();
 
     if (params_.simplemap.generate) {
       saveReconstructedMapToFile();
@@ -103,6 +104,15 @@ LidarOdometry::~LidarOdometry()
     if (!params_.local_map_updates.save_final_local_map.empty()) {
       saveLocalMapToFile();
     }
+
+    // This must come after save map calls above:
+    while (worker_disk_io_.pendingTasks() > 0) {
+      MRPT_LOG_THROTTLE_WARN(
+        2.0, "Destructor: waiting for pending tasks on the lazy-load write thread...");
+      std::this_thread::sleep_for(100ms);
+    }
+    worker_disk_io_.clear();
+
   } catch (const std::exception & e) {
     std::cerr << "[~LidarOdometry] Exception: " << e.what();
   }
@@ -112,7 +122,7 @@ void LidarOdometry::spinOnce()
 {
   MRPT_TRY_START
 
-  const ProfilerEntry tleg(profiler_, "spinOnce");
+  const ProfilerEntry tle(profiler_, "spinOnce");
 
   processPendingUserRequests();
 
@@ -122,7 +132,7 @@ void LidarOdometry::spinOnce()
   // observations are misconfigured and are not been fed in.
   if (visualizer_ && ((state_.local_map && state_.local_map->empty()) || !isActive())) {
     if (mrpt::Clock::nowDouble() - gui_.timestampLastUpdateUI > 1.0) {
-      updateVisualization({});
+      updateVisualization({}, {});
     }
   }
 
@@ -157,11 +167,11 @@ void LidarOdometry::reset()
 
 bool LidarOdometry::isBusy() const
 {
-  bool b;
+  bool b = false;
   is_busy_mtx_.lock();
   b = (state_.worker_tasks_lidar != 0) || (state_.worker_tasks_others != 0);
   is_busy_mtx_.unlock();
-  return b || worker_lidar_.pendingTasks() || worker_others_.pendingTasks();
+  return b || worker_lidar_.pendingTasks() != 0 || worker_others_.pendingTasks() != 0;
 }
 
 bool LidarOdometry::isActive() const
@@ -266,9 +276,12 @@ void LidarOdometry::saveLocalMapToFile() const
   MRPT_LOG_INFO_STREAM("Saving final metric map to file '" << fil << "'...");
   std::cout.flush();
 
-  state_.local_map->save_to_file(fil);
-
-  MRPT_LOG_INFO("Final local metric map saved.");
+  const bool saved_ok = state_.local_map->save_to_file(fil);
+  if (!saved_ok) {
+    MRPT_LOG_ERROR_STREAM("Error saving map to: " << fil);
+  } else {
+    MRPT_LOG_INFO("Final local metric map saved.");
+  }
 }
 
 void LidarOdometry::unloadPastSimplemapObservations(const size_t maxSizeUnloadQueue) const
@@ -341,7 +354,17 @@ void LidarOdometry::handleUnloadSinglePastObservation(mrpt::obs::CObservation::P
   oPts->setAsExternalStorage(
     filename, CObservationPointCloud::ExternalStorageFormat::MRPT_Serialization);
 
-  oPts->unload();  // this actually saves the data to disk
+  // Since unload() does the actual saving to disk and it might take some time, let's run it in its own thread.
+  const auto fut = this->worker_disk_io_.enqueue([oPts]() {
+    try {
+      oPts->unload();
+    } catch (const std::exception & e) {
+      std::cerr << "[LidarOdometry] handleUnloadSinglePastObservation(): Error saving "
+                   "observation to disk: "
+                << e.what() << "\n";
+    }
+  });
+  (void)fut;
 }
 
 void LidarOdometry::enqueue_request(const std::function<void()> & userRequest)
@@ -366,13 +389,15 @@ void LidarOdometry::processPendingUserRequests()
 }
 
 #if defined(MOLA_LO_HAS_ONLINE_VERSION_CHECK)
+namespace
+{
 std::string http_get(const std::string & host, const std::string & path = "/")
 {
   const int port = 80;
 
   // Resolve hostname
-  hostent * server = gethostbyname(host.c_str());
-  if (!server) {
+  hostent * server = gethostbyname(host.c_str());  // NOLINT
+  if (server == nullptr) {
     throw std::runtime_error("Error: no such host");
   }
 
@@ -389,7 +414,7 @@ std::string http_get(const std::string & host, const std::string & path = "/")
   std::memcpy(&serv_addr.sin_addr.s_addr, server->h_addr, server->h_length);
 
   // Connect
-  if (connect(sock, (sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+  if (connect(sock, reinterpret_cast<sockaddr *>(&serv_addr), sizeof(serv_addr)) < 0) {  // NOLINT
     close(sock);
     throw std::runtime_error("Error: connecting");
   }
@@ -405,11 +430,11 @@ std::string http_get(const std::string & host, const std::string & path = "/")
 
   // Read response
   std::string response;
-  char buffer[1024];
-  ssize_t bytes;
-  while ((bytes = recv(sock, buffer, sizeof(buffer) - 1, 0)) > 0) {
+  std::array<char, 1024> buffer = {};
+  ssize_t bytes = 0;
+  while ((bytes = recv(sock, buffer.data(), buffer.size() - 1, 0)) > 0) {
     buffer[bytes] = '\0';
-    response += buffer;
+    response += std::string(buffer.data());
   }
 
   close(sock);
@@ -464,9 +489,11 @@ bool parse_http_response(const std::string & response, std::string & body_out)
 
 bool version_greater(const std::string & a, const std::string & b)  // NOLINT
 {
-  std::istringstream sa(a), sb(b);
-  int va, vb;
-  char dot;
+  std::istringstream sa(a);
+  std::istringstream sb(b);
+  int va = 0;
+  int vb = 0;
+  char dot = 0;
 
   while (true) {
     if (!(sa >> va)) {
@@ -523,7 +550,7 @@ void check_new_version(mrpt::config::CConfigFile & cfg, mrpt::system::COutputLog
 
   cfg.write("config", "last_version_check", mrpt::format("%f", now));
 }
-
+}  // namespace
 #endif
 
 void LidarOdometry::onInitializePersistentState()

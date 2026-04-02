@@ -4,7 +4,7 @@
 | | | | | | (_) | | (_| | Localization and mApping (MOLA)
 |_| |_| |_|\___/|_|\__,_| https://github.com/MOLAorg/mola
 
- Copyright (C) 2018-2025 Jose Luis Blanco, University of Almeria,
+ Copyright (C) 2018-2026 Jose Luis Blanco, University of Almeria,
                          and individual contributors.
  SPDX-License-Identifier: GPL-3.0
  See LICENSE for full license information.
@@ -63,11 +63,16 @@
 #include <vector>
 
 // Forward declarations:
+#if MOLA_VERSION_CHECK(2, 6, 0)
+#include <mola_kernel/GuiWidgetDescription.h>
+#else
 namespace nanogui
 {
+class Window;
 class Label;
 class CheckBox;
 }  // namespace nanogui
+#endif
 
 namespace mola
 {
@@ -110,11 +115,7 @@ public:
   // See docs in base class
   void initialize_frontend(const Yaml & cfg) override;
   void spinOnce() override;
-#if MOLA_VERSION_CHECK(2, 1, 0)
   void onNewObservation(const CObservation::ConstPtr & o) override;
-#else
-  void onNewObservation(const CObservation::Ptr & o) override;
-#endif
 
   /** Re-initializes the odometry system. It effectively calls initialize()
      *  once again with the same parameters that were used the first time.
@@ -234,6 +235,9 @@ public:
          * accepted during regular lidar odometry & mapping */
     double min_icp_goodness = 0.4;
 
+    /** If defined, .icplog files will be saved if ICP quality drops below the given threshold */
+    std::optional<double> write_debug_icp_log_if_quality_under;
+
     bool pipeline_profiler_enabled = false;
     bool icp_profiler_enabled = false;
     bool icp_profiler_full_history = false;
@@ -292,6 +296,9 @@ public:
       std::vector<ModelPart> model;
 
       void initialize(const Yaml & c);
+
+    private:
+      void initializeModelPart(const Yaml & c);
     };
     Visualization visualization;
 
@@ -447,6 +454,27 @@ public:
 
     ObservationValidityChecks observation_validity_checks;
 
+    struct IMUGravityCorrection
+    {
+      /// Enable accelerometer-based pitch/roll correction in ICP prior.
+      bool enabled = true;
+
+      /// Sigma [degrees] for the gravity-derived pitch/roll prior.
+      /// Lower values = more trust in IMU. Typical: 1–5 deg.
+      double sigma_deg = 2.0;
+
+      /// Number of recent accelerometer samples to average for gravity estimation.
+      uint32_t averaging_samples = 20;
+
+      /// Maximum age [seconds] for accelerometer samples used in averaging.
+      /// Samples older than this are discarded. 0 = no age limit.
+      double max_age_seconds = 2.0;
+
+      void initialize(const Yaml & c);
+    };
+
+    IMUGravityCorrection imu_gravity_correction;
+
     bool start_active = true;
 
     uint32_t max_lidar_queue_before_drop = 15;
@@ -473,7 +501,7 @@ public:
   bool isBusy() const;
 
   bool isActive() const;
-  void setActive(const bool active);
+  void setActive(bool active);
 
   /** Returns a copy of the estimated trajectory, with timestamps for each
      * lidar observation.
@@ -609,6 +637,31 @@ private:
     /// Used for pitch & roll initialization
     std::optional<mola::imu::ImuInitialCalibrator> imu_initializer;
 
+    /// Accumulates recent accelerometer readings and provides
+    /// a smoothed pitch/roll estimate from the gravity direction.
+    struct GravityEstimator
+    {
+      struct TimestampedAcc
+      {
+        double timestamp = 0;
+        std::array<double, 3> acc = {0, 0, 0};
+      };
+
+      mrpt::containers::circular_buffer<TimestampedAcc> acc_buffer{200};
+      mrpt::poses::CPose3D imu_sensor_pose;  ///< last known IMU extrinsics
+      double imu_sensor_pose_timestamp = 0;  ///< timestamp of last sensor pose update
+
+      void add(const mrpt::obs::CObservationIMU & imu, uint32_t max_samples);
+
+      /// Returns estimated (pitch, roll) in radians from averaged
+      /// accelerometer data in the vehicle frame, or nullopt if not enough data.
+      /// max_age_seconds <= 0 means no age filtering.
+      std::optional<std::pair<double, double>> estimatedPitchRoll(
+        uint32_t required_samples, double max_age_seconds) const;
+    };
+
+    GravityEstimator gravity_estimator;
+
     mrpt::poses::CPose3DPDFGaussian last_lidar_pose;  //!< in local map
 
     std::map<std::string, mrpt::Clock::time_point> last_obs_tim_by_label;
@@ -640,10 +693,14 @@ private:
 
     mp2p_icp_filters::GeneratorSet obs_generators;
     mp2p_icp_filters::FilterPipeline pc_filterAdjustTimes;
+    mp2p_icp_filters::FilterPipeline pc_prefilter;
+    mp2p_icp_filters::FilterPipeline pc_deskew;
     mp2p_icp_filters::FilterPipeline pc_filter1, pc_filter2, pc_filter3;
     mp2p_icp_filters::GeneratorSet local_map_generators;
     mp2p_icp::metric_map_t::Ptr local_map = mp2p_icp::metric_map_t::Create();
     mp2p_icp_filters::FilterPipeline obs2map_merge;
+
+    // fallback only for when not using IMU and optimize_twist is enabled:
     mp2p_icp_filters::FilterPipeline obsDeskewForViz;
 
     mutable std::optional<bool> isPipelinesUsingIMU;  //!< See isPipelineUsingIMU()
@@ -664,6 +721,8 @@ private:
     bool local_map_needs_viz_update = true;
     bool local_map_needs_publish = true;
     bool local_map_georef_needs_publish = true;
+
+    std::optional<double> last_yaw_for_viz_camera;
 
     void mark_local_map_as_updated(bool force_republish = false)
     {
@@ -703,13 +762,19 @@ private:
     /// Used to estimate sensor rate
     mrpt::containers::circular_buffer<double> recent_imu_stamps{1500};
 
-    /// Returns the rates (Hz) of incoming LiDAR and IMU sensors for the past few seconds
-    std::tuple<double, double> get_lidar_imu_sensor_rates();
+    /// Used to estimate GNSS sensor rate
+    mrpt::containers::circular_buffer<double> recent_gnss_stamps{100};
+
+    /// Returns the rates (Hz) of incoming LiDAR, IMU, and GNSS sensors
+    /// for the past few seconds. A rate of 0.0 means no data or stale data.
+    std::tuple<double, double, double> get_sensor_rates();
 
     void append_lidar_stamp(
       const std::string & sensorLabel, const mrpt::Clock::time_point & stamp,
       const mrpt::system::COutputLogger & logger);
     void append_imu_stamp(
+      const mrpt::Clock::time_point & stamp, const mrpt::system::COutputLogger & logger);
+    void append_gnss_stamp(
       const mrpt::Clock::time_point & stamp, const mrpt::system::COutputLogger & logger);
 
   };  // end of MethodState
@@ -725,6 +790,13 @@ private:
   mrpt::WorkerThreadsPool worker_others_{
     1 /*num threads*/, mrpt::WorkerThreadsPool::POLICY_FIFO, "worker_imu"};
 
+  /** The worker thread pool with 1 thread for processing saving lazy-load observations to disk */
+  mutable mrpt::WorkerThreadsPool worker_disk_io_{
+    1 /*num threads*/, mrpt::WorkerThreadsPool::POLICY_FIFO, "worker_disk"};
+
+  /** Runs colorization tasks for clouds to be shown in the gui */
+  mrpt::WorkerThreadsPool worker_viz_{2, mrpt::WorkerThreadsPool::POLICY_DROP_OLD, "worker_viz"};
+
   MethodState state_;
   const MethodState & state() const { return state_; }
   MethodState stateCopy() const { return state_; }
@@ -736,6 +808,16 @@ private:
 
     double timestampLastUpdateUI = 0;
 
+#if MOLA_VERSION_CHECK(2, 6, 0)
+    bool gui_created = false;
+    mola::gui::LiveString::Ptr lbIcpQuality;
+    mola::gui::LiveString::Ptr lbSensorRates;
+    mola::gui::LiveString::Ptr lbSensorRange;
+    mola::gui::LiveString::Ptr lbTime;
+    mola::gui::LiveString::Ptr lbSpeed;
+    mola::gui::LiveString::Ptr lbLidarQueue;
+    mola::gui::LiveString::Ptr lbMapStats;
+#else
     nanogui::Window * ui = nullptr;
     nanogui::Label * lbIcpQuality = nullptr;
     nanogui::Label * lbSensorRates = nullptr;
@@ -747,6 +829,7 @@ private:
     nanogui::CheckBox * cbActive = nullptr;
     nanogui::CheckBox * cbMapping = nullptr;
     nanogui::CheckBox * cbSaveSimplemap = nullptr;
+#endif
   };
 
   // Accessing this struct in gui_ requires acquiring state_gui_mtx_
@@ -798,9 +881,23 @@ private:
   void updatePipelineTwistVariables(const mrpt::math::TTwist3D & tw);
   void updatePipelineDynamicVariablesRobotPoseOnly();
 
-  void updateVisualization(const mp2p_icp::metric_map_t & currentObservation);
+  void updateVisualization(
+    const mp2p_icp::metric_map_t & currentObservation,
+    const mrpt::maps::CPointsMap::Ptr & deskewedCloud);
 
+  void updateVisualizationInitVehFrame();
+  void updateVisualizationCurrentObservation(
+    const mp2p_icp::metric_map_t & currentObservation,
+    const mrpt::maps::CPointsMap::Ptr & deskewedCloud);
+  void updateVisualizationLocalMap(std::vector<std::function<void()>> & updateTasks);
+  void updateVisualizationPath(std::vector<std::function<void()>> & updateTasks);
+  void updateVisualizationTextLabels();
+
+#if MOLA_VERSION_CHECK(2, 6, 0)
   void internalBuildGUI();
+#else
+  void internalBuildGUI_Legacy();
+#endif
 
   void doRemoveCloudsWithDecay();
 
@@ -813,7 +910,7 @@ private:
   void doWriteDebugTracesFile(const mrpt::Clock::time_point & this_obs_tim);
   std::optional<std::ofstream> debug_traces_of_;
 
-  void unloadPastSimplemapObservations(const size_t maxSizeUnloadQueue) const;
+  void unloadPastSimplemapObservations(size_t maxSizeUnloadQueue) const;
 
   void handleUnloadSinglePastObservation(CObservation::Ptr & o) const;
 
@@ -828,14 +925,16 @@ private:
   void onInitializePersistentState();
 
   void doUpdateSimpleMap(
-    const mrpt::obs::CSensoryFrame & sf, const bool distance_enough_sm,
-    const mp2p_icp::metric_map_t::Ptr & observation, const mrpt::Clock::time_point & this_obs_tim);
+    const mrpt::obs::CSensoryFrame & sf, bool distance_enough_sm,
+    const mp2p_icp::metric_map_t::Ptr & observation, const mrpt::Clock::time_point & this_obs_tim,
+    const mrpt::maps::CPointsMap::Ptr & deskewedCloud);
 };
 
 namespace detail
 {
 template <typename T, std::size_t... Is>
-constexpr std::array<T, sizeof...(Is)> create_array(T value, std::index_sequence<Is...>)
+constexpr std::array<T, sizeof...(Is)> create_array(
+  T value, [[maybe_unused]] std::index_sequence<Is...> seq)
 {
   // cast Is to void to remove the warning: unused value
   return {{(static_cast<void>(Is), value)...}};
