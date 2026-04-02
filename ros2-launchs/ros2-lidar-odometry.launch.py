@@ -1,4 +1,3 @@
-
 # ROS 2 launch file
 
 from launch import LaunchDescription
@@ -22,9 +21,14 @@ def generate_launch_description():
     # -------------------
     # Mandatory
     lidar_topic_name_arg = DeclareLaunchArgument(
-        "lidar_topic_name", description="Topic name to listen for PointCloud2 input from the LiDAR (for example '/ouster/points')")
+        "lidar_topic_name", description="Topic name to listen for LiDAR input, for example '/ouster/points' for PointCloud2 or '/scan' for LaserScan; see lidar_topic_type")
     lidar_topic_env_var = SetEnvironmentVariable(
         name='MOLA_LIDAR_TOPIC', value=LaunchConfiguration('lidar_topic_name'))
+    # ~~~~~~~~~~~~
+    lidar_topic_type_arg = DeclareLaunchArgument(
+        "lidar_topic_type", default_value="PointCloud2", description="The type of LiDAR topic to subscribe to. Options: 'PointCloud2' (default) or 'LaserScan'")
+    lidar_topic_type_env_var = SetEnvironmentVariable(
+        name='MOLA_LIDAR_TOPIC_TYPE', value=LaunchConfiguration('lidar_topic_type'))
     # ~~~~~~~~~~~~
     ignore_lidar_pose_from_tf_arg = DeclareLaunchArgument(
         "ignore_lidar_pose_from_tf", default_value="false", description="If true, the LiDAR pose will be assumed to be at the origin (base_link). Set to false (default) if you want to read the actual sensor pose from /tf")
@@ -40,6 +44,11 @@ def generate_launch_description():
         "gnss_topic_name", default_value="gps", description="Topic name to listen for NavSatFix input from a GNSS (for example '/gps')")
     gps_topic_env_var = SetEnvironmentVariable(
         name='MOLA_GNSS_TOPIC', value=LaunchConfiguration('gnss_topic_name'))
+    # ~~~~~~~~~~~~
+    gpsmsg_topic_name_arg = DeclareLaunchArgument(
+        "gpsfix_topic_name", default_value="gpsfix", description="Topic name to listen for gps_msgs/GPSFix input from a GNSS (for example '/gpsfix')")
+    gpsmsg_topic_env_var = SetEnvironmentVariable(
+        name='MOLA_GPS_FIX_TOPIC', value=LaunchConfiguration('gpsfix_topic_name'))
     # ~~~~~~~~~~~~
     imu_topic_name_arg = DeclareLaunchArgument(
         "imu_topic_name", default_value="imu", description="Topic name to listen for Imu input (for example '/imu')")
@@ -169,6 +178,26 @@ def generate_launch_description():
     mola_deskew_method_env_var = SetEnvironmentVariable(
         name='MOLA_DESKEW_METHOD', value=LaunchConfiguration('mola_deskew_method'))
     # ~~~~~~~~~~~~
+    imu_gravity_correction_arg = DeclareLaunchArgument(
+        "imu_gravity_correction", default_value="true", description="Whether to use IMU accelerometer readings to constrain ICP pitch/roll (prevents vertical drift; safe to leave enabled even without an IMU)")
+    imu_gravity_correction_env_var = SetEnvironmentVariable(
+        name='MOLA_IMU_GRAVITY_CORRECTION', value=LaunchConfiguration('imu_gravity_correction'))
+    # ~~~~~~~~~~~~
+    imu_gravity_sigma_deg_arg = DeclareLaunchArgument(
+        "imu_gravity_sigma_deg", default_value="2.0", description="Sigma [degrees] for the gravity-derived pitch/roll prior. Lower values = more trust in IMU.")
+    imu_gravity_sigma_deg_env_var = SetEnvironmentVariable(
+        name='MOLA_IMU_GRAVITY_SIGMA_DEG', value=LaunchConfiguration('imu_gravity_sigma_deg'))
+    # ~~~~~~~~~~~~
+    imu_gravity_avg_samples_arg = DeclareLaunchArgument(
+        "imu_gravity_avg_samples", default_value="20", description="Number of IMU samples to average when estimating the gravity direction for pitch/roll correction.")
+    imu_gravity_avg_samples_env_var = SetEnvironmentVariable(
+        name='MOLA_IMU_GRAVITY_AVG_SAMPLES', value=LaunchConfiguration('imu_gravity_avg_samples'))
+    # ~~~~~~~~~~~~
+    imu_gravity_max_age_arg = DeclareLaunchArgument(
+        "imu_gravity_max_age", default_value="2.0", description="Maximum age [seconds] of IMU samples used for gravity alignment. Samples older than this are discarded.")
+    imu_gravity_max_age_env_var = SetEnvironmentVariable(
+        name='MOLA_IMU_GRAVITY_MAX_AGE', value=LaunchConfiguration('imu_gravity_max_age'))
+    # ~~~~~~~~~~~~
     mola_tf_base_link_arg = DeclareLaunchArgument(
         "mola_tf_base_link", default_value="base_link", description="The /tf frame name for the robot base link.")
     mola_tf_base_link_env_var = SetEnvironmentVariable(
@@ -244,6 +273,8 @@ def generate_launch_description():
         generate_simplemap_env_var,
         gnss_topic_name_arg,
         gps_topic_env_var,
+        gpsmsg_topic_name_arg,
+        gpsmsg_topic_env_var,
         ignore_imu_pose_from_tf_arg,
         ignore_imu_pose_from_tf_env_var,
         ignore_lidar_pose_from_tf_arg,
@@ -257,6 +288,16 @@ def generate_launch_description():
         lidar_scan_validity_minimum_point_env_var,
         lidar_topic_env_var,
         lidar_topic_name_arg,
+        lidar_topic_type_arg,
+        lidar_topic_type_env_var,
+        imu_gravity_correction_arg,
+        imu_gravity_correction_env_var,
+        imu_gravity_sigma_deg_arg,
+        imu_gravity_sigma_deg_env_var,
+        imu_gravity_avg_samples_arg,
+        imu_gravity_avg_samples_env_var,
+        imu_gravity_max_age_arg,
+        imu_gravity_max_age_env_var,
         mola_deskew_method_arg,
         mola_deskew_method_env_var,
         mola_footprint_to_base_link_tf_arg,
