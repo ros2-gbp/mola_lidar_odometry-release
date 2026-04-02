@@ -44,7 +44,6 @@ runs **MOLA-LO** live on point clouds received from a ROS 2 topic, **demonstrati
            mola_tf_base_link:=os_sensor
 
    .. tab-item:: LIO usage (No /tf)
-      :selected:
 
       This is how to use LiDAR-Inertial Odometry (LIO) by using LiDAR clouds plus an IMU,
       when no /tf is available for the sensor poses so you must manually specify them:
@@ -64,7 +63,6 @@ runs **MOLA-LO** live on point clouds received from a ROS 2 topic, **demonstrati
 
 
    .. tab-item:: Robot with NS
-      :selected:
 
       If your robot uses a ROS 2 namespace ``ROBOT_NS`` for all its sensor and tf topics, use:
 
@@ -76,8 +74,21 @@ runs **MOLA-LO** live on point clouds received from a ROS 2 topic, **demonstrati
             use_namespace:=True \
             namespace:=ROBOT_NS
 
-|
+   .. tab-item:: 2D LiDAR
 
+      To use with a 2D LiDAR, define the argument `lidar_topic_type:=LaserScan`, e.g.:
+
+      .. code-block:: bash
+
+         # Minimal use case:
+         ros2 launch mola_lidar_odometry ros2-lidar-odometry.launch.py \
+            lidar_topic_name:=/scan \
+            lidar_topic_type:=LaserScan \
+            mola_lo_pipeline:=../pipelines/lidar2d.yaml \
+            ignore_lidar_pose_from_tf:=False \
+            publish_localization_following_rep105:=True
+
+|
 
 .. dropdown:: How to invoke for a rosbag (``.mcap``, ``.db3``)
     :icon: list-unordered
@@ -132,6 +143,10 @@ runs **MOLA-LO** live on point clouds received from a ROS 2 topic, **demonstrati
              Topic name to listen for NavSatFix input from a GNSS (for example '/gps')
              (default: 'gps')
 
+          'gpsfix_topic_name':
+             Topic name to listen for gps_msgs/GPSFix input from a GNSS (for example '/gpsfix')
+             (default: 'gpsfix')
+
           'ignore_imu_pose_from_tf':
              If true, the IMU pose will be assumed to be at the origin (base_link). Set to false (default) if you want to read the actual sensor pose from /tf
              (default: 'false')
@@ -154,6 +169,10 @@ runs **MOLA-LO** live on point clouds received from a ROS 2 topic, **demonstrati
 
           'lidar_topic_name':
              Topic name to listen for PointCloud2 input from the LiDAR (for example '/ouster/points')
+
+          'lidar_topic_type':
+             The type of LiDAR topic to subscribe to. Options: 'PointCloud2' (default) or 'LaserScan'
+             (default: 'PointCloud2')
 
           'mola_deskew_method':
              Which motion-compensation method to use to align LiDAR scans more precisely
@@ -215,6 +234,8 @@ runs **MOLA-LO** live on point clouds received from a ROS 2 topic, **demonstrati
              If false, the basic state estimator 'mola::state_estimation_simple::StateEstimationSimple' will be used. If true, 'mola::state_estimation_smoother::StateEstimationSmoother' is used instead.
              (default: 'False')
 
+          'state_estimator_config_yaml':
+             A YAML file with settings for the state estimator. Absolute path or relative to 'mola-cli-launchs/lidar_odometry_ros2.yaml'
 
 
 .. _mola_lo_ros_mola-cli-env-vars:
