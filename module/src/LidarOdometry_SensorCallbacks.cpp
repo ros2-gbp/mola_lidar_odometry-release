@@ -4,7 +4,7 @@
 | | | | | | (_) | | (_| | Localization and mApping (MOLA)
 |_| |_| |_|\___/|_|\__,_| https://github.com/MOLAorg/mola
 
- Copyright (C) 2018-2025 Jose Luis Blanco, University of Almeria,
+ Copyright (C) 2018-2026 Jose Luis Blanco, University of Almeria,
                          and individual contributors.
  SPDX-License-Identifier: GPL-3.0
  See LICENSE for full license information.
@@ -241,13 +241,19 @@ void LidarOdometry::onIMUImpl(const CObservation::ConstPtr & o)
     mp2p_icp_filters::apply_generators(state_.obs_generators, *imu, dummy_map);
   }
 
+  // 3) Gravity estimation for ICP verticality correction:
+  if (params_.imu_gravity_correction.enabled) {
+    auto lckState2 = mrpt::lockHelper(state_mtx_);
+    state_.gravity_estimator.add(*imu, params_.imu_gravity_correction.averaging_samples);
+  }
+
   // Finally, schedule to run those LiDAR scans that were waiting for IMU data:
   if (isPipelineUsingIMU()) {
     const auto imuTim = mrpt::Clock::toDouble(imu->timestamp);
 
     const auto rate_lidar_hz = [&] {
       auto lckState = mrpt::lockHelper(state_mtx_);
-      auto [rate_lidar, _] = state_.get_lidar_imu_sensor_rates();
+      auto [rate_lidar, rate_imu_, rate_gnss_] = state_.get_sensor_rates();
       return rate_lidar;
     }();
 
@@ -321,6 +327,9 @@ void LidarOdometry::onGPSImpl(const CObservation::ConstPtr & o)
     }
   }
 
+  // for rate stats:
+  state_.append_gnss_stamp(gps->timestamp, *this);
+
   // Keep the latest GPS observations for simplemap insertion:
   state_.last_gnss_.emplace(gps->timestamp, gps);
 
@@ -357,33 +366,71 @@ bool LidarOdometry::doCheckIsValidObservation(const mp2p_icp::metric_map_t & m)
 
 namespace
 {
-double rate_from_stamps_buffer(const mrpt::containers::circular_buffer<double> & stamps)
+/// Computes rate as (N-1)/(t_last - t_first).
+/// Returns 0.0 if the buffer has fewer than 2 stamps, or if the most recent
+/// stamp is older than `staleness_timeout` seconds relative to `ref_time`.
+double rate_from_stamps_buffer(
+  const mrpt::containers::circular_buffer<double> & stamps, double ref_time = 0,
+  double staleness_timeout = 5.0)
 {
-  if (stamps.size() < 2) {
-    return .0;
-  }
-  double rate_accum = 0;
-  for (std::size_t i = 0; i < stamps.size() - 1; i++) {
-    const auto ti = stamps.peek(i);
-    const auto tj = stamps.peek(i + 1);
-    rate_accum += tj != ti ? 1.0 / (tj - ti) : .0;
-  }
-  rate_accum *= 1.0 / static_cast<double>(stamps.size() - 1);
-  return rate_accum;
+  if (stamps.size() < 2) return .0;
+
+  const double t_first = stamps.peek(0);
+  const double t_last = stamps.peek(stamps.size() - 1);
+
+  // Staleness check: if ref_time is provided and the newest stamp
+  // is too old, report 0 (sensor stopped):
+  if (ref_time > 0 && (ref_time - t_last) > staleness_timeout) return .0;
+
+  const double dt = t_last - t_first;
+  if (dt <= 0) return .0;
+
+  return static_cast<double>(stamps.size() - 1) / dt;
 }
 
 }  // namespace
 
-std::tuple<double, double> LidarOdometry::MethodState::get_lidar_imu_sensor_rates()
+std::tuple<double, double, double> LidarOdometry::MethodState::get_sensor_rates()
 {
-  const double lidar_rate = recent_lidar_stamps.empty()
-                              ? 10.0
-                              : rate_from_stamps_buffer(recent_lidar_stamps.begin()->second);
+  // Use the latest observation timestamp as reference for staleness detection.
+  // This works for both live and offline (rawlog/rosbag) data sources.
+  const double ref_time = last_obs_timestamp ? mrpt::Clock::toDouble(*last_obs_timestamp) : 0.0;
 
-  const double imu_rate = rate_from_stamps_buffer(recent_imu_stamps);
+  // Aggregate across all lidar sensors:
+  double lidar_rate = 0;
+  for (auto & [label, stamps] : recent_lidar_stamps)
+    lidar_rate += rate_from_stamps_buffer(stamps, ref_time);
 
-  return {lidar_rate, imu_rate};
+  const double imu_rate = rate_from_stamps_buffer(recent_imu_stamps, ref_time);
+  const double gnss_rate = rate_from_stamps_buffer(recent_gnss_stamps, ref_time);
+
+  return {lidar_rate, imu_rate, gnss_rate};
 }
+
+namespace
+{
+/// Appends a timestamp to a circular buffer, with backwards-time rejection.
+/// Returns true if the stamp was accepted, false if rejected.
+bool append_stamp_to_buffer(
+  mrpt::containers::circular_buffer<double> & stamps, double t, const char * sensor_name,
+  const mrpt::system::COutputLogger & logger)
+{
+  // Reject backwards timestamps instead of just warning:
+  if (stamps.size() > 0) {
+    const double t_prev = stamps.peek(stamps.size() - 1);
+    if (t < t_prev) {
+      logger.logFmt(
+        mrpt::system::LVL_WARN,
+        "%s timestamps went backwards in time: t[k-1]=%f, t[k]=%f (discarding for rate calc)",
+        sensor_name, t_prev, t);
+      return false;
+    }
+  }
+  if (stamps.available() == 0) stamps.pop();
+  stamps.push(t);
+  return true;
+}
+}  // namespace
 
 void LidarOdometry::MethodState::append_lidar_stamp(
   const std::string & sensorLabel, const mrpt::Clock::time_point & stamp,
@@ -393,41 +440,115 @@ void LidarOdometry::MethodState::append_lidar_stamp(
 
   auto [it_stamps, is_new] =
     recent_lidar_stamps.try_emplace(sensorLabel, LIDAR_STAMPS_QUEUE_LENGTH);
-  auto & stamps = it_stamps->second;
-  if (stamps.available() == 0) {
-    stamps.pop();
-  }
-  stamps.push(mrpt::Clock::toDouble(stamp));
 
-  // Trigger a warning if stamps seems to move backwards in time, since this is never expected:
-  if (const auto nLidarStamps = stamps.size(); nLidarStamps > 2) {
-    const auto tm1 = stamps.peek(nLidarStamps - 1);
-    const auto tm2 = stamps.peek(nLidarStamps - 2);
-    if (tm1 < tm2) {
-      logger.logFmt(
-        mrpt::system::LVL_WARN,
-        "LiDAR timestamps seem to have gone backwards in time (!): t[k-1]=%f, t[k]=%f", tm2, tm1);
-    }
-  }
+  append_stamp_to_buffer(it_stamps->second, mrpt::Clock::toDouble(stamp), "LiDAR", logger);
 }
+
 void LidarOdometry::MethodState::append_imu_stamp(
   const mrpt::Clock::time_point & stamp, const mrpt::system::COutputLogger & logger)
 {
-  if (recent_imu_stamps.size() >= recent_imu_stamps.capacity() - 2) {
-    recent_imu_stamps.pop();
-  }
-  recent_imu_stamps.push(mrpt::Clock::toDouble(stamp));
+  append_stamp_to_buffer(recent_imu_stamps, mrpt::Clock::toDouble(stamp), "IMU", logger);
+}
 
-  // Trigger a warning if stamps seems to move backwards in time, since this is never expected:
-  if (const auto nImuStamps = recent_imu_stamps.size(); nImuStamps > 2) {
-    const auto tm1 = recent_imu_stamps.peek(nImuStamps - 1);
-    const auto tm2 = recent_imu_stamps.peek(nImuStamps - 2);
-    if (tm1 < tm2) {
-      logger.logFmt(
-        mrpt::system::LVL_WARN,
-        "IMU timestamps seem to have gone backwards in time (!): t[k-1]=%f, t[k]=%f", tm2, tm1);
-    }
+void LidarOdometry::MethodState::append_gnss_stamp(
+  const mrpt::Clock::time_point & stamp, const mrpt::system::COutputLogger & logger)
+{
+  append_stamp_to_buffer(recent_gnss_stamps, mrpt::Clock::toDouble(stamp), "GNSS", logger);
+}
+
+void LidarOdometry::MethodState::GravityEstimator::add(
+  const mrpt::obs::CObservationIMU & imu, uint32_t max_samples)
+{
+  if (
+    !imu.has(mrpt::obs::IMU_X_ACC) || !imu.has(mrpt::obs::IMU_Y_ACC) ||
+    !imu.has(mrpt::obs::IMU_Z_ACC)) {
+    return;
   }
+
+  const std::array<double, 3> acc = {
+    imu.get(mrpt::obs::IMU_X_ACC), imu.get(mrpt::obs::IMU_Y_ACC), imu.get(mrpt::obs::IMU_Z_ACC)};
+
+  // Reject readings whose specific-force deviates from gravity by >2 m/s²
+  // (tighter than original threshold to avoid bias during dynamic motion):
+  const double norm = std::sqrt(acc[0] * acc[0] + acc[1] * acc[1] + acc[2] * acc[2]);
+  if (std::abs(norm - 9.81) > 2.0) {
+    return;
+  }
+
+  const double stamp = mrpt::Clock::toDouble(imu.timestamp);
+
+  // Trim buffer to the desired averaging window:
+  while (acc_buffer.size() >= max_samples) {
+    acc_buffer.pop();
+  }
+  acc_buffer.push({stamp, acc});
+
+  // Remember the sensor pose for vehicle-frame transform:
+  imu_sensor_pose = imu.sensorPose;
+  imu_sensor_pose_timestamp = stamp;
+}
+
+std::optional<std::pair<double, double>>
+LidarOdometry::MethodState::GravityEstimator::estimatedPitchRoll(
+  uint32_t required_samples, double max_age_seconds) const
+{
+  if (acc_buffer.size() < required_samples) {
+    return std::nullopt;
+  }
+
+  // Determine the newest timestamp in the buffer for age filtering:
+  const double newest_stamp = acc_buffer.peek(acc_buffer.size() - 1).timestamp;
+  const bool use_age_filter = max_age_seconds > 0;
+
+  // Average the accelerometer readings (in sensor frame),
+  // considering only samples within the age limit:
+  double sx = 0, sy = 0, sz = 0;
+  std::size_t count = 0;
+  const auto n = acc_buffer.size();
+  for (std::size_t i = 0; i < n; i++) {
+    const auto & entry = acc_buffer.peek(i);
+    if (use_age_filter && (newest_stamp - entry.timestamp) > max_age_seconds) {
+      continue;  // too old
+    }
+    sx += entry.acc[0];
+    sy += entry.acc[1];
+    sz += entry.acc[2];
+    ++count;
+  }
+
+  if (count < required_samples) {
+    return std::nullopt;
+  }
+
+  const double inv_n = 1.0 / static_cast<double>(count);
+  const double ax = sx * inv_n;
+  const double ay = sy * inv_n;
+  const double az = sz * inv_n;
+
+  // Transform averaged gravity from IMU sensor frame to vehicle frame:
+  const auto rotMat = imu_sensor_pose.getRotationMatrix();
+
+  const double gx_veh = rotMat(0, 0) * ax + rotMat(0, 1) * ay + rotMat(0, 2) * az;
+  const double gy_veh = rotMat(1, 0) * ax + rotMat(1, 1) * ay + rotMat(1, 2) * az;
+  const double gz_veh = rotMat(2, 0) * ax + rotMat(2, 1) * ay + rotMat(2, 2) * az;
+
+  // From gravity direction in vehicle frame, estimate pitch and roll.
+  // Convention: if vehicle is level, gravity = [0, 0, +g] (z-up).
+  //   pitch = rotation about Y that tilts gravity into X
+  //   roll  = rotation about X that tilts gravity into Y
+  const double g_norm = std::sqrt(gx_veh * gx_veh + gy_veh * gy_veh + gz_veh * gz_veh);
+  if (g_norm < 1e-3) {
+    return std::nullopt;
+  }
+
+  const double nx = gx_veh / g_norm;
+  const double ny = gy_veh / g_norm;
+  const double nz = gz_veh / g_norm;
+
+  const double pitch = std::asin(-nx);
+  const double roll = std::atan2(ny, nz);
+
+  return std::make_pair(pitch, roll);
 }
 
 }  // namespace mola
