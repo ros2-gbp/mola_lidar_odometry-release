@@ -4,7 +4,7 @@
 | | | | | | (_) | | (_| | Localization and mApping (MOLA)
 |_| |_| |_|\___/|_|\__,_| https://github.com/MOLAorg/mola
 
- Copyright (C) 2018-2025 Jose Luis Blanco, University of Almeria,
+ Copyright (C) 2018-2026 Jose Luis Blanco, University of Almeria,
                          and individual contributors.
  SPDX-License-Identifier: GPL-3.0
  See LICENSE for full license information.
@@ -323,7 +323,8 @@ std::shared_ptr<mola::OfflineDatasetSource> dataset_from_rosbag2(
           use_fixed_sensor_pose: ${MOLA_USE_FIXED_LIDAR_POSE|false}
         - topic: ${MOLA_GNSS_TOPIC|'/gps'}
           sensorLabel: 'gps'
-          type: CObservationGPS
+          #type: CObservationGPS  # This will be determined automatically by Rosbag2Dataset
+          is_optional: true
           fixed_sensor_pose: "${GPS_POSE_X|0} ${GPS_POSE_Y|0} ${GPS_POSE_Z|0} ${GPS_POSE_YAW|0} ${GPS_POSE_PITCH|0} ${GPS_POSE_ROLL|0}"  # 'x y z yaw_deg pitch_deg roll_deg'
           use_fixed_sensor_pose: ${MOLA_USE_FIXED_GNSS_POSE|false}
         - topic: '%s'
