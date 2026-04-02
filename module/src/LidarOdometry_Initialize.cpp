@@ -4,7 +4,7 @@
 | | | | | | (_) | | (_| | Localization and mApping (MOLA)
 |_| |_| |_|\___/|_|\__,_| https://github.com/MOLAorg/mola
 
- Copyright (C) 2018-2025 Jose Luis Blanco, University of Almeria,
+ Copyright (C) 2018-2026 Jose Luis Blanco, University of Almeria,
                          and individual contributors.
  SPDX-License-Identifier: GPL-3.0
  See LICENSE for full license information.
@@ -27,6 +27,7 @@
 
 // MP2P_ICP:
 #include <mp2p_icp/icp_pipeline_from_yaml.h>
+#include <mrpt/system/filesystem.h>
 
 namespace mola
 {
@@ -97,7 +98,7 @@ void LidarOdometry::initialize_frontend(const Yaml & c)
 
   ASSERT_(!state_.obs2map_merge.empty());
 
-  // Deskew for visualization:
+  // Deskew for visualization in fallback mode (see gicp.yaml comments)
   // If not specified, the "raw" cloud will be shown instead of the de-skewed one.
   if (c.has("observations_filter_deskew_for_visualization")) {
     ASSERT_(c["observations_filter_deskew_for_visualization"].isSequence());
@@ -125,6 +126,14 @@ void LidarOdometry::initialize_frontend(const Yaml & c)
 
   if (cfg.has("multiple_lidars")) {
     params_.multiple_lidars.initialize(cfg["multiple_lidars"], params_);
+  }
+
+  // this one is std::optional
+  {
+    const std::string key = "write_debug_icp_log_if_quality_under";
+    if (cfg.has(key) && !cfg[key].isNullNode() && !cfg[key].as<std::string>().empty()) {
+      params_.write_debug_icp_log_if_quality_under.emplace(cfg[key].as<double>());
+    }
   }
 
   YAML_LOAD_OPT(params_, min_time_between_scans, double);
@@ -172,6 +181,10 @@ void LidarOdometry::initialize_frontend(const Yaml & c)
 
   if (cfg.has("observation_validity_checks")) {
     params_.observation_validity_checks.initialize(cfg["observation_validity_checks"]);
+  }
+
+  if (cfg.has("imu_gravity_correction")) {
+    params_.imu_gravity_correction.initialize(cfg["imu_gravity_correction"]);
   }
 
   if (c.has("initial_localization")) {
@@ -247,6 +260,33 @@ void LidarOdometry::initialize_frontend(const Yaml & c)
     } else {
       MRPT_LOG_WARN(
         "No YAML entry 'observations_filter_adjust_timestamps', this "
+        "filter stage will have no effect.");
+    }
+
+    if (c.has("observations_prefilter_file")) {
+      if (const auto prefilterFile = c["observations_prefilter_file"].as<std::string>();
+          !prefilterFile.empty()) {
+        ASSERT_FILE_EXISTS_(prefilterFile);
+
+        const auto prefilterYaml = mrpt::containers::yaml::FromFile(prefilterFile);
+
+        // Create, and copy my own verbosity level:
+        state_.pc_prefilter =
+          mp2p_icp_filters::filter_pipeline_from_yaml(prefilterYaml, this->getMinLoggingLevel());
+
+        // Attach to the parameter source for dynamic parameters:
+        mp2p_icp::AttachToParameterSource(state_.pc_prefilter, state_.parameter_source);
+      }
+    }
+
+    // Early deskew pass:
+    if (c.has("observations_deskew_pass")) {
+      state_.pc_deskew = mp2p_icp_filters::filter_pipeline_from_yaml(
+        c["observations_deskew_pass"], this->getMinLoggingLevel());
+      mp2p_icp::AttachToParameterSource(state_.pc_deskew, state_.parameter_source);
+    } else {
+      MRPT_LOG_WARN(
+        "No YAML entry 'observations_deskew_pass', this "
         "filter stage will have no effect.");
     }
 
