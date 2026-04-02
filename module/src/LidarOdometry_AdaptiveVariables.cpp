@@ -4,7 +4,7 @@
 | | | | | | (_) | | (_| | Localization and mApping (MOLA)
 |_| |_| |_|\___/|_|\__,_| https://github.com/MOLAorg/mola
 
- Copyright (C) 2018-2025 Jose Luis Blanco, University of Almeria,
+ Copyright (C) 2018-2026 Jose Luis Blanco, University of Almeria,
                          and individual contributors.
  SPDX-License-Identifier: GPL-3.0
  See LICENSE for full license information.
@@ -102,9 +102,11 @@ void LidarOdometry::updatePipelineDynamicVariables(const mrpt::Clock::time_point
     }
   };
 
+  // For stats generation in CSV
   ensureVarIsDefined("icp_iterations");
   ensureVarIsDefined("SENSOR_TIME_OFFSET");
   ensureVarIsDefined("twistCorrectionCount");
+  ensureVarIsDefined("icp_quality");
 
   if (state_.estimated_sensor_max_range) {
     state_.parameter_source.updateVariable(
@@ -169,7 +171,7 @@ void LidarOdometry::doUpdateAdaptiveThreshold(const mrpt::poses::CPose3D & lastM
     state_.adapt_thres_sigma = params_.adaptive_threshold.initial_sigma;
   }
 
-  state_.adapt_thres_sigma = ALPHA * state_.adapt_thres_sigma + (1.0 - ALPHA) * new_sigma;
+  state_.adapt_thres_sigma = (ALPHA * state_.adapt_thres_sigma) + ((1.0 - ALPHA) * new_sigma);
 
   mrpt::saturate(
     state_.adapt_thres_sigma, params_.adaptive_threshold.min_motion,
@@ -242,7 +244,7 @@ void LidarOdometry::doUpdateEstimatedMaxSensorRange(const mp2p_icp::metric_map_t
     state_.instantaneous_sensor_max_range = radius;
 
     // low-pass filter update:
-    maxRange = maxRange.value() * ALPHA + radius * (1.0 - ALPHA);
+    maxRange = (maxRange.value() * ALPHA) + (radius * (1.0 - ALPHA));
 
     MRPT_LOG_DEBUG_STREAM(
       "Estimated sensor max range=" << *state_.estimated_sensor_max_range
