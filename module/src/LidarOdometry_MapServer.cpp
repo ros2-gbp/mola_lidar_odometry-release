@@ -4,7 +4,7 @@
 | | | | | | (_) | | (_| | Localization and mApping (MOLA)
 |_| |_| |_|\___/|_|\__,_| https://github.com/MOLAorg/mola
 
- Copyright (C) 2018-2025 Jose Luis Blanco, University of Almeria,
+ Copyright (C) 2018-2026 Jose Luis Blanco, University of Almeria,
                          and individual contributors.
  SPDX-License-Identifier: GPL-3.0
  See LICENSE for full license information.
@@ -59,7 +59,9 @@ MapServer::ReturnStatus LidarOdometry::map_load(const std::string & path)
     }
 
     mmLoadOk = state_.local_map->load_from_file(mmFile);
-  } catch (const std::exception &) {
+  } catch (const std::exception & e) {
+    // It's ok if we cannot load the map:
+    (void)e;
   }
 
   bool smLoadOk = false;
@@ -70,7 +72,9 @@ MapServer::ReturnStatus LidarOdometry::map_load(const std::string & path)
     }
 
     smLoadOk = state_.reconstructed_simplemap.loadFromFile(smFile);
-  } catch (const std::exception &) {
+  } catch (const std::exception & e) {
+    // It's ok if we cannot load the map:
+    (void)e;
   }
 
   ret.success = mmLoadOk;  // smLoadOk: not mandatory
