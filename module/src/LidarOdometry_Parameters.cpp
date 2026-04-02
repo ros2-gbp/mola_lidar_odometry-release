@@ -4,7 +4,7 @@
 | | | | | | (_) | | (_| | Localization and mApping (MOLA)
 |_| |_| |_|\___/|_|\__,_| https://github.com/MOLAorg/mola
 
- Copyright (C) 2018-2025 Jose Luis Blanco, University of Almeria,
+ Copyright (C) 2018-2026 Jose Luis Blanco, University of Almeria,
                          and individual contributors.
  SPDX-License-Identifier: GPL-3.0
  See LICENSE for full license information.
@@ -72,49 +72,56 @@ void LidarOdometry::Parameters::Visualization::initialize(const Yaml & cfg)
   MCP_LOAD_OPT(cfg, last_deskewed_observations_colormap);
   MCP_LOAD_OPT(cfg, last_deskewed_observations_color_by_field);
 
-  if (cfg.has("model")) {
-    ASSERT_(cfg["model"].isSequence());
-    const auto models = cfg["model"].asSequenceRange();
-    for (const auto & e : models) {
-      ASSERT_(e.isMap());
-      auto c = e.asMap();
-      auto & m = model.emplace_back();
-      ASSERT_(c.count("file") != 0);
-      m.file = c["file"].as<std::string>();
-
-      if (m.file.empty()) {
-        model.erase(--model.end());
-        continue;
-      }
-
-      if (c.count("tf.x")) {
-        m.tf.x = c["tf.x"].as<float>();
-      }
-      if (c.count("tf.y")) {
-        m.tf.y = c["tf.y"].as<float>();
-      }
-      if (c.count("tf.z")) {
-        m.tf.z = c["tf.z"].as<float>();
-      }
-      if (c.count("tf.yaw")) {
-        m.tf.yaw = mrpt::DEG2RAD(c["tf.yaw"].as<float>());
-      }
-      if (c.count("tf.pitch")) {
-        m.tf.pitch = mrpt::DEG2RAD(c["tf.pitch"].as<float>());
-      }
-      if (c.count("tf.roll")) {
-        m.tf.roll = mrpt::DEG2RAD(c["tf.roll"].as<float>());
-      }
-      if (c.count("scale")) {
-        m.scale = c["scale"].as<float>();
-      }
-    }
-  }
-
   YAML_LOAD_OPT(gui_subwindow_starts_hidden, bool);
   YAML_LOAD_OPT(camera_follows_vehicle, bool);
   YAML_LOAD_OPT(camera_rotates_with_vehicle, bool);
   YAML_LOAD_OPT(camera_orthographic, bool);
+
+  initializeModelPart(cfg);
+}
+
+void LidarOdometry::Parameters::Visualization::initializeModelPart(const Yaml & cfg)
+{
+  if (!cfg.has("model")) {
+    return;
+  }
+
+  ASSERT_(cfg["model"].isSequence());
+  const auto models = cfg["model"].asSequenceRange();
+  for (const auto & e : models) {
+    ASSERT_(e.isMap());
+    auto c = e.asMap();
+    auto & m = model.emplace_back();
+    ASSERT_(c.count("file") != 0);
+    m.file = c["file"].as<std::string>();
+
+    if (m.file.empty()) {
+      model.erase(--model.end());
+      continue;
+    }
+
+    if (c.count("tf.x") != 0) {
+      m.tf.x = c["tf.x"].as<float>();
+    }
+    if (c.count("tf.y") != 0) {
+      m.tf.y = c["tf.y"].as<float>();
+    }
+    if (c.count("tf.z") != 0) {
+      m.tf.z = c["tf.z"].as<float>();
+    }
+    if (c.count("tf.yaw") != 0) {
+      m.tf.yaw = mrpt::DEG2RAD(c["tf.yaw"].as<float>());
+    }
+    if (c.count("tf.pitch") != 0) {
+      m.tf.pitch = mrpt::DEG2RAD(c["tf.pitch"].as<float>());
+    }
+    if (c.count("tf.roll") != 0) {
+      m.tf.roll = mrpt::DEG2RAD(c["tf.roll"].as<float>());
+    }
+    if (c.count("scale") != 0) {
+      m.scale = c["scale"].as<float>();
+    }
+  }
 }
 
 void LidarOdometry::Parameters::SimpleMapOptions::initialize(const Yaml & cfg, Parameters & parent)
@@ -190,6 +197,25 @@ void LidarOdometry::Parameters::ObservationValidityChecks::initialize(const Yaml
   YAML_LOAD_OPT(minimum_point_count, uint32_t);
 }
 
+void LidarOdometry::Parameters::IMUGravityCorrection::initialize(const Yaml & cfg)
+{
+  YAML_LOAD_OPT(enabled, bool);
+  YAML_LOAD_OPT(sigma_deg, double);
+  YAML_LOAD_OPT(averaging_samples, uint32_t);
+  YAML_LOAD_OPT(max_age_seconds, double);
+
+  if (enabled) {
+    ASSERTMSG_(
+      averaging_samples >= 1 && averaging_samples <= 200,
+      mrpt::format(
+        "imu_gravity_correction.averaging_samples=%u is out of valid range [1, 200]",
+        static_cast<unsigned>(averaging_samples)));
+
+    ASSERTMSG_(
+      sigma_deg > 0, mrpt::format("imu_gravity_correction.sigma_deg=%.4f must be > 0", sigma_deg));
+  }
+}
+
 void LidarOdometry::onParameterUpdate(const mrpt::containers::yaml & names_values)
 {
   if (names_values.isNullNode() || names_values.empty()) {
@@ -217,6 +243,7 @@ void LidarOdometry::onParameterUpdate(const mrpt::containers::yaml & names_value
   }
 
   // and reflect changes in the GUI, if used.
+#if !MOLA_VERSION_CHECK(2, 6, 0)
   this->enqueue_request([this]() {
     auto lckGuiMtx = mrpt::lockHelper(state_gui_mtx_);
     if (gui_.cbActive) {
@@ -225,6 +252,7 @@ void LidarOdometry::onParameterUpdate(const mrpt::containers::yaml & names_value
       gui_.cbSaveSimplemap->setChecked(params_.simplemap.generate);
     }
   });
+#endif
 }
 
 void LidarOdometry::onExposeParameters()
