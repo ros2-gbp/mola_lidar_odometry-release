@@ -26,8 +26,12 @@
 #include <mola_yaml/yaml_helpers.h>
 
 // MP2P_ICP:
+#include <mp2p_icp/IcpPrepareCapable.h>
 #include <mp2p_icp/icp_pipeline_from_yaml.h>
 #include <mrpt/system/filesystem.h>
+
+// Std:
+#include <sstream>
 
 namespace mola
 {
@@ -54,6 +58,35 @@ void LidarOdometry::initialize_frontend(const Yaml & c)
 
   // make a copy of the initialization, for use in reset()
   lastInitConfig_ = c;
+
+  // One-shot deprecation warning for the legacy *_sensor_* names. Aliases
+  // are still honored (dynamic variables are double-published; the *_sensor_*
+  // YAML param keys fall back via cfg.getOrDefault below), so old pipelines
+  // keep working, but we nudge users to migrate. Scope-limited substring scan
+  // over the serialized config covers embedded pipeline blocks
+  // (observations_deskew_pass, localmap_generator, etc.) without parsing
+  // them again.
+  {
+    std::stringstream ss;
+    ss << c;
+    const std::string serialized = ss.str();
+    const auto found = [&](const char * needle) {
+      return serialized.find(needle) != std::string::npos;
+    };
+    if (
+      found("ESTIMATED_SENSOR_MAX_RANGE") || found("INSTANTANEOUS_SENSOR_MAX_RANGE") ||
+      found("max_sensor_range_filter_coefficient") || found("absolute_minimum_sensor_range")) {
+      MRPT_LOG_WARN(
+        "Your YAML pipeline references one or more deprecated *_sensor_* "
+        "names (ESTIMATED_SENSOR_MAX_RANGE, INSTANTANEOUS_SENSOR_MAX_RANGE, "
+        "max_sensor_range_filter_coefficient, absolute_minimum_sensor_range). "
+        "They are aliases of ESTIMATED_OBSERVATION_RADIUS, "
+        "INSTANTANEOUS_OBSERVATION_RADIUS, observation_radius_filter_coefficient, "
+        "absolute_minimum_observation_radius respectively (all measured from "
+        "base_link, not from the sensor) and will be removed in a future "
+        "release. Please rename references in your pipeline files.");
+    }
+  }
 
   // Load params:
   const auto cfg = c["params"];
@@ -138,8 +171,15 @@ void LidarOdometry::initialize_frontend(const Yaml & c)
 
   YAML_LOAD_OPT(params_, min_time_between_scans, double);
   YAML_LOAD_REQ(params_, min_icp_goodness, double);
-  YAML_LOAD_OPT(params_, max_sensor_range_filter_coefficient, double);
-  YAML_LOAD_OPT(params_, absolute_minimum_sensor_range, double);
+  // Accept the deprecated *_sensor_* keys as fallbacks before reading the new
+  // canonical names, so a YAML that only sets the old key keeps working and a
+  // YAML that sets both lets the new key win.
+  params_.observation_radius_filter_coefficient = cfg.getOrDefault<double>(
+    "max_sensor_range_filter_coefficient", params_.observation_radius_filter_coefficient);
+  params_.absolute_minimum_observation_radius = cfg.getOrDefault<double>(
+    "absolute_minimum_sensor_range", params_.absolute_minimum_observation_radius);
+  YAML_LOAD_OPT(params_, observation_radius_filter_coefficient, double);
+  YAML_LOAD_OPT(params_, absolute_minimum_observation_radius, double);
   YAML_LOAD_OPT(params_, start_active, bool);
 
   YAML_LOAD_OPT(params_, max_lidar_queue_before_drop, uint32_t);
@@ -157,6 +197,10 @@ void LidarOdometry::initialize_frontend(const Yaml & c)
 
   if (cfg.has("adaptive_threshold")) {
     params_.adaptive_threshold.initialize(cfg["adaptive_threshold"]);
+  }
+
+  if (cfg.has("diagnostics")) {
+    params_.diagnostics.initialize(cfg["diagnostics"]);
   }
 
   if (cfg.has("visualization")) {
@@ -358,6 +402,37 @@ void LidarOdometry::initialize_frontend(const Yaml & c)
 
     state_.mark_local_map_as_updated(true);
     state_.mark_local_map_georef_as_updated();
+
+    // Pre-warm ICP search structures for each layer that supports it.
+    //
+    // Without this, the very first call to mp2p_icp::ICP::align() for a freshly loaded
+    // map does the prepare-global work (per-keyframe global-frame cloud materialization,
+    // merged submap construction, KD-tree build) on the lidar worker thread. For a
+    // non-trivial map this can stall the first scan for many seconds, during which the
+    // bag-feed backs up and the GUI stops updating. Doing it here moves the cost to
+    // mola-cli startup, alongside the cost of load_from_file the user already pays.
+    //
+    // The ref point used for selection is the configured initial pose (defaults to
+    // origin). If the actual first ICP estimate ends up being far away, the search
+    // submap will be transparently rebuilt then, but the per-keyframe heavy data is
+    // already materialized and that rebuild is cheap.
+    {
+      const ProfilerEntry tle(profiler_, "initialize.prewarm_icp_search");
+      const auto initial_pose =
+        mrpt::poses::CPose3D(params_.initial_localization.fixed_initial_pose);
+      std::size_t prepared_layers = 0;
+      for (const auto & [layer_name, layer_map] : state_.local_map->layers) {
+        const auto * prep = dynamic_cast<const mp2p_icp::IcpPrepareCapable *>(layer_map.get());
+        if (prep == nullptr) {
+          continue;
+        }
+        prep->icp_get_prepared_as_global(initial_pose);
+        ++prepared_layers;
+      }
+      MRPT_LOG_INFO_STREAM(
+        "Pre-warmed ICP search structures for "
+        << prepared_layers << " of " << state_.local_map->layers.size() << " local-map layer(s).");
+    }
   }
 
   if (!params_.simplemap.load_existing_simple_map.empty()) {
@@ -377,6 +452,27 @@ void LidarOdometry::initialize_frontend(const Yaml & c)
     state_.navstate_fuse = std::dynamic_pointer_cast<NavStateFilter>(mods[0]);
     ASSERT_(state_.navstate_fuse);
     MRPT_LOG_DEBUG("Attached to the state estimation module");
+  }
+
+  // If using FromStateEstimator initialization, also subscribe to map updates
+  // from the state estimator to receive geo-referencing information:
+  if (params_.initial_localization.method == InitLocalization::FromStateEstimator) {
+    // The state estimator may also be a MapSourceBase (for geo-ref publishing)
+    if (auto mapSrc = std::dynamic_pointer_cast<MapSourceBase>(state_.navstate_fuse); mapSrc) {
+      mapSrc->subscribeToMapUpdates(
+        [this](const MapSourceBase::MapUpdate & mu) { onExternalMapUpdate(mu); });
+      MRPT_LOG_DEBUG("Subscribed to state estimator's map updates for geo-referencing");
+    }
+
+    // Also subscribe to localization updates for pose convergence checking
+    if (auto locSrc = std::dynamic_pointer_cast<LocalizationSourceBase>(state_.navstate_fuse);
+        locSrc) {
+      locSrc->subscribeToLocalizationUpdates(
+        [this](const LocalizationSourceBase::LocalizationUpdate & lu) {
+          onExternalLocalizationUpdate(lu);
+        });
+      MRPT_LOG_DEBUG("Subscribed to state estimator's localization updates");
+    }
   }
 
   // end of initialization:
