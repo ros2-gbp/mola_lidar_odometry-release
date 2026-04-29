@@ -29,8 +29,8 @@ params:
   min_time_between_scans: 1e-3 # [seconds]
 
   # Parameters for max sensor range automatic estimation:
-  observation_radius_filter_coefficient: 0.95
-  absolute_minimum_observation_radius: ${MOLA_ABS_MIN_SENSOR_RANGE|5.0}
+  max_sensor_range_filter_coefficient: 0.95
+  absolute_minimum_sensor_range: ${MOLA_ABS_MIN_SENSOR_RANGE|5.0}
 
   # If enabled, vehicle twist will be optimized during ICP
   # enabling better and more robust odometry in high dynamics motion without an IMU.
@@ -63,13 +63,12 @@ params:
     save_final_local_map: ${MOLA_SAVE_MM|""} # If not empty, saves the final local metric map to a ".mm" file
 
     # Idea: don't integrate scans with a high rotational speed since they are probably not correctly deskewed:
-    min_translation_between_keyframes: "${MOLA_MIN_XYZ_BETWEEN_MAP_UPDATES|(0.1e-2 + sqrt(wx^2+wy^2+wz^2)*0.1)*ESTIMATED_OBSERVATION_RADIUS}" # [m]
+    min_translation_between_keyframes: "${MOLA_MIN_XYZ_BETWEEN_MAP_UPDATES|(0.1e-2 + sqrt(wx^2+wy^2+wz^2)*0.1)*ESTIMATED_SENSOR_MAX_RANGE}" # [m]
     min_rotation_between_keyframes: "${MOLA_MIN_ROT_BETWEEN_MAP_UPDATES|(15 + sqrt(wx^2+wy^2+wz^2)*500 )}" # [deg]
 
     # Should match the "remove farther than" option of the local metric map. "0" means deletion of distant key-frames is disabled
-    max_distance_to_keep_keyframes: "${MOLA_LOCAL_MAP_MAX_SIZE|max(100.0, 1.50*ESTIMATED_OBSERVATION_RADIUS)}" # [m]
+    max_distance_to_keep_keyframes: "${MOLA_LOCAL_MAP_MAX_SIZE|max(100.0, 1.50*ESTIMATED_SENSOR_MAX_RANGE)}" # [m]
     check_for_removal_every_n: 100
-    min_nearby_poses_occupied: ${MOLA_MIN_NEARBY_POSES_OCCUPIED|1}
     publish_map_updates_every_n: ${MOLA_PUBLISH_LOCAL_MAP_UPDATES_EVERY_N|40}
 
   # Minimum ICP quality to insert it into the map:
@@ -89,17 +88,6 @@ params:
     kp: 2.0
     alpha: ${MOLA_ADAPT_THRESHOLD_ALPHA|0.99}
 
-  # REP-107 diagnostics thresholds published on /diagnostics via mola_bridge_ros2.
-  # Any of these can be omitted to keep its built-in default.
-  diagnostics:
-    icp_quality_warn: 0.30         # [0-1] WARN if icp_quality below this
-    icp_quality_error: 0.10        # [0-1] ERROR if icp_quality below this
-    input_stale_sec: 3.0           # [s]   STALE if no observation for this long
-    input_error_sec: 5.0           # [s]   ERROR if no observation for this long
-    dropped_ratio_warn: 0.20       # [0-1] WARN if dropped-frames ratio exceeds
-    dropped_ratio_error: 0.50      # [0-1] ERROR if dropped-frames ratio exceeds
-    timing_utilization_warn: 0.80  # [0-1] WARN if avg process time / sensor period exceeds
-
   # If enabled, a map will be stored in RAM and (if using the CLI) stored
   # to a ".simplemap" file for later use for localization, etc.
   simplemap:
@@ -108,12 +96,11 @@ params:
 
     save_final_map_to_file: ${MOLA_SIMPLEMAP_OUTPUT|'final_map.simplemap'}
 
-    min_translation_between_keyframes: ${MOLA_SIMPLEMAP_MIN_XYZ|(1.0e-2 + sqrt(wx^2+wy^2+wz^2)*1.0)*ESTIMATED_OBSERVATION_RADIUS} # m
+    min_translation_between_keyframes: ${MOLA_SIMPLEMAP_MIN_XYZ|(1.0e-2 + sqrt(wx^2+wy^2+wz^2)*1.0)*ESTIMATED_SENSOR_MAX_RANGE} # m
     min_rotation_between_keyframes: ${MOLA_SIMPLEMAP_MIN_ROT|15 + sqrt(wx^2+wy^2+wz^2)*500} # deg
 
     generate_lazy_load_scan_files: ${MOLA_SIMPLEMAP_GENERATE_LAZY_LOAD|false} # If enabled, a directory will be create alongside the .simplemap and pointclouds will be externally serialized there.
     add_non_keyframes_too: ${MOLA_SIMPLEMAP_ALSO_NON_KEYFRAMES|false} # If enabled, all frames are stored in the simplemap, but non-keyframes will be without associated observations.
-    min_nearby_poses_occupied: ${MOLA_SIMPLEMAP_MIN_NEARBY_POSES|1}
     save_gnss_max_age: 1.0 # [s] max age of GNSS observations to keep in the keyframe
 
     # If enabled, this will store deskewed scans into the keyframes of simplemaps.
@@ -130,8 +117,8 @@ params:
     map_update_decimation: 10
     show_trajectory: true
     trajectory_rgba: [0.1, 0.1, 0.1, 1.0]
-    show_current_observation: ${MOLA_GUI_SHOW_CURRENT_OBS|false} # shows "live deskewed" LiDAR points
-    show_last_deskewed_observations_decay: ${MOLA_GUI_SHOW_DESKEWED_DECAY|true} # shows "live deskewed" LiDAR points over time
+    show_current_observation: false # shows "live deskewed" LiDAR points
+    show_last_deskewed_observations_decay: true # shows "live deskewed" LiDAR points over time
     last_deskewed_observations_point_size: ${MOLA_GUI_LAST_CLOUDS_POINT_SIZE|1.0}
     last_deskewed_observations_colormap: ${MOLA_GUI_LAST_CLOUDS_COLORMAP|cmJET} # mrpt::img::TColormap
     last_deskewed_observations_color_by_field: ${MOLA_GUI_LAST_CLOUDS_COLOR_FIELD|intensity}
@@ -198,11 +185,6 @@ initial_localization:
   imu_initial_calibration_sample_count: "${MOLA_LO_INITIAL_IMU_SAMPLES|400}"
   imu_initial_calibration_max_age: 5.0
   use_imu_orientation: "${MOLA_LO_INITIAL_IMU_USE_ORIENTATION|true}"
-
-  # Parameters for InitLocalization::FromStateEstimator:
-  from_state_estimator_max_position_sigma: "${MOLA_LO_INIT_SE_MAX_POS_SIGMA|0.5}"
-  from_state_estimator_max_orientation_sigma_deg: "${MOLA_LO_INIT_SE_MAX_ORI_SIGMA|3.0}"
-  from_state_estimator_timeout: "${MOLA_LO_INIT_SE_TIMEOUT|60.0}"
 
 # If "icp_settings_without_vel" is not defined here, defaults to be the same than 'icp_settings_with_vel'
 # ICP settings can be included from an external YAML file if desired, or defined
@@ -289,7 +271,7 @@ localmap_generator:
           rotation_distance_weight: 2.0
           num_diverse_keyframes: ${MOLA_LOCALMAP_DIVERSE_KEYFRAMES|1} # Must be < max_search_keyframes
         insertOpts:
-          remove_frames_farther_than: "${MOLA_LOCAL_MAP_MAX_SIZE|$f{max(100.0, 1.50*ESTIMATED_OBSERVATION_RADIUS)}}" # [m]
+          remove_frames_farther_than: "${MOLA_LOCAL_MAP_MAX_SIZE|$f{max(100.0, 1.50*ESTIMATED_SENSOR_MAX_RANGE)}}" # [m]
         likelihoodOpts: ~ # none required
         renderOpts:
           color.A: 0.25 # [0,1] Use this alpha value for points, RGB from colormap
@@ -358,22 +340,14 @@ observations_prefilter_file: ${MOLA_LO_OBS_PREFILTER_PIPELINE_FILE|""}
 # Runs once; result is reused for decimation, viz, publish, simplemap.
 # Skipped at runtime when !hasIMU && optimize_twist (fallback to 2nd-pass deskew).
 observations_deskew_pass:
-  # Drop near returns to remove "noise" from the vehicle body, a person
-  # standing next to the robot (e.g. with a joystick), etc., and clamp
-  # very far returns where small angular errors blow up into large
-  # translational errors. metric_l_infinity → axis-aligned cube; center
-  # is unset → anchored at base_link (the vehicle origin), *not* at the
-  # sensor — this is intentional so the deadzone covers the whole
-  # vehicle footprint regardless of where the sensor is mounted on it.
-  # If you also need a sensor-anchored cut (e.g. the sensor's blind
-  # sphere when it is mounted significantly off base_link), add an
-  # extra filter via observations_prefilter_file.
+  # Remove points too close, to prevent "noise" from the vehicle,
+  # the person next to the robot, etc.
   - class_name: mp2p_icp_filters::FilterByRange
     params:
       input_pointcloud_layer: "raw"
       output_layer_between: "raw_range_filtered"
-      range_min: "${MOLA_MINIMUM_RANGE_FILTER|max(1.0, 0.03*ESTIMATED_OBSERVATION_RADIUS)}"
-      range_max: 1.2*ESTIMATED_OBSERVATION_RADIUS
+      range_min: "${MOLA_MINIMUM_RANGE_FILTER|max(1.0, 0.03*ESTIMATED_SENSOR_MAX_RANGE)}"
+      range_max: 1.2*ESTIMATED_SENSOR_MAX_RANGE
       metric_l_infinity: true
 
   - class_name: mp2p_icp_filters::FilterDeskew
@@ -382,7 +356,6 @@ observations_deskew_pass:
       input_pointcloud_layer: "raw_range_filtered"
       output_pointcloud_layer: "deskewed"
       method: "${MOLA_DESKEW_METHOD|MotionCompensationMethod::Linear}"
-      ignore_accelerometer: "${MOLA_DESKEW_IGNORE_ACCELEROMETER|false}"
       silently_ignore_no_timestamps: ${MOLA_IGNORE_NO_POINT_STAMPS|true} # To handle more dataset types
       output_layer_class: "mrpt::maps::CGenericPointsMap" # Keep intensity, ring, time channels
 
@@ -454,8 +427,8 @@ observations_filter_deskew_for_visualization:
     params:
       input_pointcloud_layer: "raw"
       output_layer_between: "raw_filtered"
-      range_min: "${MOLA_MINIMUM_RANGE_FILTER|max(1.0, 0.03*ESTIMATED_OBSERVATION_RADIUS)}"
-      range_max: 1.2*ESTIMATED_OBSERVATION_RADIUS
+      range_min: "${MOLA_MINIMUM_RANGE_FILTER|max(1.0, 0.03*ESTIMATED_SENSOR_MAX_RANGE)}"
+      range_max: 1.2*ESTIMATED_SENSOR_MAX_RANGE
       metric_l_infinity: true
 
   - class_name: mp2p_icp_filters::FilterDeskew
@@ -464,7 +437,6 @@ observations_filter_deskew_for_visualization:
       input_pointcloud_layer: "raw_filtered"
       output_pointcloud_layer: "viz"
       method: "${MOLA_DESKEW_METHOD|MotionCompensationMethod::Linear}"
-      ignore_accelerometer: "${MOLA_DESKEW_IGNORE_ACCELEROMETER|false}"
       silently_ignore_no_timestamps: ${MOLA_IGNORE_NO_POINT_STAMPS|true} # To handle more dataset types
       output_layer_class: "mrpt::maps::CGenericPointsMap" # Keep intensity only
 
