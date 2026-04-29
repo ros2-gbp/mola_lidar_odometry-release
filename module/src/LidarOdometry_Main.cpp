@@ -375,17 +375,27 @@ void LidarOdometry::enqueue_request(const std::function<void()> & userRequest)
 
 void LidarOdometry::processPendingUserRequests()
 {
-  auto lckState = mrpt::lockHelper(state_mtx_);
-  auto lck = mrpt::lockHelper(requests_mtx_);
+  // Swap-and-release pattern:
+  //  1) Atomically take ownership of the pending list by swapping it out
+  //     under requests_mtx_.
+  //  2) Release requests_mtx_ before executing any user lambda.
+  // This is required because a request body may legitimately call
+  // enqueue_request() (which would self-deadlock on a non-recursive mutex),
+  // or take state_mtx_ (a previous version of this function held it here,
+  // stalling ROS service threads that called e.g. relocalize_near_pose_pdf).
+  std::vector<std::function<void()>> pending;
+  {
+    auto lck = mrpt::lockHelper(requests_mtx_);
+    pending.swap(requests_);
+  }
 
-  for (const auto & r : requests_) {
+  for (const auto & r : pending) {
     try {
       r();
     } catch (const std::exception & e) {
       MRPT_LOG_ERROR_STREAM("Error processing asynchronous enqueue_request(): " << e.what());
     }
   }
-  requests_.clear();
 }
 
 #if defined(MOLA_LO_HAS_ONLINE_VERSION_CHECK)
@@ -574,7 +584,7 @@ void LidarOdometry::onInitializePersistentState()
   }
 }
 
-void LidarOdometry::doWriteDebugTracesFile(const mrpt::Clock::time_point & this_obs_tim)
+void LidarOdometry::doWriteDebugTracesFile(const mrpt::Clock::time_point & scan_ref_time)
 {
   if (!params_.debug_traces.save_to_file) {
     return;  // disabled
@@ -601,7 +611,7 @@ void LidarOdometry::doWriteDebugTracesFile(const mrpt::Clock::time_point & this_
   auto & of = debug_traces_of_.value();
 
   auto vars = state_.parameter_source.getVariableValues();
-  vars["timestamp"] = mrpt::Clock::toDouble(this_obs_tim);
+  vars["timestamp"] = mrpt::Clock::toDouble(scan_ref_time);
   vars["time_onLidar"] = profiler_.getLastTime("onLidar");
 
   if (firstLine) {
