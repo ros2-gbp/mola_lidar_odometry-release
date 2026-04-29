@@ -281,11 +281,12 @@ Sensor inputs: LiDAR
 - ``MOLA_LIDAR_MAX_TIME_OFFSET`` (Default: ``0.1`` [s]): Maximum delay between different LiDAR observations to handle them together.
   Note that deskewing takes into account the exact delays between clouds from different LiDARs.
 
-- ``MOLA_ABS_MIN_SENSOR_RANGE`` (Default: ``5.0`` [m]): Absolute minimum for the otherwise automatically 
-  detected maximum sensor range.
+- ``MOLA_ABS_MIN_SENSOR_RANGE`` (Default: ``5.0`` [m]): Absolute minimum for the otherwise
+  automatically detected observation radius (see ``ESTIMATED_OBSERVATION_RADIUS``).
 
-- ``MOLA_MINIMUM_RANGE_FILTER`` (Default: 3% of max sensor range). Minimum range for 3D points. This removes points from 
-  the robot/vehicle itself.
+- ``MOLA_MINIMUM_RANGE_FILTER`` (Default: 3% of the estimated observation radius). Minimum range
+  (L∞ cube around ``base_link``) for 3D points used by ICP; intended to cut out points coming from
+  the robot/vehicle body itself or a person standing right next to it.
 
 Sensor inputs: IMU (optional)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -306,6 +307,10 @@ Sensor inputs: IMU (optional)
 
 - ``MOLA_DESKEW_METHOD`` (Default: ``MotionCompensationMethod::Linear``): **IMPORTANT**: If you do not change this from its default,
   the IMU data will not be used for deskewing. To fully achieve the best accuracy, set this variable to ``MotionCompensationMethod::IMU``.
+
+- ``MOLA_DESKEW_IGNORE_ACCELEROMETER`` (Default: ``false``): Enable if a noisy IMU sensor causes shaky motion in the estimation, 
+  but you still want to use gyroscope for precise deskewing in LIO.
+
 
 IMU gravity correction (pitch/roll)
 """""""""""""""""""""""""""""""""""""
@@ -346,7 +351,7 @@ extrinsics, and derives pitch and roll from the gravity direction.
 Sensor inputs: Wheels odometry (optional)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-- ``MOLA_ODOMETRY_NAME`` (Default: ``odometry``): **Sensor label** (or regex) of the observations
+- ``MOLA_ODOMETRY_NAME`` (Default: ``wheel_odom``): **Sensor label** (or regex) of the observations
   with wheels odometry, if it exists.
 
 Sensor inputs: GPS (GNSS) (optional)
