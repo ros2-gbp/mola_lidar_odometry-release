@@ -93,6 +93,7 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
 
   // Keep timestamps for logging purposes:
   state_.last_obs_timestamp = this_obs_tim;
+  state_.last_obs_reception_time = mrpt::Clock::now();
   if (!state_.first_ever_timestamp) {
     state_.first_ever_timestamp = this_obs_tim;
   }
@@ -119,8 +120,8 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
   state_.last_obs_tim_by_label[obs->sensorLabel] = this_obs_tim;
 
   // Use the observation to update the estimated sensor range:
-  if (!state_.estimated_sensor_max_range.has_value()) {
-    doInitializeEstimatedMaxSensorRange(*obs);
+  if (!state_.estimated_observation_radius.has_value()) {
+    doInitializeEstimatedObservationRadius(*obs);
   }
 
   // Handle multiple simultaneous LIDARs:
@@ -184,7 +185,7 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
   }
 
   // Update sensor max range from the obs map layers:
-  doUpdateEstimatedMaxSensorRange(*observation);
+  doUpdateEstimatedObservationRadius(*observation);
 
   profiler_.enter("onLidar.2.copy_vars");
 
@@ -214,6 +215,17 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
     return;
   }
 
+  // The ICP-derived pose corresponds to the vehicle at t=0 of the deskewed
+  // cloud, i.e. the local velocity buffer's reference_zero_time (set by
+  // Generator to obs.timestamp, then shifted by FilterAdjustTimestamps when
+  // configured, e.g. MiddleIsZero -> mid-scan). Use it consistently for any
+  // pose-time semantics (state fusion, trajectory, published stamps).
+  // With no per-point time adjustment configured this equals obs->timestamp.
+  const double scan_ref_time_s =
+    state_.parameter_source.localVelocityBuffer.get_reference_zero_time();
+  const auto scan_ref_time =
+    scan_ref_time_s > 0 ? mrpt::Clock::fromDouble(scan_ref_time_s) : this_obs_tim;
+
   // local map: used for LIDAR odometry:
   bool updateLocalMap = false;
 
@@ -229,7 +241,7 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
   ProfilerEntry tleMotion(profiler_, "onLidar.2b.estimated_navstate");
 
   state_.last_motion_model_output =
-    state_.navstate_fuse->estimated_navstate(this_obs_tim, params_.publish_reference_frame);
+    state_.navstate_fuse->estimated_navstate(scan_ref_time, params_.publish_reference_frame);
 
   bool hasMotionModel = state_.last_motion_model_output.has_value();
 
@@ -263,7 +275,7 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
     {
       auto lck = mrpt::lockHelper(state_trajectory_mtx_);
       state_.estimated_trajectory.insert(
-        this_obs_tim, params_.initial_localization.fixed_initial_pose);
+        scan_ref_time, params_.initial_localization.fixed_initial_pose);
     }
 
     // Define the current robot pose at the origin with minimal uncertainty
@@ -272,7 +284,7 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
     initPose.mean = mrpt::poses::CPose3D(params_.initial_localization.fixed_initial_pose);
     initPose.cov.setDiagonal(1e-12);
 
-    state_.navstate_fuse->fuse_pose(this_obs_tim, initPose, params_.publish_reference_frame);
+    state_.navstate_fuse->fuse_pose(scan_ref_time, initPose, params_.publish_reference_frame);
   } else {
     // Register point clouds using ICP:
     // ------------------------------------
@@ -380,6 +392,7 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
     if (state_.last_icp_timestamp) {
       in.time_since_last_keyframe =
         mrpt::system::timeDifference(*state_.last_icp_timestamp, this_obs_tim);
+      state_.last_observed_scan_period_sec = in.time_since_last_keyframe;
     }
     state_.last_icp_timestamp = this_obs_tim;
 
@@ -542,7 +555,7 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
       if (state_.step_counter_post_relocalization == 0) {
         // Do integrate info:
         state_.navstate_fuse->fuse_pose(
-          this_obs_tim, out.found_pose_to_wrt_from, params_.publish_reference_frame);
+          scan_ref_time, out.found_pose_to_wrt_from, params_.publish_reference_frame);
       } else {
         // Skip during post-relocalization:
         state_.step_counter_post_relocalization--;
@@ -557,7 +570,7 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
     // Update trajectory too:
     if (icpIsGood) {
       auto lck = mrpt::lockHelper(state_trajectory_mtx_);
-      state_.estimated_trajectory.insert(this_obs_tim, state_.last_lidar_pose.mean);
+      state_.estimated_trajectory.insert(scan_ref_time, state_.last_lidar_pose.mean);
     }
 
     // Update for stats in CSV format:
@@ -590,13 +603,38 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
       state_.distance_checker_simplemap.emplace(params_.simplemap.measure_from_last_kf_only);
     }
 
+    // Use the lidar sensor pose (in world frame) as the distance-checker key.
+    // This correctly handles moving lidars and non-repetitive scan patterns,
+    // since the sensor itself -- not the base_link -- determines coverage.
+    mrpt::poses::CPose3D sensorPoseInVehicle;
+    obs->getSensorPose(sensorPoseInVehicle);
+    const mrpt::poses::CPose3D lidarPoseInWorld = state_.last_lidar_pose.mean + sensorPoseInVehicle;
+
     // Create a new KF if the distance since the last one is large enough:
     const auto [isFirstPoseInChecker, distanceToClosest] =
-      state_.distance_checker_local_map->check(state_.last_lidar_pose.mean);
+      state_.distance_checker_local_map->check(lidarPoseInWorld);
 
     const double euclidean_dist_since_last = distanceToClosest.norm();
     const double rot_since_last =
       mrpt::poses::Lie::SO<3>::log(distanceToClosest.getRotationMatrix()).norm();
+
+    bool distFarEnoughLocal =
+      (isFirstPoseInChecker ||
+       euclidean_dist_since_last > params_.local_map_updates.min_translation_between_keyframes ||
+       rot_since_last > mrpt::DEG2RAD(params_.local_map_updates.min_rotation_between_keyframes));
+
+#if defined(MOLA_POSE_LIST_HAS_KFM_POSE_PLUMBING)
+    if (!distFarEnoughLocal && params_.local_map_updates.min_nearby_poses_occupied > 1) {
+      const uint32_t nearbyCount = state_.distance_checker_local_map->countNearby(
+        lidarPoseInWorld, params_.local_map_updates.min_translation_between_keyframes,
+        mrpt::DEG2RAD(params_.local_map_updates.min_rotation_between_keyframes));
+      if (nearbyCount < params_.local_map_updates.min_nearby_poses_occupied) {
+        distFarEnoughLocal = true;
+      }
+    }
+#else
+    // Older mola_pose_list: countNearby() unavailable; min_nearby_poses_occupied has no effect.
+#endif
 
     // clang-format off
     updateLocalMap =
@@ -605,15 +643,12 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
        params_.local_map_updates.enabled &&
        // skip map update for the special ICP alignment without motion model
        hasMotionModel &&
-       (isFirstPoseInChecker ||
-        euclidean_dist_since_last > params_.local_map_updates.min_translation_between_keyframes ||
-        rot_since_last >
-          mrpt::DEG2RAD(params_.local_map_updates.min_rotation_between_keyframes))
+       distFarEnoughLocal
        );
     // clang-format on
 
     if (updateLocalMap) {
-      state_.distance_checker_local_map->insert(state_.last_lidar_pose.mean);
+      state_.distance_checker_local_map->insert(lidarPoseInWorld);
 
       if (
         params_.local_map_updates.max_distance_to_keep_keyframes > 0 &&
@@ -626,7 +661,7 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
         const auto nInit = state_.distance_checker_local_map->size();
 
         state_.distance_checker_local_map->removeAllFartherThan(
-          state_.last_lidar_pose.mean, params_.local_map_updates.max_distance_to_keep_keyframes);
+          lidarPoseInWorld, params_.local_map_updates.max_distance_to_keep_keyframes);
 
         const auto nFinal = state_.distance_checker_local_map->size();
         MRPT_LOG_DEBUG_STREAM("removeAllFartherThan: " << nInit << " => " << nFinal << " KFs");
@@ -634,7 +669,7 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
     }
 
     const auto [isFirstPoseInSMChecker, distanceToClosestSM] =
-      state_.distance_checker_simplemap->check(state_.last_lidar_pose.mean);
+      state_.distance_checker_simplemap->check(lidarPoseInWorld);
 
     const double euclidean_dist_since_last_sm = distanceToClosestSM.norm();
     const double rot_since_last_sm =
@@ -645,6 +680,19 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
       euclidean_dist_since_last_sm > params_.simplemap.min_translation_between_keyframes ||
       rot_since_last_sm > mrpt::DEG2RAD(params_.simplemap.min_rotation_between_keyframes);
 
+#if defined(MOLA_POSE_LIST_HAS_KFM_POSE_PLUMBING)
+    if (!distance_enough_sm && params_.simplemap.min_nearby_poses_occupied > 1) {
+      const uint32_t nearbyCountSM = state_.distance_checker_simplemap->countNearby(
+        lidarPoseInWorld, params_.simplemap.min_translation_between_keyframes,
+        mrpt::DEG2RAD(params_.simplemap.min_rotation_between_keyframes));
+      if (nearbyCountSM < params_.simplemap.min_nearby_poses_occupied) {
+        distance_enough_sm = true;
+      }
+    }
+#else
+    // Older mola_pose_list: countNearby() unavailable; min_nearby_poses_occupied has no effect.
+#endif
+
     // clang-format off
     updateSimpleMap =
       params_.simplemap.generate &&
@@ -654,7 +702,7 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
     // clang-format on
 
     if (updateSimpleMap && distance_enough_sm) {
-      state_.distance_checker_simplemap->insert(state_.last_lidar_pose.mean);
+      state_.distance_checker_simplemap->insert(lidarPoseInWorld);
     }
 
     MRPT_LOG_DEBUG_FMT(
@@ -733,13 +781,14 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
 
   // Optional build simplemap:
   if (updateSimpleMap) {
-    doUpdateSimpleMap(sf, distance_enough_sm, observation, this_obs_tim, fullCloudForVizAndPublish);
+    doUpdateSimpleMap(
+      sf, distance_enough_sm, observation, scan_ref_time, fullCloudForVizAndPublish);
   }
 
   // In any case, publish the vehicle pose, no matter if it's a keyframe or not,
   // if ICP quality was good enough:
   if (state_.last_icp_was_good) {
-    doPublishUpdatedLocalization(this_obs_tim);
+    doPublishUpdatedLocalization(scan_ref_time);
   }
 
   // Prepare deskewed scan for publishing:
@@ -764,14 +813,14 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
   }
 
   // Publish new local map & deskewed scan for visualization on external systems (ROS):
-  doPublishUpdatedLocalMap(this_obs_tim);
+  doPublishUpdatedLocalMap(scan_ref_time);
 
   if (state_.last_icp_was_good) {
-    doPublishDeskewedScan(this_obs_tim);
+    doPublishDeskewedScan(scan_ref_time);
   }
 
   // Optional debug traces to CSV file:
-  doWriteDebugTracesFile(this_obs_tim);
+  doWriteDebugTracesFile(scan_ref_time);
 
   // Optional real-time GUI via MOLA VizInterface:
   if (visualizer_ && state_.local_map && state_.last_icp_was_good) {
@@ -851,7 +900,7 @@ mrpt::obs::CSensoryFrame LidarOdometry::collectRawObservations(
 
 void LidarOdometry::doUpdateSimpleMap(
   const mrpt::obs::CSensoryFrame & sf, const bool distance_enough_sm,
-  const mp2p_icp::metric_map_t::Ptr & observation, const mrpt::Clock::time_point & this_obs_tim,
+  const mp2p_icp::metric_map_t::Ptr & observation, const mrpt::Clock::time_point & scan_ref_time,
   const mrpt::maps::CPointsMap::Ptr & deskewedCloud)
 {
   using namespace std::string_literals;
@@ -867,7 +916,7 @@ void LidarOdometry::doUpdateSimpleMap(
 
     if (params_.simplemap.save_deskewed_scans && deskewedCloud) {
       auto od = mrpt::obs::CObservationPointCloud::Create();
-      od->timestamp = this_obs_tim;
+      od->timestamp = scan_ref_time;
       auto spc = mrpt::maps::CGenericPointsMap::Create();
       spc->insertAnotherMap(deskewedCloud.get(), {});
       od->pointcloud = spc;
@@ -875,7 +924,7 @@ void LidarOdometry::doUpdateSimpleMap(
       keyframe_obs->insert(od);
     }
 
-    const auto curLidarStamp = this_obs_tim;
+    const auto curLidarStamp = scan_ref_time;
 
     // insert GNSS too? Search for a close-enough observation:
     std::optional<double> closestTimeAbsDiff;
@@ -906,7 +955,7 @@ void LidarOdometry::doUpdateSimpleMap(
 
   // Add metadata ("comment") observation:
   auto metadataObs = mrpt::obs::CObservationComment::Create();
-  metadataObs->timestamp = this_obs_tim;
+  metadataObs->timestamp = scan_ref_time;
   metadataObs->sensorLabel = "metadata";
 
   mrpt::containers::yaml kf_metadata = mrpt::containers::yaml::Map();
@@ -954,7 +1003,7 @@ void LidarOdometry::doUpdateSimpleMap(
   // We cannot unload them right now, for the case when they are being
   // used in a GUI, etc.
   // (1/2) Add to the list:
-  state_.past_simplemaps_observations[this_obs_tim] = keyframe_obs;
+  state_.past_simplemaps_observations[scan_ref_time] = keyframe_obs;
 
   const ProfilerEntry tleUnloadSM(profiler_, "onLidar.5.unload_past_sm_obs");
 
