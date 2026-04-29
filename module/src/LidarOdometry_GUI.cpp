@@ -459,7 +459,6 @@ void LidarOdometry::internalBuildGUI_Legacy()
 
 void LidarOdometry::doRemoveCloudsWithDecay()
 {
-  // Remove possible old 3D objects if the user disabled visualization on the fly:
   if (visualizer_) {
     visualizer_->clear_all_point_clouds_with_decay();
   }
@@ -502,29 +501,15 @@ void LidarOdometry::updateVisualization(
 
   // Vehicle pose:
   // ---------------------------
-  if (!state_.glVehicleModelsLoaded) {
+  if (!state_.glVehicleFrame) {
     updateVisualizationInitVehFrame();
   }
 
   // Update vehicle pose
   // -------------------------
-  // Build a *fresh* CSetOfObjects each update. The vehicle model children
-  // are read-only after load, so sharing their Ptrs between the cached
-  // slot and this fresh parent is safe. We never hand out the cached
-  // list itself to the GUI thread, so there is no writer/reader race on
-  // the parent (MolaViz::update_3d_object deep-reads it on the GUI
-  // thread while the lidar worker may keep producing new frames).
-  auto glVehicle = mrpt::opengl::CSetOfObjects::Create();
-  if (const auto l = params_.visualization.current_pose_corner_size; l > 0) {
-    glVehicle->insert(mrpt::opengl::stock_objects::CornerXYZ(l));
-  }
-  for (const auto & m : state_.glVehicleModels) {
-    glVehicle->insert(m);
-  }
-  glVehicle->setPose(state_.last_lidar_pose.mean);
-  updateTasks.emplace_back([visualizer = visualizer_, glVehicle]() {
-    visualizer->update_3d_object("liodom/vehicle", glVehicle);
-  });
+  state_.glVehicleFrame->setPose(state_.last_lidar_pose.mean);
+  updateTasks.emplace_back(
+    [this]() { visualizer_->update_3d_object("liodom/vehicle", state_.glVehicleFrame); });
 
   // Update current observation
   // ----------------------------
@@ -537,21 +522,21 @@ void LidarOdometry::updateVisualization(
   // GUI follow vehicle:
   // ---------------------------
   if (params_.visualization.camera_follows_vehicle) {
-    const auto t = state_.last_lidar_pose.mean.translation();
-    updateTasks.emplace_back(
-      [visualizer = visualizer_, t]() { visualizer->update_viewport_look_at(t); });
+    updateTasks.emplace_back([this]() {
+      visualizer_->update_viewport_look_at(state_.last_lidar_pose.mean.translation());
+    });
   }
 
   if (params_.visualization.camera_rotates_with_vehicle) {
-    const double yaw = state_.last_lidar_pose.mean.yaw();
-    double yawIncr = 0;
-    if (state_.last_yaw_for_viz_camera) {
-      yawIncr = mrpt::math::wrapToPi(yaw - *state_.last_yaw_for_viz_camera);
-    }
-    state_.last_yaw_for_viz_camera = yaw;
+    updateTasks.emplace_back([this]() {
+      const double yaw = state_.last_lidar_pose.mean.yaw();
+      double yawIncr = 0;
+      if (state_.last_yaw_for_viz_camera) {
+        yawIncr = mrpt::math::wrapToPi(yaw - *state_.last_yaw_for_viz_camera);
+      }
+      state_.last_yaw_for_viz_camera = yaw;
 
-    updateTasks.emplace_back([visualizer = visualizer_, yawIncr]() {
-      visualizer->update_viewport_camera_azimuth(yawIncr, false /*incremental*/);
+      visualizer_->update_viewport_camera_azimuth(yawIncr, false /*incremental*/);
     });
   }
 
@@ -579,9 +564,8 @@ void LidarOdometry::updateVisualization(
 
       glGroundGrid->insert(glGrid);
     }
-    updateTasks.emplace_back([visualizer = visualizer_, glGroundGrid]() {
-      visualizer->update_3d_object("liodom/groundgrid", glGroundGrid);
-    });
+    updateTasks.emplace_back(
+      [this, glGroundGrid]() { visualizer_->update_3d_object("liodom/groundgrid", glGroundGrid); });
   }
 
   // now, update all visual elements at once:
@@ -594,13 +578,6 @@ void LidarOdometry::updateVisualization(
     const auto s = mrpt::format(
       "t=%.03f *WARNING* No input LiDAR observations received yet!", mrpt::Clock::nowDouble());
     visualizer_->output_console_message(s);
-    gui_.was_waiting_for_lidar_data = true;
-  } else if (gui_.was_waiting_for_lidar_data) {
-    gui_.was_waiting_for_lidar_data = false;
-    const auto s =
-      mrpt::format("t=%.03f LiDAR data started to be received.", mrpt::Clock::nowDouble());
-    visualizer_->output_console_message(s);
-    MRPT_LOG_INFO(s);
   }
 
   // Sub-window with custom UI
@@ -629,11 +606,14 @@ void LidarOdometry::updateVisualization(
 
 void LidarOdometry::updateVisualizationInitVehFrame()
 {
-  // Load the vehicle 3D model(s) exactly once and cache them as read-only
-  // children. The corner is cheap and rebuilt on every update so its color
-  // / size can track runtime parameter changes if ever needed.
-  state_.glVehicleModels.clear();
+  state_.glVehicleFrame = mrpt::opengl::CSetOfObjects::Create();
 
+  if (const auto l = params_.visualization.current_pose_corner_size; l > 0) {
+    auto glCorner = mrpt::opengl::stock_objects::CornerXYZ(l);
+    state_.glVehicleFrame->insert(glCorner);
+  }
+
+  // 3D model:
   if (!params_.visualization.model.empty()) {
     const auto & _ = params_.visualization;
 
@@ -652,11 +632,9 @@ void LidarOdometry::updateVisualizationInitVehFrame()
       m->setScale(static_cast<float>(model.scale));
       m->setPose(model.tf);
 
-      state_.glVehicleModels.push_back(m);
+      state_.glVehicleFrame->insert(m);
     }
   }
-
-  state_.glVehicleModelsLoaded = true;
 }
 
 void LidarOdometry::updateVisualizationCurrentObservation(
@@ -784,17 +762,15 @@ void LidarOdometry::updateVisualizationLocalMap(std::vector<std::function<void()
     // local map:
     auto glMap = state_.local_map->get_visualization(rp);
 
-    updateTasks.emplace_back([visualizer = visualizer_, glMap]() {
-      visualizer->update_3d_object("liodom/localmap", glMap);
-    });
+    updateTasks.emplace_back(
+      [this, glMap]() { visualizer_->update_3d_object("liodom/localmap", glMap); });
   }
 
   // Clear the local map if the user clicks on "hide it" at runtime:
   if (!params_.visualization.show_localmap) {
     auto glMap = mrpt::opengl::CSetOfObjects::Create();
-    updateTasks.emplace_back([visualizer = visualizer_, glMap]() {
-      visualizer->update_3d_object("liodom/localmap", glMap);
-    });
+    updateTasks.emplace_back(
+      [this, glMap]() { visualizer_->update_3d_object("liodom/localmap", glMap); });
   }
 }
 
@@ -807,6 +783,7 @@ void LidarOdometry::updateVisualizationPath(std::vector<std::function<void()>> &
       state_.glEstimatedPath = mrpt::opengl::CSetOfLines::Create();
       const auto & rgba = params_.visualization.trajectory_rgba;
       state_.glEstimatedPath->setColor(rgba.at(0), rgba.at(1), rgba.at(2), rgba.at(3));
+      state_.glPathGrp = mrpt::opengl::CSetOfObjects::Create();
     }
     // Update path viz:
     for (size_t i = state_.glEstimatedPath->size(); i < state_.estimated_trajectory.size(); i++) {
@@ -821,16 +798,11 @@ void LidarOdometry::updateVisualizationPath(std::vector<std::function<void()>> &
         state_.glEstimatedPath->appendLineStrip(t);
       }
     }
-    // Hand a *fresh* wrapper containing a deep clone of the lines to the
-    // GUI thread, so the worker-private glEstimatedPath buffer can keep
-    // growing on subsequent ticks without racing with MolaViz's deep
-    // read on the GUI thread.
-    auto pathGrp = mrpt::opengl::CSetOfObjects::Create();
-    pathGrp->insert(mrpt::opengl::CSetOfLines::Create(*state_.glEstimatedPath));
+    state_.glPathGrp->clear();
+    state_.glPathGrp->insert(mrpt::opengl::CSetOfLines::Create(*state_.glEstimatedPath));
 
-    updateTasks.emplace_back([visualizer = visualizer_, pathGrp]() {
-      visualizer->update_3d_object("liodom/path", pathGrp);
-    });
+    updateTasks.emplace_back(
+      [this]() { visualizer_->update_3d_object("liodom/path", state_.glPathGrp); });
   }
 }
 
@@ -853,12 +825,12 @@ void LidarOdometry::updateVisualizationTextLabels()
       "LiDAR=%6.02f Hz | IMU=%6.02f Hz | GNSS=%5.02f Hz", rate_lidar, rate_imu, rate_gnss));
   }
 
-  if (state_.estimated_observation_radius) {
+  if (state_.estimated_sensor_max_range) {
     gui_.lbSensorRange->set(mrpt::format(
-      "Est. obs. radius: %.02f m (inst: %.02f m)", *state_.estimated_observation_radius,
-      state_.instantaneous_observation_radius ? *state_.instantaneous_observation_radius : .0));
+      "Est. max range: %.02f m (inst: %.02f m)", *state_.estimated_sensor_max_range,
+      state_.instantaneous_sensor_max_range ? *state_.instantaneous_sensor_max_range : .0));
   } else {
-    gui_.lbSensorRange->set("Est. obs. radius: (Not available)");
+    gui_.lbSensorRange->set("Est. max range: (Not available)");
   }
 
   {
@@ -899,12 +871,12 @@ void LidarOdometry::updateVisualizationTextLabels()
       "LiDAR=%6.02f Hz | IMU=%6.02f Hz | GNSS=%5.02f Hz", rate_lidar, rate_imu, rate_gnss));
   }
 
-  if (state_.estimated_observation_radius) {
+  if (state_.estimated_sensor_max_range) {
     gui_.lbSensorRange->setCaption(mrpt::format(
-      "Est. obs. radius: %.02f m (inst: %.02f m)", *state_.estimated_observation_radius,
-      state_.instantaneous_observation_radius ? *state_.instantaneous_observation_radius : .0));
+      "Est. max range: %.02f m (inst: %.02f m)", *state_.estimated_sensor_max_range,
+      state_.instantaneous_sensor_max_range ? *state_.instantaneous_sensor_max_range : .0));
   } else {
-    gui_.lbSensorRange->setCaption("Est. obs. radius: (Not available)");
+    gui_.lbSensorRange->setCaption("Est. max range: (Not available)");
   }
 
   {

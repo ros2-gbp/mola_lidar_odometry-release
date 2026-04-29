@@ -39,8 +39,7 @@ modules:
     execution_rate: ${MOLA_STATE_ESTIMATOR_PUBLISH_RATE|10} # Hz
 
     # This includes here a whole block "params: (...)":
-    # Don't provide a default for the ROS2 system to make sure we are getting the env var from the launch file
-    params: "${MOLA_STATE_ESTIMATOR_YAML|no_default.yaml}"
+    params: "${MOLA_STATE_ESTIMATOR_YAML|../state-estimator-params/state-estimation-simple.yaml}"
 
   # =====================
   # ROS2 <-> MOLA
@@ -125,13 +124,6 @@ modules:
       #  - false: the wall-clock time.
       publish_in_sim_time: ${MOLA_ROS2_PUBLISH_IN_SIM_TIME|true}
 
-      # Future-dating offset [s] for the localization /tf stamp.
-      transform_tolerance: ${MOLA_ROS2_TRANSFORM_TOLERANCE|0.1}
-
-      # Period [s] for re-broadcasting the latest localization /tf
-      # (0 disables). Default 20 Hz.
-      transform_publish_period: ${MOLA_ROS2_TRANSFORM_PUBLISH_PERIOD|0.05}
-
       # Period [s] to publish the updated map to ROS2 from the MOLA SLAM solution:
       # Note that no repeated maps are published. This is just the period for checking the need to republish.
       period_publish_new_map: ${MOLA_ROS2_PUBLISH_MAPS_PERIOD|1.0} # [s]
@@ -148,13 +140,6 @@ modules:
           # If present, this will override whatever /tf tells about the sensor pose:
           fixed_sensor_pose: "${LIDAR_POSE_X|0} ${LIDAR_POSE_Y|0} ${LIDAR_POSE_Z|0} ${LIDAR_POSE_YAW|0} ${LIDAR_POSE_PITCH|0} ${LIDAR_POSE_ROLL|0}" # 'x y z yaw_deg pitch_deg roll_deg''
           use_fixed_sensor_pose: ${MOLA_USE_FIXED_LIDAR_POSE|false}
-          # Subscription QoS. Defaults follow REP-2003 (best-effort, volatile)
-          # with depth=50 to absorb executor stalls. Set reliability=reliable
-          # and a deeper depth when subscribing to a reliable, high-rate
-          # publisher (e.g. some Ouster drivers).
-          qos:
-            reliability: ${MOLA_LIDAR_QOS_RELIABILITY|best_effort}
-            depth: ${MOLA_LIDAR_QOS_DEPTH|50}
 
         # For GPS messages of type 'sensor_msgs/NavSatFix'
         - topic: ${MOLA_GNSS_TOPIC|/gps}
@@ -178,22 +163,7 @@ modules:
           # If present, this will override whatever /tf tells about the sensor pose:
           fixed_sensor_pose: "${IMU_POSE_X|0} ${IMU_POSE_Y|0} ${IMU_POSE_Z|0} ${IMU_POSE_YAW|0} ${IMU_POSE_PITCH|0} ${IMU_POSE_ROLL|0}" # 'x y z yaw_deg pitch_deg roll_deg''
           use_fixed_sensor_pose: ${MOLA_USE_FIXED_IMU_POSE|false}
-          # Subscription QoS. Defaults follow REP-2003 (best-effort, volatile)
-          # with depth=50 to absorb executor stalls. For high-rate IMUs
-          # (e.g. Ouster's 640 Hz) consumed by a heavy SLAM pipeline,
-          # consider reliability=reliable and a deeper depth (e.g. 200-1000)
-          # to avoid silent drops; the publisher must also be reliable.
-          qos:
-            reliability: ${MOLA_IMU_QOS_RELIABILITY|best_effort}
-            depth: ${MOLA_IMU_QOS_DEPTH|50}
 
-        # Optional: direct subscription to a nav_msgs/Odometry topic (e.g., wheel odometry).
-        # Leave MOLA_ODOM_TOPIC empty (default) to disable. Set to e.g. "/wheel_odom" to enable.
-        # Mutually exclusive with `forward_ros_tf_as_mola_odometry_observations` (TF-driven path)
-        # — enabling both feeds duplicate observations to the state estimator.
-        # With `odometry_as_robot_pose_observation=true` (default), this produces a 3D
-        # CObservationRobotPose (6x6 covariance), which is what the Smoother wants for
-        # multi-source fusion.
-        - topic: ${MOLA_ODOM_TOPIC|}
-          msg_type: Odometry
-          output_sensor_label: ${MOLA_ODOM_SENSOR_LABEL|odom_wheels}
+        #- topic: /odom
+        #  msg_type: Odometry
+        #  output_sensor_label: odom
