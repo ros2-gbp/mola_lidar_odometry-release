@@ -31,57 +31,6 @@
 namespace mola
 {
 
-void LidarOdometry::Parameters::Diagnostics::initialize(const Yaml & cfg)
-{
-  YAML_LOAD_OPT(icp_quality_warn, double);
-  YAML_LOAD_OPT(icp_quality_error, double);
-  YAML_LOAD_OPT(input_stale_sec, double);
-  YAML_LOAD_OPT(input_error_sec, double);
-  YAML_LOAD_OPT(dropped_ratio_warn, double);
-  YAML_LOAD_OPT(dropped_ratio_error, double);
-  YAML_LOAD_OPT(timing_utilization_warn, double);
-
-  // Validate thresholds so misconfiguration cannot silently invert severities.
-  ASSERTMSG_(
-    icp_quality_warn >= 0 && icp_quality_error >= 0,
-    mrpt::format(
-      "diagnostics: icp_quality_warn (%.3f) and icp_quality_error (%.3f) must be >= 0",
-      icp_quality_warn, icp_quality_error));
-  ASSERTMSG_(
-    icp_quality_error < icp_quality_warn,
-    mrpt::format(
-      "diagnostics: icp_quality_error (%.3f) must be < icp_quality_warn (%.3f)", icp_quality_error,
-      icp_quality_warn));
-
-  ASSERTMSG_(
-    input_stale_sec >= 0 && input_error_sec >= 0,
-    mrpt::format(
-      "diagnostics: input_stale_sec (%.3f) and input_error_sec (%.3f) must be >= 0",
-      input_stale_sec, input_error_sec));
-  ASSERTMSG_(
-    input_stale_sec < input_error_sec,
-    mrpt::format(
-      "diagnostics: input_stale_sec (%.3f) must be < input_error_sec (%.3f)", input_stale_sec,
-      input_error_sec));
-
-  ASSERTMSG_(
-    dropped_ratio_warn >= 0 && dropped_ratio_warn <= 1 && dropped_ratio_error >= 0 &&
-      dropped_ratio_error <= 1,
-    mrpt::format(
-      "diagnostics: dropped_ratio_warn (%.3f) and dropped_ratio_error (%.3f) must be in [0,1]",
-      dropped_ratio_warn, dropped_ratio_error));
-  ASSERTMSG_(
-    dropped_ratio_warn < dropped_ratio_error,
-    mrpt::format(
-      "diagnostics: dropped_ratio_warn (%.3f) must be < dropped_ratio_error (%.3f)",
-      dropped_ratio_warn, dropped_ratio_error));
-
-  ASSERTMSG_(
-    timing_utilization_warn >= 0 && timing_utilization_warn <= 1,
-    mrpt::format(
-      "diagnostics: timing_utilization_warn (%.3f) must be in [0,1]", timing_utilization_warn));
-}
-
 void LidarOdometry::Parameters::AdaptiveThreshold::initialize(const Yaml & cfg)
 {
   YAML_LOAD_REQ(enabled, bool);
@@ -106,7 +55,6 @@ void LidarOdometry::Parameters::Visualization::initialize(const Yaml & cfg)
 
   YAML_LOAD_OPT(show_current_observation, bool);
   YAML_LOAD_OPT(show_last_deskewed_observations_decay, bool);
-  YAML_LOAD_OPT(show_localmap, bool);
   YAML_LOAD_OPT(observations_decay_seconds, double);
   YAML_LOAD_OPT(observations_initial_alpha, float);
   YAML_LOAD_OPT(current_observation_alpha, float);
@@ -184,11 +132,6 @@ void LidarOdometry::Parameters::SimpleMapOptions::initialize(const Yaml & cfg, P
   YAML_LOAD_OPT(save_final_map_to_file, std::string);
   YAML_LOAD_OPT(add_non_keyframes_too, bool);
   YAML_LOAD_OPT(measure_from_last_kf_only, bool);
-  YAML_LOAD_OPT(min_nearby_poses_occupied, uint32_t);
-  ASSERTMSG_(
-    min_nearby_poses_occupied >= 1, mrpt::format(
-                                      "simplemap.min_nearby_poses_occupied=%u must be >= 1",
-                                      static_cast<unsigned>(min_nearby_poses_occupied)));
   YAML_LOAD_OPT(generate_lazy_load_scan_files, bool);
   YAML_LOAD_OPT(save_gnss_max_age, double);
   YAML_LOAD_OPT(save_deskewed_scans, bool);
@@ -210,11 +153,6 @@ void LidarOdometry::Parameters::MapUpdateOptions::initialize(const Yaml & cfg, P
   DECLARE_PARAMETER_IN_OPT(cfg, check_for_removal_every_n, parent);
   DECLARE_PARAMETER_IN_OPT(cfg, publish_map_updates_every_n, parent);
   YAML_LOAD_OPT(measure_from_last_kf_only, bool);
-  YAML_LOAD_OPT(min_nearby_poses_occupied, uint32_t);
-  ASSERTMSG_(
-    min_nearby_poses_occupied >= 1, mrpt::format(
-                                      "simplemap.min_nearby_poses_occupied=%u must be >= 1",
-                                      static_cast<unsigned>(min_nearby_poses_occupied)));
   YAML_LOAD_OPT(load_existing_local_map, std::string);
   YAML_LOAD_OPT(save_final_local_map, std::string);
 }
@@ -239,9 +177,6 @@ void LidarOdometry::Parameters::InitialLocalizationOptions::initialize(const Yam
   YAML_LOAD_OPT(imu_initial_calibration_sample_count, uint32_t);
   YAML_LOAD_OPT(imu_initial_calibration_max_age, double);
   YAML_LOAD_OPT(use_imu_orientation, bool);
-  YAML_LOAD_OPT(from_state_estimator_max_position_sigma, double);
-  YAML_LOAD_OPT(from_state_estimator_max_orientation_sigma_deg, double);
-  YAML_LOAD_OPT(from_state_estimator_timeout, double);
 
   if (cfg.has("fixed_initial_pose")) {
     ASSERT_(
@@ -299,7 +234,7 @@ void LidarOdometry::onParameterUpdate(const mrpt::containers::yaml & names_value
   params_.simplemap.generate =
     names_values.getOrDefault("generate_simplemap", params_.simplemap.generate);
 
-  // Special triggering reset "variable":
+  // Special triggering reset "variabe":
   if (names_values.getOrDefault("reset_state", false)) {
     this->enqueue_request([this]() {
       MRPT_LOG_INFO("Received a reset() command via parameters update.");
