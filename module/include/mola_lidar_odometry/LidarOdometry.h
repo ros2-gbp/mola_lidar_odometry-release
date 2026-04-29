@@ -22,6 +22,10 @@
 
 // MOLA interfaces:
 #include <mola_kernel/id.h>  // INVALID_ID
+#if __has_include(<mola_kernel/interfaces/DiagnosticsProvider.h>)
+#include <mola_kernel/interfaces/DiagnosticsProvider.h>
+#define MOLA_HAS_DIAGNOSTICS_PROVIDER 1
+#endif
 #include <mola_kernel/interfaces/FrontEndBase.h>
 #include <mola_kernel/interfaces/LocalizationSourceBase.h>
 #include <mola_kernel/interfaces/MapServer.h>
@@ -96,6 +100,10 @@ class LidarOdometry : public mola::FrontEndBase,
                       public mola::MapSourceBase,
                       public mola::MapServer,
                       public mola::Relocalization
+#if MOLA_HAS_DIAGNOSTICS_PROVIDER
+,
+                      public mola::DiagnosticsProvider
+#endif
 {
   DEFINE_MRPT_OBJECT(LidarOdometry, mola)
 
@@ -150,8 +158,11 @@ public:
          */
     double min_time_between_scans = 0.05;
 
-    double max_sensor_range_filter_coefficient = 0.999;
-    double absolute_minimum_sensor_range = 5.0;  // [m]
+    // Low-pass filter alpha for the EMA of ESTIMATED_OBSERVATION_RADIUS, and
+    // the absolute floor for that estimate. Both used to be named *_sensor_*
+    // before the observation-radius rename; the old YAML keys still parse.
+    double observation_radius_filter_coefficient = 0.999;
+    double absolute_minimum_observation_radius = 5.0;  // [m]
 
     /** If enabled (slower), vehicle twist will be optimized during ICP
          *  enabling better and more robust odometry in high dynamics motion.
@@ -211,6 +222,14 @@ public:
              * how often to do the distant keyframes clean up.
              */
       uint32_t check_for_removal_every_n = 100;
+
+      /** Minimum number of stored poses within the threshold distance
+             *  before a volume is considered "occupied" and no new keyframe
+             *  is inserted there. Default=1 gives the classic behavior.
+             *  Increase to 2+ for non-repetitive-scan lidars (e.g. Livox)
+             *  so multiple scans are taken from each location.
+             */
+      uint32_t min_nearby_poses_occupied = 1;
 
       /** Publish updated map via mola::MapSourceBase once every N frames
              */
@@ -317,6 +336,29 @@ public:
     };
     AdaptiveThreshold adaptive_threshold;
 
+    /** Thresholds for REP-107 diagnostics levels. */
+    struct Diagnostics
+    {
+      double icp_quality_warn = 0.30;
+      double icp_quality_error = 0.10;
+
+      /// Input considered stale if no observation received for this many seconds
+      double input_stale_sec = 3.0;
+
+      /// Fatal-level staleness (no data for this many seconds)
+      double input_error_sec = 5.0;
+
+      /// Warn when dropped-frames ratio exceeds this value
+      double dropped_ratio_warn = 0.20;
+      double dropped_ratio_error = 0.50;
+
+      /// Warn when average process time exceeds this fraction of sensor period
+      double timing_utilization_warn = 0.80;
+
+      void initialize(const Yaml & c);
+    };
+    Diagnostics diagnostics;
+
     /** ICP parameters for the case of having, or not, a good velocity
          * model that works a good prior. Each entry in the vector is an
          * "ICP stage", to be run as a sequence of coarser to finer detail
@@ -382,6 +424,13 @@ public:
       /** If enabled, saved keyframes will contain an additional 'deskewed' observation with the motion-compensated cloud. */
       bool save_deskewed_scans = false;
 
+      /** Minimum number of stored poses within the threshold distance
+             *  before a volume is considered "occupied" and no new keyframe
+             *  is inserted there. Default=1 gives the classic behavior.
+             *  Increase to 2+ for non-repetitive-scan lidars (e.g. Livox).
+             */
+      uint32_t min_nearby_poses_occupied = 1;
+
       void initialize(const Yaml & c, Parameters & parent);
     };
 
@@ -435,6 +484,18 @@ public:
 
       /// If provided by the IMU, prefer gravity-aligned orientation from the sensor instead of accelerometer data.
       bool use_imu_orientation = true;
+
+      /// Maximum position sigma (m) to accept state estimator as converged
+      /// Used when method == FromStateEstimator
+      double from_state_estimator_max_position_sigma = 0.5;  // [m]
+
+      /// Maximum orientation sigma (deg) to accept state estimator as converged
+      /// Used when method == FromStateEstimator
+      double from_state_estimator_max_orientation_sigma_deg = 3.0;  // [deg]
+
+      /// Timeout (seconds) waiting for state estimator to converge
+      /// If <=0, wait indefinitely
+      double from_state_estimator_timeout = 60.0;  // [s]
 
       void initialize(const Yaml & c);
     };
@@ -542,11 +603,18 @@ public:
   /** Re-localize near this pose, including uncertainty.
      *  \param[in] pose The pose, in the local map frame.
      *  There is no return value from this method.
+     *
+     *  Thread-safe: may be called from any thread. The actual work is
+     *  dispatched asynchronously to the internal lidar worker thread via
+     *  enqueue_request(), so this call does not block on state_mtx_ and
+     *  cannot be involved in any deadlock with the main processing loop.
      */
   void relocalize_near_pose_pdf(const mrpt::poses::CPose3DPDFGaussian & p) override;
 
   /** Re-localize with the next incoming GNSS message.
      *  There is no return value from this method.
+     *
+     *  Thread-safe and non-blocking; see relocalize_near_pose_pdf() for details.
      */
   void relocalize_from_gnss() override;
 
@@ -561,6 +629,11 @@ public:
      *
      *  \param[in] path File name(s) prefix for the map to load. Do not add file
      * extension.
+     *
+     *  Thread-safe: the load work is dispatched to the internal lidar worker
+     *  thread via enqueue_request() and this call blocks on an std::future
+     *  until the work completes. The caller holds no internal mutex while
+     *  waiting, so it cannot contribute to deadlock with the processing loop.
      */
   MapServer::ReturnStatus map_load(const std::string & path) override;
 
@@ -570,6 +643,8 @@ public:
      *
      *  \param[in] path File name(s) prefix for the map to save. Do not add file
      * extension.
+     *
+     *  Thread-safe; see map_load() for details on the async dispatch.
      */
   MapServer::ReturnStatus map_save(const std::string & path) override;
 
@@ -672,6 +747,16 @@ private:
     std::optional<mrpt::Clock::time_point> first_ever_timestamp;
     std::optional<mrpt::Clock::time_point> last_obs_timestamp;
     std::optional<mrpt::Clock::time_point> last_icp_timestamp;
+    /// Wall-clock time when the last observation was received (used for
+    /// staleness checks, avoids relying on sensor hardware clocks).
+    std::optional<mrpt::Clock::time_point> last_obs_reception_time;
+    double last_observed_scan_period_sec = 0.0;  //!< seconds between last two processed scans
+
+    /// Timestamp when we started waiting for state estimator convergence
+    std::optional<mrpt::Clock::time_point> waiting_for_state_estimator_since;
+
+    /// Received georeferencing from external state estimator
+    std::optional<mola::Georeferencing> external_georef;
 
     /// Cache for multiple LIDAR synchronization:
     std::map<std::string /*label*/, mrpt::obs::CObservation::ConstPtr> sync_obs;
@@ -687,9 +772,10 @@ private:
     // KISS-ICP-like adaptive threshold method:
     double adapt_thres_sigma = 0;  // 0: initial
 
-    // Automatic estimation of max range:
-    std::optional<double> estimated_sensor_max_range;
-    std::optional<double> instantaneous_sensor_max_range;
+    // Automatic estimation of the observation bounding-radius (measured from
+    // base_link, not from the sensor — see ESTIMATED_OBSERVATION_RADIUS docs):
+    std::optional<double> estimated_observation_radius;
+    std::optional<double> instantaneous_observation_radius;
 
     mp2p_icp_filters::GeneratorSet obs_generators;
     mp2p_icp_filters::FilterPipeline pc_filterAdjustTimes;
@@ -746,7 +832,16 @@ private:
     std::map<mrpt::Clock::time_point, std::shared_ptr<const mrpt::obs::CObservationGPS>> last_gnss_;
 
     // Visualization:
-    mrpt::opengl::CSetOfObjects::Ptr glVehicleFrame, glPathGrp;
+    // Cache only the *expensive*, read-only-after-load vehicle model
+    // children (typically CAssimpModel). Each update builds a fresh
+    // CSetOfObjects around them and hands it to MolaViz, so we never
+    // share a long-lived, mutable object pointer with the GUI thread.
+    // glVehicleCachedBuilt tracks whether loading has already happened.
+    std::vector<mrpt::opengl::CRenderizable::Ptr> glVehicleModels;
+    bool glVehicleModelsLoaded = false;
+    // Worker-private growing buffer for the estimated path. Never handed
+    // to the GUI thread directly: each update clones it into a fresh
+    // CSetOfObjects wrapper before dispatch.
     mrpt::opengl::CSetOfLines::Ptr glEstimatedPath;
     int mapUpdateCnt = std::numeric_limits<int>::max();
 
@@ -807,6 +902,7 @@ private:
     StateUI() = default;
 
     double timestampLastUpdateUI = 0;
+    bool was_waiting_for_lidar_data = true;
 
 #if MOLA_VERSION_CHECK(2, 6, 0)
     bool gui_created = false;
@@ -846,9 +942,21 @@ private:
   mutable std::recursive_mutex state_simplemap_mtx_;
   mutable std::mutex state_gui_mtx_;
 
-  /// The list of pending tasks from enqueue_request():
+  /// The list of pending tasks from enqueue_request().
+  /// Protected exclusively by requests_mtx_. Must never be accessed while
+  /// holding state_mtx_ to avoid lock-order inversions.
   std::vector<std::function<void()>> requests_;
   std::mutex requests_mtx_;
+
+  // --- Synchronous bodies for the public async API entry points. ---
+  // These run on the internal lidar worker thread (or spin thread) after
+  // being enqueued. They take whatever state_/simplemap_/... locks they need
+  // themselves, so their *callers* (ROS service threads, GUI threads)
+  // never touch these mutexes directly.
+  void relocalize_near_pose_pdf_impl(const mrpt::poses::CPose3DPDFGaussian & p);
+  void relocalize_from_gnss_impl();
+  MapServer::ReturnStatus map_load_impl(const std::string & path);
+  MapServer::ReturnStatus map_save_impl(const std::string & path);
 
   /// Must be called from a scope with state_flags_mtx_ already acquired!
   void addDropStats(bool frame_is_dropped);
@@ -871,8 +979,8 @@ private:
   // KISS-ICP adaptive threshold method:
   void doUpdateAdaptiveThreshold(const mrpt::poses::CPose3D & lastMotionModelError);
 
-  void doInitializeEstimatedMaxSensorRange(const mrpt::obs::CObservation & o);
-  void doUpdateEstimatedMaxSensorRange(const mp2p_icp::metric_map_t & m);
+  void doInitializeEstimatedObservationRadius(const mrpt::obs::CObservation & o);
+  void doUpdateEstimatedObservationRadius(const mp2p_icp::metric_map_t & m);
 
   /// Returns false if the scan/observation is not valid:
   bool doCheckIsValidObservation(const mp2p_icp::metric_map_t & m);
@@ -901,13 +1009,16 @@ private:
 
   void doRemoveCloudsWithDecay();
 
-  void doPublishUpdatedLocalization(const mrpt::Clock::time_point & this_obs_tim);
+  void onExternalMapUpdate(const MapSourceBase::MapUpdate & mu);
+  void onExternalLocalizationUpdate(const LocalizationSourceBase::LocalizationUpdate & lu);
 
-  void doPublishUpdatedLocalMap(const mrpt::Clock::time_point & this_obs_tim);
+  void doPublishUpdatedLocalization(const mrpt::Clock::time_point & scan_ref_time);
 
-  void doPublishDeskewedScan(const mrpt::Clock::time_point & this_obs_tim);
+  void doPublishUpdatedLocalMap(const mrpt::Clock::time_point & scan_ref_time);
 
-  void doWriteDebugTracesFile(const mrpt::Clock::time_point & this_obs_tim);
+  void doPublishDeskewedScan(const mrpt::Clock::time_point & scan_ref_time);
+
+  void doWriteDebugTracesFile(const mrpt::Clock::time_point & scan_ref_time);
   std::optional<std::ofstream> debug_traces_of_;
 
   void unloadPastSimplemapObservations(size_t maxSizeUnloadQueue) const;
@@ -915,7 +1026,15 @@ private:
   void handleUnloadSinglePastObservation(CObservation::Ptr & o) const;
 
   void onPublishDiagnostics();
+
+#if MOLA_HAS_DIAGNOSTICS_PROVIDER
+  /// REP-107 structured diagnostics, collected by BridgeROS2 at ~1 Hz.
+  void getDiagnostics(std::vector<mola::DiagnosticStatusMsg> & status) override;
+#endif
   void handleInitialLocalization();
+  void handleInitialLocalizationStateEstimation();
+  void handleInitialLocalizationDoInitFromPose(
+    const mrpt::poses::CPose3DPDFGaussian & initPose, bool resetStateEstimator);
 
   bool isPipelineUsingIMU() const;
   void sendLidarScanToProcessQueue(const CObservation::ConstPtr & o);
@@ -926,7 +1045,7 @@ private:
 
   void doUpdateSimpleMap(
     const mrpt::obs::CSensoryFrame & sf, bool distance_enough_sm,
-    const mp2p_icp::metric_map_t::Ptr & observation, const mrpt::Clock::time_point & this_obs_tim,
+    const mp2p_icp::metric_map_t::Ptr & observation, const mrpt::Clock::time_point & scan_ref_time,
     const mrpt::maps::CPointsMap::Ptr & deskewedCloud);
 };
 
