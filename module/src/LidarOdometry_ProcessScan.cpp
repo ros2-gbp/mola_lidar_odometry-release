@@ -130,6 +130,13 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
     return;  // not all required LiDARs yet.
   }
 
+  // Cache sensor poses (in vehicle frame) for GUI visualization:
+  for (const auto & o : sf) {
+    mrpt::poses::CPose3D sp;
+    o->getSensorPose(sp);
+    state_.last_lidar_sensor_poses[o->sensorLabel] = sp;
+  }
+
   // Refresh dyn. variables used in the mp2p_icp pipelines:
   updatePipelineDynamicVariables(this_obs_tim);
 
@@ -580,9 +587,10 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
     state_.parameter_source.updateVariable("icp_quality", state_.last_icp_quality);
 
     // KISS-ICP adaptive threshold method:
-    if (params_.adaptive_threshold.enabled) {
-      // Run this even if "!icpIsGood":
-
+    // Only update on good ICP: a bad ICP may have converged to a local minimum
+    // near the initial guess, yielding an artificially small motion model error
+    // that would incorrectly shrink the search threshold.
+    if (params_.adaptive_threshold.enabled && icpIsGood) {
       const mrpt::poses::CPose3D motionModelError =
         out.found_pose_to_wrt_from.mean - mrpt::poses::CPose3D(in.init_guess_local_wrt_global);
 
@@ -592,6 +600,45 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
         "Adaptive threshold: sigma=" << state_.adapt_thres_sigma
                                      << " motionModelError=" << motionModelError.asString());
     }  // end adaptive threshold
+
+    // Sustained-failure recovery for the adaptive threshold (opt-in).
+    // The KISS-ICP rule above never updates sigma on a bad ICP, which is correct
+    // for isolated failures but creates a deadlock under sustained failure: with
+    // sigma frozen small, the matcher window stays tight and ICP cannot find
+    // enough correspondences to recover. When enabled, after a streak of bad
+    // ICPs we grow sigma multiplicatively (capped at maximum_sigma) to enlarge
+    // the correspondence search radius for the next attempt.
+    if (icpIsGood) {
+      state_.consecutive_bad_icps = 0;
+    } else {
+      state_.consecutive_bad_icps++;
+
+      if (
+        params_.adaptive_threshold.enabled &&
+        params_.adaptive_threshold.recover_on_sustained_failure &&
+        state_.consecutive_bad_icps >= params_.adaptive_threshold.recover_after_n_bad) {
+        if (state_.adapt_thres_sigma == 0) {
+          state_.adapt_thres_sigma = params_.adaptive_threshold.initial_sigma;
+        }
+        const double new_sigma = std::min(
+          state_.adapt_thres_sigma * params_.adaptive_threshold.recover_growth_factor,
+          params_.adaptive_threshold.maximum_sigma);
+        if (new_sigma > state_.adapt_thres_sigma) {
+          MRPT_LOG_THROTTLE_WARN_FMT(
+            2.0,
+            "Sustained ICP failure (n=%d, q=%.2f): widening adaptive threshold "
+            "sigma %.3f -> %.3f m to recover correspondences",
+            state_.consecutive_bad_icps, state_.last_icp_quality, state_.adapt_thres_sigma,
+            new_sigma);
+          state_.adapt_thres_sigma = new_sigma;
+          // Reset counter so the KISS-ICP EMA has N bad frames of breathing
+          // room before the next growth event; without this, every subsequent
+          // bad ICP would immediately re-trigger recovery and sigma would lock
+          // at maximum_sigma indefinitely.
+          state_.consecutive_bad_icps = 0;
+        }
+      }
+    }
 
     // Create distance checker on first usage:
     if (!state_.distance_checker_local_map) {
@@ -713,10 +760,13 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
 
   }  // end: yes, we can do ICP
 
-  // If this was a bad ICP, and we just started with an empty map, re-start again:
+  // If this was a bad ICP, and we just started with an empty map, re-start again.
+  // Do NOT restart if a starting map was loaded: that would wipe the loaded map.
   if (
     !state_.last_icp_was_good && state_.estimated_trajectory.size() == 1 &&
-    params_.local_map_updates.enabled) {
+    params_.local_map_updates.enabled &&
+    params_.local_map_updates.load_existing_local_map.empty() &&
+    params_.simplemap.load_existing_simple_map.empty()) {
     // Re-start the local map:
     state_.local_map->clear();
     state_.estimated_trajectory.clear();
@@ -823,10 +873,17 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
   doWriteDebugTracesFile(scan_ref_time);
 
   // Optional real-time GUI via MOLA VizInterface:
-  if (visualizer_ && state_.local_map && state_.last_icp_was_good) {
+  if (visualizer_ && state_.local_map) {
     const ProfilerEntry tle(profiler_, "onLidar.6.updateVisualization");
 
-    updateVisualization(observationRawForViz, fullCloudForVizAndPublish);
+    if (state_.last_icp_was_good) {
+      updateVisualization(observationRawForViz, fullCloudForVizAndPublish);
+    } else {
+      // On bad ICP: still update the local map display, GUI panel, and text
+      // labels. Skipping the full updateVisualization() avoids 3D pose/path
+      // updates that would be based on an unreliable ICP result.
+      updateVisualizationAlways();
+    }
   }
 }
 
