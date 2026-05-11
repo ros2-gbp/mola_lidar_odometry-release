@@ -29,8 +29,8 @@ params:
   min_time_between_scans: 1e-3 # [seconds]
 
   # Parameters for max sensor range automatic estimation:
-  max_sensor_range_filter_coefficient: 0.95
-  absolute_minimum_sensor_range: ${MOLA_ABS_MIN_SENSOR_RANGE|5.0}
+  observation_radius_filter_coefficient: 0.95
+  absolute_minimum_observation_radius: ${MOLA_ABS_MIN_SENSOR_RANGE|5.0}
 
   # If enabled, vehicle twist will be optimized during ICP
   # enabling better and more robust odometry in high dynamics motion.
@@ -51,12 +51,13 @@ params:
     load_existing_local_map: ${MOLA_LOAD_MM|""}
 
     # Idea: don't integrate scans with a high rotational speed since they are probably not correctly deskewed:
-    min_translation_between_keyframes: "${MOLA_MIN_XYZ_BETWEEN_MAP_UPDATES|(0.1e-2 + sqrt(wx^2+wy^2+wz^2)*0.1)*ESTIMATED_SENSOR_MAX_RANGE}" # [m]
+    min_translation_between_keyframes: "${MOLA_MIN_XYZ_BETWEEN_MAP_UPDATES|(0.1e-2 + sqrt(wx^2+wy^2+wz^2)*0.1)*ESTIMATED_OBSERVATION_RADIUS}" # [m]
     min_rotation_between_keyframes: "${MOLA_MIN_ROT_BETWEEN_MAP_UPDATES|(15 + sqrt(wx^2+wy^2+wz^2)*500 )}" # [deg]
 
     # Should match the "remove farther than" option of the local metric map. "0" means deletion of distant key-frames is disabled
-    max_distance_to_keep_keyframes: "${MOLA_LOCAL_MAP_MAX_SIZE|max(100.0, 1.50*ESTIMATED_SENSOR_MAX_RANGE)}" # [m]
+    max_distance_to_keep_keyframes: "${MOLA_LOCAL_MAP_MAX_SIZE|max(100.0, 1.50*ESTIMATED_OBSERVATION_RADIUS)}" # [m]
     check_for_removal_every_n: 100
+    min_nearby_poses_occupied: ${MOLA_MIN_NEARBY_POSES_OCCUPIED|1}
 
   # Minimum ICP quality to insert it into the map:
   min_icp_goodness: ${MOLA_MINIMUM_ICP_QUALITY|0.25}
@@ -69,6 +70,13 @@ params:
     maximum_sigma: ${MOLA_SIGMA_MAX|0.5} # [m]
     kp: 2.0
     alpha: ${MOLA_ADAPT_THRESHOLD_ALPHA|0.90}
+    # Optional sustained-failure recovery: if enabled, sigma is grown
+    # multiplicatively after a streak of bad ICPs, capped at maximum_sigma,
+    # so the matcher window can re-open and ICP can recover. With the flag
+    # off (default) behavior is unchanged.
+    recover_on_sustained_failure: ${MOLA_ADAPT_THRESHOLD_RECOVER|false}
+    recover_after_n_bad: ${MOLA_ADAPT_THRESHOLD_RECOVER_AFTER_N_BAD|5}
+    recover_growth_factor: ${MOLA_ADAPT_THRESHOLD_RECOVER_GROWTH_FACTOR|1.5}
 
   # If enabled, a map will be stored in RAM and (if using the CLI) stored
   # to a ".simplemap" file for later use for localization, etc.
@@ -78,11 +86,12 @@ params:
 
     save_final_map_to_file: ${MOLA_SIMPLEMAP_OUTPUT|'final_map.simplemap'}
 
-    min_translation_between_keyframes: ${MOLA_SIMPLEMAP_MIN_XYZ|(1.0e-2 + sqrt(wx^2+wy^2+wz^2)*1.0)*ESTIMATED_SENSOR_MAX_RANGE} # m
+    min_translation_between_keyframes: ${MOLA_SIMPLEMAP_MIN_XYZ|(1.0e-2 + sqrt(wx^2+wy^2+wz^2)*1.0)*ESTIMATED_OBSERVATION_RADIUS} # m
     min_rotation_between_keyframes: ${MOLA_SIMPLEMAP_MIN_ROT|15 + sqrt(wx^2+wy^2+wz^2)*500} # deg
 
     generate_lazy_load_scan_files: ${MOLA_SIMPLEMAP_GENERATE_LAZY_LOAD|false} # If enabled, a directory will be create alongside the .simplemap and pointclouds will be externally serialized there.
     add_non_keyframes_too: ${MOLA_SIMPLEMAP_ALSO_NON_KEYFRAMES|false} # If enabled, all frames are stored in the simplemap, but non-keyframes will be without associated observations.
+    min_nearby_poses_occupied: ${MOLA_SIMPLEMAP_MIN_NEARBY_POSES|1}
     save_gnss_max_age: 1.0 # [s] max age of GNSS observations to keep in the keyframe
 
   # Save the final trajectory in TUM format. Disabled by default.
@@ -99,6 +108,7 @@ params:
     show_ground_grid: true
     ground_grid_spacing: 5.0 # [m]
     #current_pose_corner_size: 1.5
+    #sensor_poses_corner_size: 0.5  # XYZ corner for each LiDAR sensor pose; 0 to disable
     local_map_point_size: 3
     model:
       - file: ${MOLA_VEHICLE_MODEL_FILE|""} # Default: none
@@ -133,15 +143,9 @@ params:
 # re-localization method to use at start up:
 initial_localization:
   method: "InitLocalization::FixedPose"
+  # Format: x(m) y(m) z(m) yaw(deg) pitch(deg) roll(deg)
   fixed_initial_pose:
-    [
-      "${MOLA_INITIAL_X|0.0}",
-      "${MOLA_INITIAL_Y|0.0}",
-      "${MOLA_INITIAL_Z|0.0}",
-      "${MOLA_INITIAL_YAW|0.0}",
-      "${MOLA_INITIAL_PITCH|0.0}",
-      "${MOLA_INITIAL_ROLL|0.0}",
-    ]
+    ["${MOLA_INITIAL_X|0.0}", "${MOLA_INITIAL_Y|0.0}", "${MOLA_INITIAL_Z|0.0}", "${MOLA_INITIAL_YAW|0.0}", "${MOLA_INITIAL_PITCH|0.0}", "${MOLA_INITIAL_ROLL|0.0}"]
 
 # If "icp_settings_without_vel" is not defined here, defaults to be the same than 'icp_settings_with_vel'
 # ICP settings can be included from an external YAML file if desired, or defined
@@ -227,12 +231,12 @@ localmap_generator:
         plugin: "libmola_metric_maps.so" # Import additional custom user-defined map classes (search in LD_LIBRARY_PATH)
         creationOpts:
           #voxel_size: '${MOLA_LOCAL_VOXELMAP_RESOLUTION|2.0}' # [m]
-          voxel_size: "${MOLA_LOCAL_VOXELMAP_RESOLUTION|$f{max(0.5, min(2.5, 0.75*ESTIMATED_SENSOR_MAX_RANGE))}}" # [m]
+          voxel_size: "${MOLA_LOCAL_VOXELMAP_RESOLUTION|$f{max(0.5, min(2.5, 0.75*ESTIMATED_OBSERVATION_RADIUS))}}" # [m]
         insertOpts:
           max_points_per_voxel: ${MOLA_LOCALMAP_MAX_POINTS_PER_VOXEL|0}
           min_distance_between_points: "$f{${MOLA_LOCAL_VOXELMAP_RESOLUTION|2.0}*0.1}" # [m]
           # if !=0, remove voxels farther (L1) than the current observation insert point
-          remove_voxels_farther_than: "${MOLA_LOCAL_MAP_MAX_SIZE|$f{max(100.0, 1.50*ESTIMATED_SENSOR_MAX_RANGE)}}" # [m]
+          remove_voxels_farther_than: "${MOLA_LOCAL_MAP_MAX_SIZE|$f{max(100.0, 1.50*ESTIMATED_OBSERVATION_RADIUS)}}" # [m]
           # Max ratio between eigenvalues for considering an NDT a plane:
           max_eigen_ratio_for_planes: 0.05
         likelihoodOpts:
@@ -291,7 +295,7 @@ observations_filter_1st_pass:
     params:
       input_pointcloud_layer: "raw"
       output_pointcloud_layer: "decimated_for_map_raw"
-      voxel_filter_resolution: max(0.10, 0.10*1e-2*ESTIMATED_SENSOR_MAX_RANGE) # [m]
+      voxel_filter_resolution: max(0.10, 0.10*1e-2*ESTIMATED_OBSERVATION_RADIUS) # [m]
       minimum_input_points_to_filter: 2000 # don't decimate if smaller than this size
       decimate_method: DecimateMethod::FirstPoint
       #decimate_method: DecimateMethod::ClosestToAverage
@@ -303,32 +307,22 @@ observations_filter_1st_pass:
     params:
       input_pointcloud_layer: "decimated_for_map_raw"
       output_layer_between: "decimated_for_map_by_range"
-      range_min: "${MOLA_MINIMUM_RANGE_FILTER|max(1.0, 0.03*ESTIMATED_SENSOR_MAX_RANGE)}"
-      range_max: 1.2*ESTIMATED_SENSOR_MAX_RANGE
+      range_min: "${MOLA_MINIMUM_RANGE_FILTER|max(1.0, 0.03*ESTIMATED_OBSERVATION_RADIUS)}"
+      range_max: 1.2*ESTIMATED_OBSERVATION_RADIUS
 
   # Remove close ceilings (problematic in most cases!)
   - class_name: mp2p_icp_filters::FilterBoundingBox
     params:
       input_pointcloud_layer: "decimated_for_map_by_range"
       outside_pointcloud_layer: "decimated_for_map_skewed"
-      bounding_box_min:
-        [
-          -0.20*INSTANTANEOUS_SENSOR_MAX_RANGE,
-          -0.20*INSTANTANEOUS_SENSOR_MAX_RANGE,
-          0.01*INSTANTANEOUS_SENSOR_MAX_RANGE,
-        ]
-      bounding_box_max:
-        [
-          0.20*INSTANTANEOUS_SENSOR_MAX_RANGE,
-          0.20*INSTANTANEOUS_SENSOR_MAX_RANGE,
-          0.10*INSTANTANEOUS_SENSOR_MAX_RANGE,
-        ]
+      bounding_box_min: [-0.20*INSTANTANEOUS_OBSERVATION_RADIUS, -0.20*INSTANTANEOUS_OBSERVATION_RADIUS, 0.01*INSTANTANEOUS_OBSERVATION_RADIUS]
+      bounding_box_max: [0.20*INSTANTANEOUS_OBSERVATION_RADIUS, 0.20*INSTANTANEOUS_OBSERVATION_RADIUS, 0.10*INSTANTANEOUS_OBSERVATION_RADIUS]
 
   - class_name: mp2p_icp_filters::FilterDecimateVoxels
     params:
       input_pointcloud_layer: "decimated_for_map_skewed"
       output_pointcloud_layer: "decimated_for_icp_skewed"
-      voxel_filter_resolution: max(0.60, 0.20*1e-2*ESTIMATED_SENSOR_MAX_RANGE) # [m]
+      voxel_filter_resolution: max(0.60, 0.20*1e-2*ESTIMATED_OBSERVATION_RADIUS) # [m]
       minimum_input_points_to_filter: 2000 # don't decimate if smaller than this size
       decimate_method: DecimateMethod::FirstPoint
       #decimate_method: DecimateMethod::ClosestToAverage
@@ -369,14 +363,7 @@ observations_filter_final_pass:
   # Remove layers to save memory and log file storage
   - class_name: mp2p_icp_filters::FilterDeleteLayer
     params:
-      pointcloud_layer_to_remove:
-        [
-          "raw",
-          "decimated_for_map_skewed",
-          "decimated_for_icp_skewed",
-          "decimated_for_map_by_range",
-          "decimated_for_map_raw",
-        ]
+      pointcloud_layer_to_remove: ["raw", "decimated_for_map_skewed", "decimated_for_icp_skewed", "decimated_for_map_by_range", "decimated_for_map_raw"]
 
 # To populate the local map, one or more observation layers are merged
 # into the local map via this pipeline:
@@ -386,5 +373,4 @@ insert_observation_into_local_map:
       input_pointcloud_layer: "decimated_for_map"
       target_layer: "localmap"
       input_layer_in_local_coordinates: true
-      robot_pose:
-        [robot_x, robot_y, robot_z, robot_yaw, robot_pitch, robot_roll]
+      robot_pose: [robot_x, robot_y, robot_z, robot_yaw, robot_pitch, robot_roll]
