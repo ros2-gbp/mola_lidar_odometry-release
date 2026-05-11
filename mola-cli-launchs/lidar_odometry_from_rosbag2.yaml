@@ -9,7 +9,7 @@ modules:
   # MolaViz
   # =====================
   - name: viz
-    type: mola::MolaViz
+    type: ${MOLA_GUI_MODULE|mola::MolaViz} # Options: mola::MolaViz | mola::MolaVizImGui
     verbosity_level: "${MOLA_VERBOSITY_MOLA_VIZ|INFO}"
     params: ~ # none
 
@@ -40,6 +40,7 @@ modules:
   # =========================
   - type: mola::Rosbag2Dataset
     name: dataset_input
+    verbosity_level: "${MOLA_VERBOSITY_ROSBAG2|INFO}"
     export_to_rawlog: ${MOLA_ROS2BAG_EXPORT_TO_RAWLOG_FILE|''}
 
     # In Rosbag2Dataset, this execution rate (Hz) determines the
@@ -56,7 +57,6 @@ modules:
       - raw_sensor_label: "${MOLA_LIDAR_NAME|lidar}"
         decimation: 1
         win_pos: 5 5 400 400
-
       #- raw_sensor_label: '/ouster/range_image'
       #  decimation: 1
       #  win_pos: 5 420 400 400
@@ -68,6 +68,11 @@ modules:
       start_paused: ${MOLA_DATASET_START_PAUSED|false}
 
       base_link_frame_id: "${MOLA_TF_BASE_LINK|base_link}"
+
+      # /tf topic names in the bag. Override for namespaced bags,
+      # e.g. MOLA_TF_TOPIC=/robot1/tf MOLA_TF_STATIC_TOPIC=/robot1/tf_static
+      tf_topic: "${MOLA_TF_TOPIC|/tf}"
+      tf_static_topic: "${MOLA_TF_STATIC_TOPIC|/tf_static}"
 
       # 'sensors' contains maps from output "sensorLabel"s, to the
       # configuration of that data source (mainly, 'type', 'topic'):
@@ -99,9 +104,7 @@ modules:
           fixed_sensor_pose: "${IMU_POSE_X|0} ${IMU_POSE_Y|0} ${IMU_POSE_Z|0} ${IMU_POSE_YAW|0} ${IMU_POSE_PITCH|0} ${IMU_POSE_ROLL|0}" # 'x y z yaw_deg pitch_deg roll_deg''
           use_fixed_sensor_pose: ${MOLA_USE_FIXED_IMU_POSE|false}
 
-        #- topic: /ouster/range_image
-        #  type: CObservationImage
-        #  fixed_sensor_pose: "0 0 0 0 0 0"  # 'x y z yaw_deg pitch_deg roll_deg'
-
-        #- topic: ${MOLA_ODOMETRY_TOPIC|'/odom'}
-        #  type: CObservationOdometry
+        # 2D wheel odometry (disabled by default)
+        - topic: ${MOLA_ODOMETRY_TOPIC|''}
+          sensorLabel: ${MOLA_ODOM_SENSOR_LABEL|odom_wheels}
+          type: CObservationOdometry
