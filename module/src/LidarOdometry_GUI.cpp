@@ -26,11 +26,14 @@
 #include <mola_kernel/version.h>
 
 // MRPT:
+MRPT_TODO("Remove legacy GUI code path once mrpt_kernel>=2.6.0 is stable in all distros");
+
 #if !MOLA_VERSION_CHECK(2, 6, 0)
 #include <mrpt/gui/CDisplayWindowGUI.h>
 #endif
 #include <mrpt/maps/CGenericPointsMap.h>
 #include <mrpt/obs/customizable_obs_viz.h>
+#include <mrpt/opengl/CArrow.h>
 #include <mrpt/opengl/CAssimpModel.h>
 #include <mrpt/opengl/CGridPlaneXY.h>
 #include <mrpt/opengl/COpenGLScene.h>
@@ -207,6 +210,21 @@ void LidarOdometry::internalBuildGUI()
       "Show log messages", params_.visualization.show_console_messages, [this](bool checked) {
         this->enqueue_request(
           [this, checked]() { params_.visualization.show_console_messages = checked; });
+      }});
+
+    tab.widgets.emplace_back(CheckBox{
+      "Show gravity-alignment vector", params_.visualization.show_gravity_align_vector,
+      [this](bool checked) {
+        this->enqueue_request(
+          [this, checked]() { params_.visualization.show_gravity_align_vector = checked; });
+      }});
+
+    tab.widgets.emplace_back(CheckBox{
+      "Show sensor poses", (params_.visualization.sensor_poses_corner_size > 0),
+      [this](bool checked) {
+        this->enqueue_request([this, checked]() {
+          params_.visualization.sensor_poses_corner_size = checked ? 0.5f : 0.0f;
+        });
       }});
 
     desc.tabs.emplace_back(std::move(tab));
@@ -429,6 +447,14 @@ void LidarOdometry::internalBuildGUI_Legacy()
       [this, checked]() { params_.visualization.show_console_messages = checked; });
   });
 
+  auto * cbShowSensorPoses = tab3->add<nanogui::CheckBox>("Show sensor poses");
+  cbShowSensorPoses->setChecked(params_.visualization.sensor_poses_corner_size > 0);
+  cbShowSensorPoses->setCallback([&](bool checked) {
+    this->enqueue_request([this, checked]() {
+      params_.visualization.sensor_poses_corner_size = checked ? 0.5f : 0.0f;
+    });
+  });
+
   // Background 3D scene: change background color
   visualizer_->execute_custom_code_on_background_scene([this](mrpt::opengl::Scene & scene) {
     const auto f = params_.visualization.background_color_gray_level;
@@ -518,6 +544,13 @@ void LidarOdometry::updateVisualization(
   if (const auto l = params_.visualization.current_pose_corner_size; l > 0) {
     glVehicle->insert(mrpt::opengl::stock_objects::CornerXYZ(l));
   }
+  if (const auto l = params_.visualization.sensor_poses_corner_size; l > 0) {
+    for (const auto & [label, sp] : state_.last_lidar_sensor_poses) {
+      auto sensorCorner = mrpt::opengl::stock_objects::CornerXYZSimple(l);
+      sensorCorner->setPose(sp);
+      glVehicle->insert(sensorCorner);
+    }
+  }
   for (const auto & m : state_.glVehicleModels) {
     glVehicle->insert(m);
   }
@@ -533,6 +566,10 @@ void LidarOdometry::updateVisualization(
   // Estimated path:
   // ------------------------
   updateVisualizationPath(updateTasks);
+
+  // Estimated gravity vector:
+  // ---------------------------------
+  updateVisualizationGravityVector(updateTasks);
 
   // GUI follow vehicle:
   // ---------------------------
@@ -554,10 +591,6 @@ void LidarOdometry::updateVisualization(
       visualizer->update_viewport_camera_azimuth(yawIncr, false /*incremental*/);
     });
   }
-
-  // Local map:
-  // -----------------------------
-  updateVisualizationLocalMap(updateTasks);
 
   // ground grid:
   {
@@ -601,6 +634,20 @@ void LidarOdometry::updateVisualization(
       mrpt::format("t=%.03f LiDAR data started to be received.", mrpt::Clock::nowDouble());
     visualizer_->output_console_message(s);
     MRPT_LOG_INFO(s);
+  }
+
+  updateVisualizationAlways();
+}
+
+void LidarOdometry::updateVisualizationAlways()
+{
+  // Local map: update whenever map content changed, independent of ICP quality.
+  {
+    std::vector<std::function<void()>> updateTasks;
+    updateVisualizationLocalMap(updateTasks);
+    for (const auto & ut : updateTasks) {
+      ut();
+    }
   }
 
   // Sub-window with custom UI
@@ -668,12 +715,19 @@ void LidarOdometry::updateVisualizationCurrentObservation(
   const bool showDecay = params_.visualization.show_last_deskewed_observations_decay;
 
   if (!hasRaw || (!showCurrent && !showDecay)) {
-    // None enabled, clean up directly:
-    if (showCurrent) {
+    // Route the clear through the worker thread so it is ordered after any
+    // previously enqueued frame lambdas and cannot be overwritten by them.
+    auto viz = visualizer_;
+    worker_viz_.enqueue([=]() {
+      // Always clear cur_obs: we reach here precisely when showCurrent is
+      // false or there is no raw layer, so any previously displayed cloud
+      // must be removed.
       auto empty = mrpt::opengl::CSetOfObjects::Create();
-      visualizer_->update_3d_object("liodom/cur_obs", empty);
-    }
-    doRemoveCloudsWithDecay();
+      viz->update_3d_object("liodom/cur_obs", empty);
+      if (viz) {
+        viz->clear_all_point_clouds_with_decay();
+      }
+    });
     return;
   }
 
@@ -716,12 +770,13 @@ void LidarOdometry::updateVisualizationCurrentObservation(
       mm.layers["raw"] = rawLayer;
 
       mp2p_icp::render_params_t rp;
-      auto & cm = rp.points.allLayers.colorMode.emplace();
       rp.points.allLayers.force_alpha_channel = true;
-      cm.colorMap = curObsColormap;
-      cm.recolorizeByField = curObsColorField;
       rp.points.allLayers.pointSize = curObsPointSize;
       rp.points.allLayers.color.A = mrpt::f2u8(curObsAlpha);
+
+      auto & cm = rp.points.allLayers.colorMode.emplace();
+      cm.colorMap = curObsColormap;
+      cm.recolorizeByField = curObsColorField;
 
       auto glCurrentObs = mm.get_visualization(rp);
       glCurrentObs->setPose(currentPose);
@@ -758,6 +813,8 @@ void LidarOdometry::updateVisualizationCurrentObservation(
 
         viz->insert_point_cloud_with_decay(cloud, decaySeconds);
       }
+    } else if (!showDecay) {
+      viz->clear_all_point_clouds_with_decay();
     }
   });
 
@@ -777,6 +834,10 @@ void LidarOdometry::updateVisualizationLocalMap(std::vector<std::function<void()
 
     mp2p_icp::render_params_t rp;
     rp.points.allLayers.pointSize = params_.visualization.local_map_point_size;
+
+    auto & cm = rp.points.allLayers.colorMode.emplace();
+    cm.colorMap = params_.visualization.local_map_colormap;
+    cm.recolorizeByField = params_.visualization.local_map_colormap_color_by_field;
 
     rp.points.allLayers.render_voxelmaps_free_space =
       params_.visualization.local_map_render_voxelmap_free_space;
@@ -832,6 +893,44 @@ void LidarOdometry::updateVisualizationPath(std::vector<std::function<void()>> &
       visualizer->update_3d_object("liodom/path", pathGrp);
     });
   }
+}
+
+void LidarOdometry::updateVisualizationGravityVector(
+  std::vector<std::function<void()>> & updateTasks)
+{
+  if (!params_.visualization.show_gravity_align_vector) {
+    auto grp = mrpt::opengl::CSetOfObjects::Create();
+    updateTasks.emplace_back([visualizer = visualizer_, grp]() {
+      visualizer->update_3d_object("liodom/gravity_vector", grp);
+    });
+    return;
+  }
+
+  const ProfilerEntry tle2(profiler_, "updateVisualization.update_gravity");
+
+  const auto gravityPR = state_.gravity_estimator.estimatedPitchRoll(
+    std::min(params_.imu_gravity_correction.averaging_samples, 3u),
+    params_.imu_gravity_correction.max_age_seconds);
+
+  if (!gravityPR.has_value()) {
+    return;
+  }
+
+  const auto [imu_pitch, imu_roll] = *gravityPR;
+  const auto & veh = state_.last_lidar_pose.mean;
+  const auto arrowPose = mrpt::math::TPose3D(veh.x(), veh.y(), veh.z(), 0.0, imu_pitch, imu_roll);
+
+  auto glArrow = mrpt::opengl::CArrow::Create();
+  glArrow->setArrowEnds(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 3.0f);
+  glArrow->setColor_u8(0xff, 0xa5, 0x00, 0xdc);  // orange
+
+  auto grp = mrpt::opengl::CSetOfObjects::Create();
+  grp->setPose(arrowPose);
+  grp->insert(glArrow);
+
+  updateTasks.emplace_back([visualizer = visualizer_, grp]() {
+    visualizer->update_3d_object("liodom/gravity_vector", grp);
+  });
 }
 
 void LidarOdometry::updateVisualizationTextLabels()
