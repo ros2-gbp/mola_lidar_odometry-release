@@ -263,49 +263,64 @@ public:
 
     struct Visualization
     {
+      float current_observation_alpha = 0.20f;
+
+      float background_color_gray_level = 0.3f;
+
+      float current_pose_corner_size = 1.5f;  //! [m]
+      float sensor_poses_corner_size = 0.5f;  //! [m], 0 to disable
+
+      // --- Ground grid ---
+      bool show_ground_grid = true;
+      float ground_grid_spacing = 5.0f;
+
+      // --- Trajectory ---
+      bool show_trajectory = true;
+      std::vector<float> trajectory_rgba = {0.1f, 0.1f, 0.1f, 1.0f};
+
+      // --- Current scan observation ---
+      bool show_current_observation = false;  // Show the incoming raw lidar scan observation
+      float current_observation_point_size = 3.0f;
+      mrpt::img::TColormap current_observation_colormap = mrpt::img::TColormap::cmJET;
+      /// Can be any pointcloud field name. Will change to "z" for simple XYZ clouds.
+      std::string current_observation_color_by_field = "intensity";
+
+      // --- Deskewed decaying scans ---
       /// Show a sliding window of decaying past observations to visualize a "dense local map"
       bool show_last_deskewed_observations_decay = true;
       double observations_decay_seconds = 5.0;
       float observations_initial_alpha = 0.10f;
-      float current_observation_alpha = 0.20f;
+      float last_deskewed_observations_point_size = 1.0f;
+      mrpt::img::TColormap last_deskewed_observations_colormap = mrpt::img::TColormap::cmJET;
+      /// Can be any pointcloud field name. Will change to "z" for simple XYZ clouds.
+      std::string last_deskewed_observations_color_by_field = "intensity";
 
-      /// Show just the latest observation
-      /// (redundant if `show_last_deskewed_observations_decay` is enabled)
-      bool show_current_observation = false;
-
+      // --- Local map ---
       /// Show the (decimated) underlying local map used to register observations
       /// to (less dense than `show_last_deskewed_observations_decay`).
       bool show_localmap = false;
       float local_map_point_size = 3.0f;
+      bool local_map_render_voxelmap_free_space = false;
+
+      mrpt::img::TColormap local_map_colormap = mrpt::img::TColormap::cmJET;
+      /// Can be any pointcloud field name. Will change to "z" for simple XYZ clouds.
+      std::string local_map_colormap_color_by_field = "intensity";
 
       /// If show_localmap==true, how many frames to wait to update the visualization of the
       /// map, which is a costly operation.
       int map_update_decimation = 10;
 
-      float background_color_gray_level = 0.3f;
-
-      bool show_trajectory = true;
-      std::vector<float> trajectory_rgba = {0.1f, 0.1f, 0.1f, 1.0f};
-      bool show_ground_grid = true;
-      float ground_grid_spacing = 5.0f;
-      float current_pose_corner_size = 1.5f;  //! [m]
-      float current_observation_point_size = 3.0f;
-      mrpt::img::TColormap current_observation_colormap = mrpt::img::TColormap::cmJET;
-      /// Can be any pointcloud field name. Will change to "z" for simple XYZ clouds.
-      std::string current_observation_color_by_field = "intensity";
-      float last_deskewed_observations_point_size = 1.0f;
-      mrpt::img::TColormap last_deskewed_observations_colormap = mrpt::img::TColormap::cmJET;
-      /// Can be any pointcloud field name. Will change to "z" for simple XYZ clouds.
-      std::string last_deskewed_observations_color_by_field = "intensity";
-      bool local_map_render_voxelmap_free_space = false;
       bool gui_subwindow_starts_hidden = false;
       bool show_console_messages = true;
+
+      // --- camera control ---
       bool camera_follows_vehicle = true;
       bool camera_rotates_with_vehicle = false;
       bool camera_orthographic = false;
+      bool show_gravity_align_vector = false;
 
       /** If not empty, an optional 3D model (.DAE, etc) to load for
-             * visualizing the robot/vehicle pose */
+       * visualizing the robot/vehicle pose */
       struct ModelPart
       {
         std::string file;
@@ -331,6 +346,16 @@ public:
       double kp = 5.0;
       double alpha = 0.99;
       double icp_quality_controller_setpoint = 0.85;
+
+      // Sustained-failure recovery (opt-in).
+      // KISS-ICP only updates sigma on good ICP, so a streak of bad ICPs
+      // freezes sigma at its last (typically small) value. With a small
+      // matcher window the system cannot recover from a perturbation that
+      // exceeds 2*sigma. When enabled, sigma is multiplicatively grown
+      // toward maximum_sigma after recover_after_n_bad consecutive failures.
+      bool recover_on_sustained_failure = false;
+      int recover_after_n_bad = 5;
+      double recover_growth_factor = 1.5;
 
       void initialize(const Yaml & c);
     };
@@ -722,7 +747,7 @@ private:
         std::array<double, 3> acc = {0, 0, 0};
       };
 
-      mrpt::containers::circular_buffer<TimestampedAcc> acc_buffer{200};
+      mrpt::containers::circular_buffer<TimestampedAcc> acc_buffer{4096};
       mrpt::poses::CPose3D imu_sensor_pose;  ///< last known IMU extrinsics
       double imu_sensor_pose_timestamp = 0;  ///< timestamp of last sensor pose update
 
@@ -740,6 +765,7 @@ private:
     mrpt::poses::CPose3DPDFGaussian last_lidar_pose;  //!< in local map
 
     std::map<std::string, mrpt::Clock::time_point> last_obs_tim_by_label;
+    std::map<std::string, mrpt::poses::CPose3D> last_lidar_sensor_poses;  //!< sensor pose per label
     bool last_icp_was_good = true;
     double last_icp_quality = .0;
     std::size_t last_icp_iterations = 0;
@@ -771,6 +797,10 @@ private:
 
     // KISS-ICP-like adaptive threshold method:
     double adapt_thres_sigma = 0;  // 0: initial
+
+    // Counter of consecutive bad ICPs; drives the optional sustained-failure
+    // recovery in AdaptiveThreshold.
+    int consecutive_bad_icps = 0;
 
     // Automatic estimation of the observation bounding-radius (measured from
     // base_link, not from the sensor — see ESTIMATED_OBSERVATION_RADIUS docs):
@@ -890,7 +920,9 @@ private:
     1 /*num threads*/, mrpt::WorkerThreadsPool::POLICY_FIFO, "worker_disk"};
 
   /** Runs colorization tasks for clouds to be shown in the gui */
-  mrpt::WorkerThreadsPool worker_viz_{2, mrpt::WorkerThreadsPool::POLICY_DROP_OLD, "worker_viz"};
+  // Single thread: POLICY_DROP_OLD skips stale frames while 1 thread ensures
+  // serial ordering so a newer clear cannot be overwritten by an older frame's lambda.
+  mrpt::WorkerThreadsPool worker_viz_{1, mrpt::WorkerThreadsPool::POLICY_DROP_OLD, "worker_viz"};
 
   MethodState state_;
   const MethodState & state() const { return state_; }
@@ -999,7 +1031,9 @@ private:
     const mrpt::maps::CPointsMap::Ptr & deskewedCloud);
   void updateVisualizationLocalMap(std::vector<std::function<void()>> & updateTasks);
   void updateVisualizationPath(std::vector<std::function<void()>> & updateTasks);
+  void updateVisualizationGravityVector(std::vector<std::function<void()>> & updateTasks);
   void updateVisualizationTextLabels();
+  void updateVisualizationAlways();
 
 #if MOLA_VERSION_CHECK(2, 6, 0)
   void internalBuildGUI();
