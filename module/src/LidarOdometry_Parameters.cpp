@@ -91,6 +91,18 @@ void LidarOdometry::Parameters::AdaptiveThreshold::initialize(const Yaml & cfg)
   YAML_LOAD_REQ(alpha, double);
   YAML_LOAD_OPT(maximum_sigma, double);
   YAML_LOAD_OPT(icp_quality_controller_setpoint, double);
+
+  YAML_LOAD_OPT(recover_on_sustained_failure, bool);
+  YAML_LOAD_OPT(recover_after_n_bad, int);
+  YAML_LOAD_OPT(recover_growth_factor, double);
+
+  ASSERTMSG_(
+    recover_after_n_bad >= 1,
+    mrpt::format("adaptive_threshold: recover_after_n_bad (%d) must be >= 1", recover_after_n_bad));
+  ASSERTMSG_(
+    recover_growth_factor > 1.0,
+    mrpt::format(
+      "adaptive_threshold: recover_growth_factor (%.3f) must be > 1.0", recover_growth_factor));
 }
 
 void LidarOdometry::Parameters::Visualization::initialize(const Yaml & cfg)
@@ -114,6 +126,7 @@ void LidarOdometry::Parameters::Visualization::initialize(const Yaml & cfg)
   YAML_LOAD_OPT(ground_grid_spacing, float);
   YAML_LOAD_OPT(show_console_messages, bool);
   YAML_LOAD_OPT(current_pose_corner_size, float);
+  YAML_LOAD_OPT(sensor_poses_corner_size, float);
   YAML_LOAD_OPT(local_map_point_size, float);
   YAML_LOAD_OPT(current_observation_point_size, float);
   YAML_LOAD_OPT(last_deskewed_observations_point_size, float);
@@ -121,13 +134,18 @@ void LidarOdometry::Parameters::Visualization::initialize(const Yaml & cfg)
 
   MCP_LOAD_OPT(cfg, current_observation_colormap);
   MCP_LOAD_OPT(cfg, current_observation_color_by_field);
+
   MCP_LOAD_OPT(cfg, last_deskewed_observations_colormap);
   MCP_LOAD_OPT(cfg, last_deskewed_observations_color_by_field);
+
+  MCP_LOAD_OPT(cfg, local_map_colormap);
+  MCP_LOAD_OPT(cfg, local_map_colormap_color_by_field);
 
   YAML_LOAD_OPT(gui_subwindow_starts_hidden, bool);
   YAML_LOAD_OPT(camera_follows_vehicle, bool);
   YAML_LOAD_OPT(camera_rotates_with_vehicle, bool);
   YAML_LOAD_OPT(camera_orthographic, bool);
+  YAML_LOAD_OPT(show_gravity_align_vector, bool);
 
   initializeModelPart(cfg);
 }
@@ -250,7 +268,9 @@ void LidarOdometry::Parameters::InitialLocalizationOptions::initialize(const Yam
     auto & p = fixed_initial_pose;
     const auto seq = cfg["fixed_initial_pose"].asSequenceRange();
     for (size_t i = 0; i < 6; i++) {
-      p[i] = seq.at(i).as<double>();
+      const double v = seq.at(i).as<double>();
+      // x, y, z are in meters; yaw, pitch, roll (indices 3-5) are in degrees in the YAML.
+      p[i] = (i < 3) ? v : mrpt::DEG2RAD(v);
     }
   }
 }
