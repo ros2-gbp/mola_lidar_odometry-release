@@ -8,7 +8,7 @@
 # ------------------------------------------------------------------------------
 
 # Minimum CMake vesion: limited by CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.22...3.31)  # Ubuntu 22.04+
 
 if("$ENV{ROS_VERSION}" STREQUAL "2")
     set(DETECTED_ROS2 TRUE)
@@ -31,8 +31,29 @@ find_package(mola_imu_preintegration REQUIRED)
 
 # -----------------------
 # define lib:
-file(GLOB_RECURSE LIB_SRCS module/src/*.cpp module/src/*.h)
-file(GLOB_RECURSE LIB_PUBLIC_HDRS module/include/*.h)
+set(LIB_SRCS
+  module/src/GravityMapAligner.cpp
+  module/src/TrajectoryRebaker.cpp
+  module/src/LidarOdometry_Main.cpp
+  module/src/LidarOdometry_Relocalization.cpp
+  module/src/LidarOdometry_Parameters.cpp
+  module/src/LidarOdometry_Initialize.cpp
+  module/src/LidarOdometry_ProcessScan.cpp
+  module/src/LidarOdometry_AdaptiveVariables.cpp
+  module/src/LidarOdometry_MapServer.cpp
+  module/src/LidarOdometry_GUI.cpp
+  module/src/LidarOdometry_SensorCallbacks.cpp
+  module/src/LidarOdometry_Publish.cpp
+  module/src/LidarOdometry_InitialLocalization.cpp
+  # Last:
+  module/src/register.cpp
+)
+
+set(LIB_PUBLIC_HDRS
+  module/include/mola_lidar_odometry/LidarOdometry.h
+  module/include/mola_lidar_odometry/GravityMapAligner.h
+  module/include/mola_lidar_odometry/TrajectoryRebaker.h
+)
 
 mola_add_library(
   TARGET ${PROJECT_NAME}
@@ -153,6 +174,7 @@ endif()
 # Install files:
 install(
   DIRECTORY
+    config
     mola-cli-launchs
     pipelines
     ros2-launchs
@@ -170,6 +192,7 @@ install(
     scripts/mola-lo-gui-mulran
     scripts/mola-lo-gui-rawlog
     scripts/mola-lo-gui-rosbag2
+    scripts/mola-lo-gui-ouster
   DESTINATION
     bin
 )
