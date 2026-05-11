@@ -82,23 +82,30 @@ params:
   # Adaptive threshold, as in the KISS-ICP paper:
   adaptive_threshold:
     enabled: true
-    initial_sigma: 0.50 # [m]
+    initial_sigma: ${MOLA_SIGMA_INITIAL|0.50} # [m]
     min_motion: ${MOLA_SIGMA_MIN_MOTION|0.04} # [m]
     maximum_sigma: ${MOLA_SIGMA_MAX_MOTION|0.50} # [m]
     icp_quality_controller_setpoint: 0.85
     kp: 2.0
-    alpha: ${MOLA_ADAPT_THRESHOLD_ALPHA|0.99}
+    alpha: ${MOLA_ADAPT_THRESHOLD_ALPHA|0.90}
+    # Optional sustained-failure recovery: if enabled, sigma is grown
+    # multiplicatively after a streak of bad ICPs, capped at maximum_sigma,
+    # so the matcher window can re-open and ICP can recover. With the flag
+    # off (default) behavior is unchanged.
+    recover_on_sustained_failure: ${MOLA_ADAPT_THRESHOLD_RECOVER|false}
+    recover_after_n_bad: ${MOLA_ADAPT_THRESHOLD_RECOVER_AFTER_N_BAD|5}
+    recover_growth_factor: ${MOLA_ADAPT_THRESHOLD_RECOVER_GROWTH_FACTOR|1.5}
 
   # REP-107 diagnostics thresholds published on /diagnostics via mola_bridge_ros2.
   # Any of these can be omitted to keep its built-in default.
   diagnostics:
-    icp_quality_warn: 0.30         # [0-1] WARN if icp_quality below this
-    icp_quality_error: 0.10        # [0-1] ERROR if icp_quality below this
-    input_stale_sec: 3.0           # [s]   STALE if no observation for this long
-    input_error_sec: 5.0           # [s]   ERROR if no observation for this long
-    dropped_ratio_warn: 0.20       # [0-1] WARN if dropped-frames ratio exceeds
-    dropped_ratio_error: 0.50      # [0-1] ERROR if dropped-frames ratio exceeds
-    timing_utilization_warn: 0.80  # [0-1] WARN if avg process time / sensor period exceeds
+    icp_quality_warn: 0.30 # [0-1] WARN if icp_quality below this
+    icp_quality_error: 0.10 # [0-1] ERROR if icp_quality below this
+    input_stale_sec: 3.0 # [s]   STALE if no observation for this long
+    input_error_sec: 5.0 # [s]   ERROR if no observation for this long
+    dropped_ratio_warn: 0.20 # [0-1] WARN if dropped-frames ratio exceeds
+    dropped_ratio_error: 0.50 # [0-1] ERROR if dropped-frames ratio exceeds
+    timing_utilization_warn: 0.80 # [0-1] WARN if avg process time / sensor period exceeds
 
   # If enabled, a map will be stored in RAM and (if using the CLI) stored
   # to a ".simplemap" file for later use for localization, etc.
@@ -141,6 +148,7 @@ params:
     current_observation_colormap: ${MOLA_GUI_CURRENT_CLOUD_COLORMAP|cmHOT} # mrpt::img::TColormap
     current_observation_color_by_field: ${MOLA_GUI_CURRENT_CLOUD_COLOR_FIELD|intensity}
     current_observation_alpha: 0.20
+    show_gravity_align_vector: ${MOLA_GUI_SHOW_ESTIMATED_GRAVITY_VECTOR|false}
 
     background_color_gray_level: "${MOLA_GUI_BACKGROUND_GRAY_LEVEL|0.3}"
 
@@ -150,6 +158,7 @@ params:
     show_ground_grid: ${MOLA_GUI_SHOW_GROUND_GRID|true}
     ground_grid_spacing: 5.0 # [m]
     #current_pose_corner_size: 1.5
+    #sensor_poses_corner_size: 0.5  # XYZ corner for each LiDAR sensor pose; 0 to disable
     model:
       - file: ${MOLA_VEHICLE_MODEL_FILE|""} # Default: none
         tf.x: ${MOLA_VEHICLE_MODEL_X|0.0} # deg
@@ -186,15 +195,9 @@ params:
 # re-localization method to use at start up:
 initial_localization:
   method: "${MOLA_LO_INITIAL_LOCALIZATION_METHOD|InitLocalization::FixedPose}"
+  # Format: x(m) y(m) z(m) yaw(deg) pitch(deg) roll(deg)
   fixed_initial_pose:
-    [
-      "${MOLA_INITIAL_X|0.0}",
-      "${MOLA_INITIAL_Y|0.0}",
-      "${MOLA_INITIAL_Z|0.0}",
-      "${MOLA_INITIAL_YAW|0.0}",
-      "${MOLA_INITIAL_PITCH|0.0}",
-      "${MOLA_INITIAL_ROLL|0.0}",
-    ]
+    ["${MOLA_INITIAL_X|0.0}", "${MOLA_INITIAL_Y|0.0}", "${MOLA_INITIAL_Z|0.0}", "${MOLA_INITIAL_YAW|0.0}", "${MOLA_INITIAL_PITCH|0.0}", "${MOLA_INITIAL_ROLL|0.0}"]
   imu_initial_calibration_sample_count: "${MOLA_LO_INITIAL_IMU_SAMPLES|400}"
   imu_initial_calibration_max_age: 5.0
   use_imu_orientation: "${MOLA_LO_INITIAL_IMU_USE_ORIENTATION|true}"
@@ -233,6 +236,16 @@ icp_settings_with_vel:
     debugFileNameFormat: "icp-logs/icp-run-${SEQ|NO_SEQ}-$UNIQUE_ID-local_$LOCAL_ID$LOCAL_LABEL-to-global_$GLOBAL_ID$GLOBAL_LABEL.icplog"
     decimationDebugFiles: ${MP2P_ICP_LOG_FILES_DECIMATION|10}
 
+    # Post-optimization SE(3) covariance estimation (see mp2p_icp::covariance).
+    # Censi3D is the realistic sandwich estimator for cov2cov pipelines;
+    # the per-axis floor absorbs unmodelled errors and keeps downstream
+    # filters numerically stable.
+    covariance:
+      method: ${MOLA_ICP_COVARIANCE_METHOD|Censi3D}
+      defaultPointSigma: ${MOLA_ICP_COV_DEFAULT_POINT_SIGMA|0.01} # [m]
+      floor_sigma_xyz: ${MOLA_ICP_COV_FLOOR_XYZ|0.001} # [m]
+      floor_sigma_angles_deg: ${MOLA_ICP_COV_FLOOR_ANGLES_DEG|0.1} # [deg]
+
   solvers:
     - class: mp2p_icp::Solver_GaussNewton
       params:
@@ -241,8 +254,8 @@ icp_settings_with_vel:
         robustKernelParam: "${MOLA_LO_ROBUST_KERNEL_PARAM|6.0}" # In GICP, errors are normalized by covariance
         #innerLoopVerbose: true
 
-  # Sequence of one or more pairs (class, params) defining mp2p_icp::Matcher
-  # instances to pair geometric entities between pointclouds.
+        # Sequence of one or more pairs (class, params) defining mp2p_icp::Matcher
+        # instances to pair geometric entities between pointclouds.
   matchers:
     - class: mp2p_icp::Matcher_Cov2Cov
       params:
@@ -251,10 +264,7 @@ icp_settings_with_vel:
         allowMatchAlreadyMatchedGlobalPoints: true # faster
         # Both layers here must be of type 'mola::KeyframePointCloudMap'
         layerMatches:
-          - {
-              global: "${MOLA_LOCALMAP_LAYER_NAME|localmap}",
-              local: "observation",
-            }
+          - { global: "${MOLA_LOCALMAP_LAYER_NAME|localmap}", local: "observation" }
 
   quality:
     - class: mp2p_icp::QualityEvaluator_PairedRatio
@@ -299,12 +309,12 @@ localmap_generator:
           max_overall_points: ${MOLA_LOCALMAP_VIZ_MAX_POINTS_OVERALL|500000} # Max number of points to render overall (e.g. to avoid FoxGlove WS overflow)
           #point_size: 1.0  # superseded by visualization.local_map_point_size above
 
-# ---------------------------------------------------------------------------------
-# LIDAR observations are, first, loaded using a generator
-# from "observations_generator".
-# then, optionally, filtered before being registered with ICP
-# against the local map with filter "observations_filter_1st_pass".
-# ---------------------------------------------------------------------------------
+          # ---------------------------------------------------------------------------------
+          # LIDAR observations are, first, loaded using a generator
+          # from "observations_generator".
+          # then, optionally, filtered before being registered with ICP
+          # against the local map with filter "observations_filter_1st_pass".
+          # ---------------------------------------------------------------------------------
 observations_generator:
   # Generators:
   #
@@ -443,8 +453,7 @@ insert_observation_into_local_map:
       input_pointcloud_layer: "decimated_for_map"
       target_layer: "${MOLA_LOCALMAP_LAYER_NAME|localmap}"
       input_layer_in_local_coordinates: true
-      robot_pose:
-        [robot_x, robot_y, robot_z, robot_yaw, robot_pitch, robot_roll]
+      robot_pose: [robot_x, robot_y, robot_z, robot_yaw, robot_pitch, robot_roll]
 
 # Pipeline starting from raw observations (passed through "Generator"), to be
 # sent out for visualization of the sliding-window of recent clouds as a dense local map
