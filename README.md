@@ -61,7 +61,6 @@ The latest publication on MOLA is ([ArXiV](https://arxiv.org/abs/2407.20465)).
 }
 ```
 
-
 ## License
 Copyright (C) 2018-2026 Jose Luis Blanco <jlblanco@ual.es>, University of Almeria
 
