@@ -42,6 +42,16 @@ void LidarOdometry::handleInitialLocalizationDoInitFromPose(
       mrpt::Clock::fromDouble(mrpt::Clock::toDouble(*state_.last_obs_timestamp) - 1e-3);
     state_.navstate_fuse->fuse_pose(t1, initPose, params_.publish_reference_frame);
     state_.navstate_fuse->fuse_pose(t2, initPose, params_.publish_reference_frame);
+
+    // Also skip fusing the next few ICP corrections into the state estimator
+    // (same safeguard used by relocalize_near_pose_pdf()/relocalize_from_gnss()):
+    // the very first ICP correction after this reset is only a tiny "dt" away
+    // from the fake evolution above, so dividing its position delta by that
+    // dt can produce a huge, spurious velocity. Skipping a few steps lets ICP
+    // re-converge on a stable pose before velocity is derived again.
+    state_.step_counter_post_relocalization = std::max(
+      params_.initial_localization.additional_uncertainty_after_reloc_how_many_timesteps,
+      params_.initial_localization.additional_map_freeze_after_reloc_how_many_timesteps);
   }
 
   // also, keep it as the last pose for subsequent ICP runs:
@@ -99,9 +109,9 @@ void LidarOdometry::handleInitialLocalization()
 
         MRPT_LOG_INFO_STREAM("IMU automatic calibration done: " << imu_calib_opt->asString());
 
-        // Set as the initial pose:
-        il.fixed_initial_pose =
-          mrpt::math::TPose3D(0, 0, 0, 0, imu_calib_opt->pitch, imu_calib_opt->roll);
+        // Overwrite pitch & roll from the IMU, keeping the configured x/y/z/yaw prior:
+        il.fixed_initial_pose.pitch = imu_calib_opt->pitch;
+        il.fixed_initial_pose.roll = imu_calib_opt->roll;
 
         MRPT_LOG_INFO_STREAM(
           "Initial re-localization done from IMU pitch/roll with pose: "
@@ -113,11 +123,18 @@ void LidarOdometry::handleInitialLocalization()
         handleInitialLocalizationDoInitFromPose(initPose, true);
         doRemoveCloudsWithDecay();
 
-        state_.local_map->clear();
-        ASSERT_(state_.local_map->empty());
-        {
-          auto lckSM = mrpt::lockHelper(state_simplemap_mtx_);
-          state_.reconstructed_simplemap.clear();
+        // Only wipe the local map / simplemap if no preexisting map is
+        // loaded (from start-up config, or via a runtime map_load() service
+        // call): otherwise this would discard a map inherited from a
+        // previous mapping session (multisession/multi-robot mapping).
+        if (!state_.map_has_been_loaded) {
+          state_.local_map->clear();
+          state_.gravity_calib_pitch_roll.reset();  // new map origin: recapture at next first KF
+          ASSERT_(state_.local_map->empty());
+          {
+            auto lckSM = mrpt::lockHelper(state_simplemap_mtx_);
+            state_.reconstructed_simplemap.clear();
+          }
         }
 
         state_.initial_localization_done = true;
@@ -199,11 +216,10 @@ void LidarOdometry::handleInitialLocalizationStateEstimation()
   // Check if state estimator has converged
   mrpt::poses::CPose3DPDFGaussian estimatedPose;
 
-  // Snapshot georef state under lock to avoid data race with
-  // onExternalMapUpdate which writes state_.external_georef concurrently.
+  // Note: state_mtx_ is already held by the caller (processLidarScan), which
+  // also serializes us against onExternalMapUpdate (writes
+  // state_.external_georef from another thread under the same mutex).
   {
-    auto lckState = mrpt::lockHelper(state_mtx_);
-
     const bool hasGeoRef =
       state_.local_map->georeferencing.has_value() || state_.external_georef.has_value();
 
