@@ -32,6 +32,10 @@
 #include <mola_kernel/interfaces/MapSourceBase.h>
 #include <mola_kernel/interfaces/NavStateFilter.h>
 #include <mola_kernel/interfaces/Relocalization.h>
+#if __has_include(<mola_kernel/interfaces/SharedKeyframeMap.h>)
+#include <mola_kernel/interfaces/SharedKeyframeMap.h>
+#define MOLA_HAS_SHARED_KEYFRAME_MAP_SINK 1
+#endif
 #include <mola_kernel/version.h>
 
 // Other packages:
@@ -56,6 +60,7 @@
 
 // STD:
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -67,16 +72,7 @@
 #include <vector>
 
 // Forward declarations:
-#if MOLA_VERSION_CHECK(2, 6, 0)
 #include <mola_kernel/GuiWidgetDescription.h>
-#else
-namespace nanogui
-{
-class Window;
-class Label;
-class CheckBox;
-}  // namespace nanogui
-#endif
 
 namespace mola
 {
@@ -107,6 +103,9 @@ class LidarOdometry : public mola::FrontEndBase,
 {
   DEFINE_MRPT_OBJECT(LidarOdometry, mola)
 
+private:
+  constexpr static std::size_t IMU_BUFFER_SIZE = 4096;
+
 public:
   LidarOdometry();
   ~LidarOdometry() override;
@@ -124,6 +123,7 @@ public:
   void initialize_frontend(const Yaml & cfg) override;
   void spinOnce() override;
   void onNewObservation(const CObservation::ConstPtr & o) override;
+  void onQuit() override;
 
   /** Re-initializes the odometry system. It effectively calls initialize()
      *  once again with the same parameters that were used the first time.
@@ -245,6 +245,13 @@ public:
       /** If not empty, saves the final local metric map to a ".mm" file */
       std::string save_final_local_map;
 
+      /** If true, map loading from file is deferred until after the GUI is
+             * first rendered, so the GUI appears before the (potentially long)
+             * file I/O. Can also be enabled via the env var
+             * MOLA_LO_LOAD_MAP_AFTER_GUI=1.
+             */
+      bool load_map_after_gui_init = false;
+
       void initialize(const Yaml & c, Parameters & parent);
     };
 
@@ -263,49 +270,79 @@ public:
 
     struct Visualization
     {
+      float current_observation_alpha = 0.20f;
+
+      float background_color_gray_level = 0.3f;
+
+      float current_pose_corner_size = 1.5f;  //! [m]
+      float sensor_poses_corner_size = 0.5f;  //! [m], 0 to disable
+
+      // --- Ground grid ---
+      bool show_ground_grid = true;
+      float ground_grid_spacing = 5.0f;
+
+      // --- Trajectory ---
+      bool show_trajectory = true;
+      std::vector<float> trajectory_rgba = {0.1f, 0.1f, 0.1f, 1.0f};
+
+      // --- Current scan observation ---
+      bool show_current_observation = false;  // Show the incoming raw lidar scan observation
+      float current_observation_point_size = 3.0f;
+      mrpt::img::TColormap current_observation_colormap = mrpt::img::TColormap::cmJET;
+      /// Can be any pointcloud field name. Will change to "z" for simple XYZ clouds.
+      std::string current_observation_color_by_field = "intensity";
+
+      // --- Deskewed decaying scans ---
       /// Show a sliding window of decaying past observations to visualize a "dense local map"
       bool show_last_deskewed_observations_decay = true;
       double observations_decay_seconds = 5.0;
       float observations_initial_alpha = 0.10f;
-      float current_observation_alpha = 0.20f;
+      float last_deskewed_observations_point_size = 1.0f;
+      mrpt::img::TColormap last_deskewed_observations_colormap = mrpt::img::TColormap::cmJET;
+      /// Can be any pointcloud field name. Will change to "z" for simple XYZ clouds.
+      std::string last_deskewed_observations_color_by_field = "intensity";
 
-      /// Show just the latest observation
-      /// (redundant if `show_last_deskewed_observations_decay` is enabled)
-      bool show_current_observation = false;
-
+      // --- Local map ---
       /// Show the (decimated) underlying local map used to register observations
       /// to (less dense than `show_last_deskewed_observations_decay`).
       bool show_localmap = false;
       float local_map_point_size = 3.0f;
+      bool local_map_render_voxelmap_free_space = false;
+
+      mrpt::img::TColormap local_map_colormap = mrpt::img::TColormap::cmJET;
+      /// Can be any pointcloud field name. Will change to "z" for simple XYZ clouds.
+      std::string local_map_colormap_color_by_field = "intensity";
 
       /// If show_localmap==true, how many frames to wait to update the visualization of the
       /// map, which is a costly operation.
       int map_update_decimation = 10;
 
-      float background_color_gray_level = 0.3f;
-
-      bool show_trajectory = true;
-      std::vector<float> trajectory_rgba = {0.1f, 0.1f, 0.1f, 1.0f};
-      bool show_ground_grid = true;
-      float ground_grid_spacing = 5.0f;
-      float current_pose_corner_size = 1.5f;  //! [m]
-      float current_observation_point_size = 3.0f;
-      mrpt::img::TColormap current_observation_colormap = mrpt::img::TColormap::cmJET;
-      /// Can be any pointcloud field name. Will change to "z" for simple XYZ clouds.
-      std::string current_observation_color_by_field = "intensity";
-      float last_deskewed_observations_point_size = 1.0f;
-      mrpt::img::TColormap last_deskewed_observations_colormap = mrpt::img::TColormap::cmJET;
-      /// Can be any pointcloud field name. Will change to "z" for simple XYZ clouds.
-      std::string last_deskewed_observations_color_by_field = "intensity";
-      bool local_map_render_voxelmap_free_space = false;
       bool gui_subwindow_starts_hidden = false;
-      bool show_console_messages = true;
+      std::atomic<bool> show_console_messages{true};
+
+      // --- Tab visibility ---
+      bool show_tab_status = true;
+      bool show_tab_control = true;
+      bool show_tab_view = true;
+
+      // --- camera control ---
       bool camera_follows_vehicle = true;
       bool camera_rotates_with_vehicle = false;
       bool camera_orthographic = false;
+      bool show_gravity_align_vector = false;
+
+      /// If true (and a movable-frame-capable visualizer is present), all 3D
+      /// objects are drawn as children of a movable scene frame node named
+      /// `publish_reference_frame` instead of the viewport root. A central
+      /// backend such as mola_mapper_3d then repositions that frame as it
+      /// estimates `T_map_to_{odom}`, so this odometry's dense clouds / local
+      /// map stay correctly placed in {map} without being re-rendered. When no
+      /// such backend is present the frame stays at the identity pose, so the
+      /// behavior is identical to drawing at the root (standalone runs).
+      bool render_in_movable_frame = true;
 
       /** If not empty, an optional 3D model (.DAE, etc) to load for
-             * visualizing the robot/vehicle pose */
+       * visualizing the robot/vehicle pose */
       struct ModelPart
       {
         std::string file;
@@ -321,16 +358,27 @@ public:
     };
     Visualization visualization;
 
-    // KISS-ICP adaptive threshold method:
+    // Adaptive threshold method based purely on ICP quality
     struct AdaptiveThreshold
     {
       bool enabled = true;
-      double initial_sigma = 0.5;
-      double maximum_sigma = 3.0;
-      double min_motion = 0.10;
+      double initial_sigma = 0.5;    // Units: [m]
+      double maximum_sigma = 3.0;    // Units: [m]
+      double min_motion = 0.10;      // Units: [m]
+      double max_sigma_step = 0.05;  // Units: [m]
       double kp = 5.0;
       double alpha = 0.99;
-      double icp_quality_controller_setpoint = 0.85;
+      double icp_quality_controller_setpoint = 0.85;  // Range: [0,1]
+
+      // Sustained-failure recovery (opt-in).
+      // Updates sigma on good ICP, so a streak of bad ICPs
+      // freezes sigma at its last (typically small) value. With a small
+      // matcher window the system cannot recover from a perturbation that
+      // exceeds 2*sigma. When enabled, sigma is multiplicatively grown
+      // toward maximum_sigma after recover_after_n_bad consecutive failures.
+      bool recover_on_sustained_failure = false;
+      int recover_after_n_bad = 5;
+      double recover_growth_factor = 1.5;
 
       void initialize(const Yaml & c);
     };
@@ -476,6 +524,15 @@ public:
       // Right after a re-localization, do not update the pose state estimator for a few iterations
       uint32_t additional_uncertainty_after_reloc_how_many_timesteps = 5;
 
+      // Right after a re-localization (or initial localization), also do not
+      // update the local map nor the simplemap for this many timesteps.
+      // 0 (default) disables this and preserves pre-existing behavior:
+      // map updates are independent of the re-localization recovery window.
+      // Shares the same recovery-window counter as
+      // additional_uncertainty_after_reloc_how_many_timesteps (the window
+      // becomes the max of the two when both are set).
+      uint32_t additional_map_freeze_after_reloc_how_many_timesteps = 0;
+
       /// Number of IMU (accelerometer) samples to accumulate while stationary to estimate Pitch & Roll:
       uint32_t imu_initial_calibration_sample_count = 50;
 
@@ -538,6 +595,13 @@ public:
 
     bool start_active = true;
 
+    /** Under overload, incoming scans are processed with a "drop stale, keep
+     *  freshest" policy: the single worker thread always advances to the newest
+     *  ready scan, dropping older ones, so latency stays near one processing
+     *  period regardless of this value. This parameter only bounds the auxiliary
+     *  wait list used while a scan waits for its IMU data (IMU de-skew pipelines):
+     *  if IMU delivery lags, no more than this many scans are kept waiting before
+     *  the oldest are dropped. */
     uint32_t max_lidar_queue_before_drop = 15;
 
     uint32_t gnss_queue_max_size = 100;
@@ -561,6 +625,19 @@ public:
 
   bool isBusy() const;
 
+  /** Drains the worker thread pools and saves the simplemap/trajectory/local
+   *  map to disk, if so configured. Idempotent: safe to call from onQuit()
+   *  and then again from the destructor.
+   *
+   *  Must run to completion (and thus stop calling back into other modules,
+   *  e.g. via VizInterface or BridgeROS2's TF broadcaster) before any other
+   *  module of the running MOLA system is destroyed. onQuit() is invoked by
+   *  MolaLauncherApp for that exact purpose, before any module destructor
+   *  runs.
+   */
+  void shutdownCleanup();
+  std::atomic_bool shutdown_cleanup_done_{false};
+
   bool isActive() const;
   void setActive(bool active);
 
@@ -578,6 +655,9 @@ public:
   std::optional<std::tuple<mrpt::poses::CPose3DPDFGaussian, mrpt::math::TTwist3D>>
   lastEstimatedState() const;
 
+  /** Returns the ICP quality (range: [0,1]) of the last registered scan. Only valid if lastEstimatedState() returns non-empty. */
+  double lastIcpQuality() const;
+
   /** Returns a copy of the estimated simplemap.
      * Multi-thread safe to call.
      */
@@ -594,6 +674,29 @@ public:
      *
      */
   void enqueue_request(const std::function<void()> & userRequest);
+
+  /** @} */
+
+  /** @name Runtime visualization coloring overrides
+     *  All setters are thread-safe: the change is applied on the internal
+     *  LidarOdometry worker thread via enqueue_request(), so they may be
+     *  called from any thread (e.g. a host GUI) at any time.
+     *{ */
+
+  /** Sets the colormap and color-by-field used to render the live deskewed
+     *  scan streams (the incoming current observation and the decaying
+     *  "dense local map" of past observations). Pass cmNONE as \a colormap to
+     *  keep the point cloud's own RGB colors (no recoloring). */
+  void setDeskewedColoring(mrpt::img::TColormap colormap, const std::string & colorByField);
+
+  /** Sets the colormap and color-by-field used to render the local map cloud
+     *  (e.g. cmGRAYSCALE for a grayscale global map). */
+  void setLocalMapColoring(mrpt::img::TColormap colormap, const std::string & colorByField);
+
+  /** Sets estimated-trajectory line visibility and, if \a rgba has size 4,
+     *  its RGBA color (each component in [0,1]). Lets a host own the
+     *  trajectory appearance instead of toggling the scene object externally. */
+  void setTrajectoryVisualization(bool show, const std::vector<float> & rgba);
 
   /** @} */
 
@@ -693,9 +796,14 @@ private:
     // ------ ^^^ end of these flags are protected ^^^^      ---------
 
     // ------ these vars are protected by is_busy_mtx_  ---------
+    // worker_tasks_lidar is 1 while onLidar() is actively executing a scan, 0
+    // otherwise (queued-but-not-yet-running scans are tracked separately, by
+    // worker_lidar_.pendingTasks()).
     int worker_tasks_lidar = 0;
     int worker_tasks_others = 0;
+    // ------ ^^^ end of these flags are protected ^^^^      ---------
 
+    // ------ these vars are protected by drop_stats_mtx_  ---------
     static constexpr std::size_t DROP_STATS_WINDOW_LENGTH = 128;
     std::array<bool, DROP_STATS_WINDOW_LENGTH> drop_frames_stats_good =
       create_array<DROP_STATS_WINDOW_LENGTH>(true);
@@ -722,7 +830,7 @@ private:
         std::array<double, 3> acc = {0, 0, 0};
       };
 
-      mrpt::containers::circular_buffer<TimestampedAcc> acc_buffer{200};
+      mrpt::containers::circular_buffer<TimestampedAcc> acc_buffer{IMU_BUFFER_SIZE};
       mrpt::poses::CPose3D imu_sensor_pose;  ///< last known IMU extrinsics
       double imu_sensor_pose_timestamp = 0;  ///< timestamp of last sensor pose update
 
@@ -737,9 +845,19 @@ private:
 
     GravityEstimator gravity_estimator;
 
+    /// Gravity-derived (pitch, roll), in radians, captured at the time the first
+    /// keyframe (map origin) was created. The IMU gravity estimator reports
+    /// *absolute* tilt with respect to true vertical, while the map/global frame
+    /// may itself not be exactly level (e.g. `fixed_initial_pose` has nonzero
+    /// pitch/roll, or the vehicle was on a slope at start-up). This calibration
+    /// offset is required to correctly re-express later absolute IMU tilt
+    /// readings relative to the (possibly non-level) map frame.
+    std::optional<std::pair<double, double>> gravity_calib_pitch_roll;
+
     mrpt::poses::CPose3DPDFGaussian last_lidar_pose;  //!< in local map
 
     std::map<std::string, mrpt::Clock::time_point> last_obs_tim_by_label;
+    std::map<std::string, mrpt::poses::CPose3D> last_lidar_sensor_poses;  //!< sensor pose per label
     bool last_icp_was_good = true;
     double last_icp_quality = .0;
     std::size_t last_icp_iterations = 0;
@@ -764,6 +882,13 @@ private:
     // navstate_fuse to merge pose estimates, IMU, odom, estimate twist.
     std::shared_ptr<mola::NavStateFilter> navstate_fuse;
 
+#if defined(MOLA_HAS_SHARED_KEYFRAME_MAP_SINK)
+    // Central-map backend (e.g. mola_mapper_3d) accepting keyframe-insertion
+    // requests, if any is present in the running MOLA system. Detected the
+    // same way as navstate_fuse, but optional: nullptr if none is found.
+    std::shared_ptr<mola::SharedKeyframeMap> shared_keyframe_map_sink;
+#endif
+
     std::optional<NavState> last_motion_model_output;
 
     /// The source of "dynamic variables" in ICP pipelines:
@@ -771,6 +896,10 @@ private:
 
     // KISS-ICP-like adaptive threshold method:
     double adapt_thres_sigma = 0;  // 0: initial
+
+    // Counter of consecutive bad ICPs; drives the optional sustained-failure
+    // recovery in AdaptiveThreshold.
+    int consecutive_bad_icps = 0;
 
     // Automatic estimation of the observation bounding-radius (measured from
     // base_link, not from the sensor — see ESTIMATED_OBSERVATION_RADIUS docs):
@@ -785,6 +914,14 @@ private:
     mp2p_icp_filters::GeneratorSet local_map_generators;
     mp2p_icp::metric_map_t::Ptr local_map = mp2p_icp::metric_map_t::Create();
     mp2p_icp_filters::FilterPipeline obs2map_merge;
+
+    /// Set to true whenever a preexisting map is loaded into local_map /
+    /// reconstructed_simplemap, either at start-up (doPreloadLocalMap()) or
+    /// via a runtime map_load() service call. Used to avoid discarding an
+    /// inherited map (multisession/multi-robot mapping) on later events that
+    /// would otherwise assume a brand new, empty map (e.g. IMU-based initial
+    /// re-localization).
+    bool map_has_been_loaded = false;
 
     // fallback only for when not using IMU and optimize_twist is enabled:
     mp2p_icp_filters::FilterPipeline obsDeskewForViz;
@@ -874,12 +1011,39 @@ private:
 
   };  // end of MethodState
 
-  /** The worker thread pool with 1 thread for processing incoming observations*/
+  /** The worker thread pool with 1 thread for processing incoming observations.
+   *  Uses POLICY_DROP_OLD: when a new scan is enqueued while one is already
+   *  waiting (the worker thread being busy with a previous one), the pool
+   *  itself discards the older, not-yet-started scan, so the worker always
+   *  resumes on the freshest available one instead of grinding through a deep
+   *  backlog ("drop stale, keep freshest"). Running tasks are never aborted. */
   mrpt::WorkerThreadsPool worker_lidar_{
-    1 /*num threads*/, mrpt::WorkerThreadsPool::POLICY_FIFO, "worker_lidar"};
+    1 /*num threads*/, mrpt::WorkerThreadsPool::POLICY_DROP_OLD, "worker_lidar"};
 
   std::multimap<double /*timestamp*/, CObservation::ConstPtr> worker_lidar_wait_for_imu_list_;
   std::mutex worker_lidar_wait_for_imu_list_mtx_;
+
+  /// Timestamp (seconds, sensor clock) up to which IMU data has actually been
+  /// *fed* into the de-skew LocalVelocityBuffer (updated at the end of the IMU
+  /// feeding in onIMUImpl). A waiting scan may only be released to the worker
+  /// once this passes its own timestamp by one scan period, i.e. once the IMU
+  /// covering the scan's whole span is available for de-skew. Kept as an atomic
+  /// so the wait-list can be drained (see releaseReadyLidarScansToWorker) from
+  /// the sensor-input thread too, without waiting for the (FIFO, possibly
+  /// backed-up) IMU worker to run its own drain -- decoupling scan release from
+  /// IMU-processing latency.
+  std::atomic<double> latest_fed_imu_time_{0};
+
+  /// Cached estimate of the LiDAR scan period [s], read lock-free by
+  /// releaseReadyLidarScansToWorker(). Estimated from consecutive scan *arrival*
+  /// (sensor) timestamps rather than the processed-scan rate: under heavy
+  /// dropping the processed rate collapses, which would otherwise inflate this
+  /// period and make scans wait for far more IMU than they actually need,
+  /// needlessly deepening the wait list.
+  std::atomic<double> lidar_scan_period_{0.1};
+  /// Sensor timestamp [s] of the previous LiDAR scan seen at input, for the
+  /// arrival-based period estimate above. Guarded by the wait-list mutex.
+  double last_lidar_arrival_stamp_ = 0;
 
   /** The worker thread pool with 1 thread for processing incoming observations*/
   mrpt::WorkerThreadsPool worker_others_{
@@ -890,11 +1054,23 @@ private:
     1 /*num threads*/, mrpt::WorkerThreadsPool::POLICY_FIFO, "worker_disk"};
 
   /** Runs colorization tasks for clouds to be shown in the gui */
-  mrpt::WorkerThreadsPool worker_viz_{2, mrpt::WorkerThreadsPool::POLICY_DROP_OLD, "worker_viz"};
+  // Single thread: POLICY_DROP_OLD skips stale frames while 1 thread ensures
+  // serial ordering so a newer clear cannot be overwritten by an older frame's lambda.
+  mrpt::WorkerThreadsPool worker_viz_{1, mrpt::WorkerThreadsPool::POLICY_DROP_OLD, "worker_viz"};
 
   MethodState state_;
   const MethodState & state() const { return state_; }
   MethodState stateCopy() const { return state_; }
+
+#ifdef MOLA_KERNEL_VIZ_HAS_METRICS
+  /** Metric plot channels (mola_viz_imgui "Plots" menu); lazily registered
+   *  from the first onLidarImpl() call, once visualizer_ is available.
+   *  Guarded by the feature macro so this module still builds against an
+   *  older mola_kernel that predates register_metric()/push_metric(). */
+  MetricChannel::Ptr metric_icp_time_ms_;
+  MetricChannel::Ptr metric_icp_goodness_;
+  MetricChannel::Ptr metric_onlidar_time_ms_;
+#endif
 
   // Accessing this struct in gui_ requires acquiring state_gui_mtx_
   struct StateUI
@@ -904,7 +1080,6 @@ private:
     double timestampLastUpdateUI = 0;
     bool was_waiting_for_lidar_data = true;
 
-#if MOLA_VERSION_CHECK(2, 6, 0)
     bool gui_created = false;
     mola::gui::LiveString::Ptr lbIcpQuality;
     mola::gui::LiveString::Ptr lbSensorRates;
@@ -913,19 +1088,6 @@ private:
     mola::gui::LiveString::Ptr lbSpeed;
     mola::gui::LiveString::Ptr lbLidarQueue;
     mola::gui::LiveString::Ptr lbMapStats;
-#else
-    nanogui::Window * ui = nullptr;
-    nanogui::Label * lbIcpQuality = nullptr;
-    nanogui::Label * lbSensorRates = nullptr;
-    nanogui::Label * lbSensorRange = nullptr;
-    nanogui::Label * lbTime = nullptr;
-    nanogui::Label * lbSpeed = nullptr;
-    nanogui::Label * lbLidarQueue = nullptr;
-    nanogui::Label * lbMapStats = nullptr;
-    nanogui::CheckBox * cbActive = nullptr;
-    nanogui::CheckBox * cbMapping = nullptr;
-    nanogui::CheckBox * cbSaveSimplemap = nullptr;
-#endif
   };
 
   // Accessing this struct in gui_ requires acquiring state_gui_mtx_
@@ -936,8 +1098,10 @@ private:
 
   bool destructor_called_ = false;
   mutable std::mutex is_busy_mtx_;
+  /// Guards MethodState::drop_frames_stats_* (see addDropStats()/getDropStats()).
+  mutable std::mutex drop_stats_mtx_;
   mutable std::mutex state_flags_mtx_;
-  mutable std::recursive_mutex state_mtx_;
+  mutable std::mutex state_mtx_;
   mutable std::mutex state_trajectory_mtx_;
   mutable std::recursive_mutex state_simplemap_mtx_;
   mutable std::mutex state_gui_mtx_;
@@ -958,7 +1122,7 @@ private:
   MapServer::ReturnStatus map_load_impl(const std::string & path);
   MapServer::ReturnStatus map_save_impl(const std::string & path);
 
-  /// Must be called from a scope with state_flags_mtx_ already acquired!
+  /// Locks drop_stats_mtx_ internally to update the drop-stats window.
   void addDropStats(bool frame_is_dropped);
 
   /// Returns the ratio [0,1] of lidar frames dropped due to slow processing in the last few seconds.
@@ -967,7 +1131,11 @@ private:
   // Process requests_(), at the spinOnce() rate.
   void processPendingUserRequests();
 
-  void onLidar(const CObservation::ConstPtr & o);
+  /// `readyTimestamp` is when the scan became ready for processing (used to
+  /// report the "delay_onNewObs_to_process" queueing-delay metric); it cannot
+  /// be measured via profiler_.enter()/leave() here since worker_lidar_'s
+  /// POLICY_DROP_OLD may discard a queued scan before it ever runs onLidar().
+  void onLidar(const CObservation::ConstPtr & o, double readyTimestamp);
   void processLidarScan(const CObservation::ConstPtr & obs);
 
   void onIMU(const CObservation::ConstPtr & o);
@@ -976,8 +1144,8 @@ private:
   void onGPS(const CObservation::ConstPtr & o);
   void onGPSImpl(const CObservation::ConstPtr & o);
 
-  // KISS-ICP adaptive threshold method:
-  void doUpdateAdaptiveThreshold(const mrpt::poses::CPose3D & lastMotionModelError);
+  // Adaptive threshold method:
+  void doUpdateAdaptiveThreshold();
 
   void doInitializeEstimatedObservationRadius(const mrpt::obs::CObservation & o);
   void doUpdateEstimatedObservationRadius(const mp2p_icp::metric_map_t & m);
@@ -999,15 +1167,21 @@ private:
     const mrpt::maps::CPointsMap::Ptr & deskewedCloud);
   void updateVisualizationLocalMap(std::vector<std::function<void()>> & updateTasks);
   void updateVisualizationPath(std::vector<std::function<void()>> & updateTasks);
+  void updateVisualizationGravityVector(std::vector<std::function<void()>> & updateTasks);
   void updateVisualizationTextLabels();
+  void updateVisualizationAlways();
 
-#if MOLA_VERSION_CHECK(2, 6, 0)
   void internalBuildGUI();
-#else
-  void internalBuildGUI_Legacy();
-#endif
+  mola::gui::Tab buildTabStatus();
+  mola::gui::Tab buildTabControl();
+  mola::gui::Tab buildTabView();
 
   void doRemoveCloudsWithDecay();
+
+  /// Movable scene-frame name to draw 3D objects under (see
+  /// Visualization::render_in_movable_frame). Empty => draw at the viewport
+  /// root (standalone / older mola_kernel).
+  [[nodiscard]] std::string vizParentFrame() const;
 
   void onExternalMapUpdate(const MapSourceBase::MapUpdate & mu);
   void onExternalLocalizationUpdate(const LocalizationSourceBase::LocalizationUpdate & lu);
@@ -1037,16 +1211,58 @@ private:
     const mrpt::poses::CPose3DPDFGaussian & initPose, bool resetStateEstimator);
 
   bool isPipelineUsingIMU() const;
+  /// Same as isPipelineUsingIMU(), but assumes state_mtx_ is already held by the caller.
+  bool isPipelineUsingIMU_locked() const;
   void sendLidarScanToProcessQueue(const CObservation::ConstPtr & o);
+
+  /** Hands a LiDAR scan that is ready for processing (i.e. already has the IMU
+   *  data it needs for de-skew, when applicable) to the single worker thread.
+   *  worker_lidar_'s POLICY_DROP_OLD implements the "drop stale, keep freshest"
+   *  policy itself: if the worker is idle the scan starts right away; if it is
+   *  busy, this call replaces any older not-yet-started scan still queued
+   *  behind it. This method only adds the drop-stats bookkeeping the pool
+   *  itself doesn't provide. Safe to call from any thread. */
+  void submitReadyLidarScanToWorker(const CObservation::ConstPtr & o);
+  /// Number of LiDAR scans currently running or queued on worker_lidar_ (0, 1, or 2).
+  int pendingLidarScanCount() const;
+
+  /** Releases to the worker every LiDAR scan on worker_lidar_wait_for_imu_list_
+   *  whose whole time span is already covered by IMU data fed into the de-skew
+   *  buffer (i.e. latest_fed_imu_time_ is more than one scan period past the
+   *  scan timestamp). On an IMU catch-up burst several scans can qualify at
+   *  once; only the freshest is submitted (the pool would drop the rest anyway).
+   *  Takes no heavy locks (only the wait-list mutex + atomics), so it can run on
+   *  the sensor-input thread while onLidar holds state_mtx_; this decouples scan
+   *  release from IMU-worker processing latency. No-op for LO (empty wait list). */
+  void releaseReadyLidarScansToWorker();
   mp2p_icp::metric_map_t::Ptr observationFromRawSensor(const mrpt::obs::CSensoryFrame & sf);
   mrpt::obs::CSensoryFrame collectRawObservations(const mrpt::obs::CObservation::ConstPtr & obs);
 
   void onInitializePersistentState();
 
+  /** Loads the local map (and optional simplemap) from the paths stored in
+   *  params_.local_map_updates.load_existing_local_map and
+   *  params_.simplemap.load_existing_simple_map.
+   *  Safe to call from initialize_frontend() (startup) or from spinOnce()
+   *  (deferred). Acquires its own locks internally.
+   */
+  void doPreloadLocalMap();
+
+  /// True when map loading has been deferred to spinOnce() via load_map_after_gui_init.
+  bool pending_preload_map_ = false;
+
   void doUpdateSimpleMap(
     const mrpt::obs::CSensoryFrame & sf, bool distance_enough_sm,
     const mp2p_icp::metric_map_t::Ptr & observation, const mrpt::Clock::time_point & scan_ref_time,
     const mrpt::maps::CPointsMap::Ptr & deskewedCloud);
+
+  /** Appends a "metadata" CObservationComment (frame bbox + the local velocity
+   *  buffer needed for precise later deskew) to a keyframe's sensory frame.
+   *  Shared by the self-built simplemap and the shared-keyframe-map push so both
+   *  carry the same per-keyframe velocity window. */
+  void appendKeyframeMetadataObs(
+    mrpt::obs::CSensoryFrame & keyframe_obs, const mrpt::Clock::time_point & scan_ref_time,
+    const mp2p_icp::metric_map_t & observation);
 };
 
 namespace detail

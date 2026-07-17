@@ -278,7 +278,8 @@ def generate_launch_description():
     #     diagnostic_aggregator (the common production case). In that case
     #     just include "LidarOdometry" (or the relevant startswith/contains
     #     pattern) in your central aggregator YAML.
-    use_diagnostic_aggregator = LaunchConfiguration('use_diagnostic_aggregator')
+    use_diagnostic_aggregator = LaunchConfiguration(
+        'use_diagnostic_aggregator')
     use_diagnostic_aggregator_arg = DeclareLaunchArgument(
         "use_diagnostic_aggregator", default_value="False",
         description=(
@@ -400,10 +401,33 @@ def generate_launch_description():
                     "If empty (default), the pipeline YAML fallback is used (FixedPose) and `gnss_mode:=relocalize` may switch it to FromStateEstimator.")
 
     def _apply_initial_localization_method(context, *args, **kwargs):
-        v = LaunchConfiguration('initial_localization_method').perform(context).strip()
+        v = LaunchConfiguration(
+            'initial_localization_method').perform(context).strip()
         return [SetEnvironmentVariable(name='MOLA_LO_INITIAL_LOCALIZATION_METHOD', value=v)] if v else []
     initial_localization_method_env_var = OpaqueFunction(
         function=_apply_initial_localization_method)
+
+    initial_pose_arg = DeclareLaunchArgument(
+        "initial_pose", default_value="",
+        description="Known initial pose for InitLocalization::FixedPose, as "
+                    "\"[x, y, z, yaw_deg, pitch_deg, roll_deg]\" in the loaded map's frame "
+                    "(mirrors `mola_footprint_to_base_link_tf`'s format). If empty (default), "
+                    "the pipeline YAML fallback is used (identity/origin, via MOLA_INITIAL_X/Y/Z/"
+                    "YAW/PITCH/ROLL, see pipelines/lidar3d-default.yaml).")
+
+    def _apply_initial_pose(context, *args, **kwargs):
+        v = LaunchConfiguration('initial_pose').perform(context).strip()
+        if not v:
+            return []
+        components = [c.strip() for c in v.strip('[]').split(',')]
+        if len(components) != 6:
+            raise RuntimeError(
+                "\n\n[ERROR] initial_pose must have exactly 6 comma-separated "
+                f"components \"[x, y, z, yaw_deg, pitch_deg, roll_deg]\", got: {v!r}\n")
+        names = ['MOLA_INITIAL_X', 'MOLA_INITIAL_Y', 'MOLA_INITIAL_Z',
+                 'MOLA_INITIAL_YAW', 'MOLA_INITIAL_PITCH', 'MOLA_INITIAL_ROLL']
+        return [SetEnvironmentVariable(name=n, value=c) for n, c in zip(names, components)]
+    initial_pose_env_var = OpaqueFunction(function=_apply_initial_pose)
 
     use_state_estimator_arg = DeclareLaunchArgument(
         "use_state_estimator", default_value="False",
@@ -422,7 +446,8 @@ def generate_launch_description():
     def _apply_estimate_geo_ref(context, *args, **kwargs):
         if LaunchConfiguration('use_state_estimator').perform(context).lower() != 'true':
             return []
-        v = LaunchConfiguration('estimate_geo_reference').perform(context).strip()
+        v = LaunchConfiguration(
+            'estimate_geo_reference').perform(context).strip()
         return [SetEnvironmentVariable(name='MOLA_ESTIMATE_GEO_REF', value=v)] if v else []
 
     # Environment variables that only apply if the smoother is active
@@ -449,17 +474,27 @@ def generate_launch_description():
             " else 'mola::state_estimation_simple::StateEstimationSimple'"
         ]))
 
+    # NOTE: 'state_estimation' (not 'state_estimator') must match the
+    # module *instance name* the state estimator is registered under in
+    # mola-cli-launchs/lidar_odometry_ros2.yaml ("- name: state_estimation"),
+    # since that's what ends up in each LocalizationUpdate/MapUpdate's
+    # `.method` field (StateEstimationSmoother::spinOnce() and
+    # ::publish_georef(), via getModuleInstanceName()'s colon-suffix) and is
+    # therefore what publish_tf_from_slam_source/
+    # publish_odometry_msgs_from_slam_source filter against. A mismatch here
+    # silently discards every update from the state estimator: no /tf, no
+    # odometry topic, ever, regardless of how well localization converged.
     localization_publish_tf_source_env_var = SetEnvironmentVariable(
         name='MOLA_LOCALIZATION_PUBLISH_TF_SOURCE',
         value=PythonExpression([
-            "'state_estimator' if ", LaunchConfiguration(
+            "'state_estimation' if ", LaunchConfiguration(
                 'use_state_estimator'), " else 'lidar_odometry'"
         ])
     )
     localization_publish_odom_source_env_var = SetEnvironmentVariable(
         name='MOLA_LOCALIZATION_PUBLISH_ODOM_MSGS_SOURCE',
         value=PythonExpression([
-            "'state_estimator' if ", LaunchConfiguration(
+            "'state_estimation' if ", LaunchConfiguration(
                 'use_state_estimator'), " else 'lidar_odometry'"
         ])
     )
@@ -531,6 +566,7 @@ def generate_launch_description():
     # ---------------------------------------------------
     namespace = LaunchConfiguration('namespace')
     use_namespace = LaunchConfiguration('use_namespace')
+    use_namespaced_tf = LaunchConfiguration('use_namespaced_tf')
 
     declare_namespace_cmd = DeclareLaunchArgument(
         'namespace',
@@ -540,7 +576,18 @@ def generate_launch_description():
     declare_use_namespace_cmd = DeclareLaunchArgument(
         'use_namespace',
         default_value='false',
-        description='Whether to apply a namespace to the navigation stack')
+        description='Whether to apply a namespace to the MOLA stack')
+
+    declare_use_namespaced_tf_cmd = DeclareLaunchArgument(
+        'use_namespaced_tf',
+        default_value='true',
+        description='Whether to apply a namespace to /tf and /tf_static when "use_namespace" is True. Default: true. Set to false to keep reading /tf and /tf_static despite having namespaced sensor topics')
+
+    use_sim_time = LaunchConfiguration('use_sim_time')
+    declare_use_sim_time_cmd = DeclareLaunchArgument(
+        'use_sim_time',
+        default_value='false',
+        description='Use simulation (bag) clock if true')
 
     # Map fully qualified names to relative ones so the node's namespace can be prepended.
     # In case of the transforms (tf), currently, there doesn't seem to be a better alternative
@@ -550,6 +597,10 @@ def generate_launch_description():
     # (JLBC further explanation) The problem is the "tf2" library. It's hardcoded to subscribe
     # to "/tf". This remapping allows "/robot/tf" to be seen as "/tf" so tf2_ros (and RViz) can see it.
     #
+    # tf remapping is applied ONLY when use_namespace=true AND use_namespaced_tf is not
+    # explicitly false. The use_namespaced_tf=false escape hatch covers the common rosbag
+    # case where sensor topics carry a namespace (e.g. /robot/points) but /tf was recorded
+    # without one; so the nodes must subscribe to the global /tf, not /robot/tf.
     tf_remaps = [('/tf', 'tf'),
                  ('/tf_static', 'tf_static')]
 
@@ -561,45 +612,65 @@ def generate_launch_description():
     # -------------------
     #        Node
     # -------------------
-    node_group = GroupAction([
-        PushRosNamespace(
-            condition=IfCondition(use_namespace),
-            namespace=namespace),
+    def make_node_group(context, *args, **kwargs):
+        _use_namespace = LaunchConfiguration(
+            'use_namespace').perform(context).lower() == 'true'
+        _use_namespaced_tf = LaunchConfiguration(
+            'use_namespaced_tf').perform(context).lower()
 
-        Node(
-            package='mola_launcher',
-            executable='mola-cli',
-            output='screen',
-            remappings=tf_remaps,
-            arguments=[mola_system_yaml_file],
-            on_exit=Shutdown()
-        ),
+        # Apply tf remapping only when the namespace is active AND the user
+        # has not explicitly opted out with use_namespaced_tf:=false.
+        apply_tf_remap = _use_namespace and (_use_namespaced_tf != 'false')
+        active_tf_remaps = tf_remaps if apply_tf_remap else []
 
-        Node(
-            condition=IfCondition(use_rviz),
-            package='rviz2',
-            executable='rviz2',
-            name='rviz2',
-            remappings=tf_remaps,
-            arguments=[
-                '-d', [os.path.join(myDir, 'rviz2', 'lidar-odometry.rviz')]]
-        ),
+        return [GroupAction([
+            PushRosNamespace(
+                condition=IfCondition(use_namespace),
+                namespace=namespace),
 
-        # Optional standalone diagnostic_aggregator (see flag docs above).
-        Node(
-            condition=IfCondition(use_diagnostic_aggregator),
-            package='diagnostic_aggregator',
-            executable='aggregator_node',
-            name='diagnostic_aggregator',
-            parameters=[os.path.join(
-                get_package_share_directory('mola_lidar_odometry'),
-                'config', 'diagnostics_aggregator.yaml')],
-        )
-    ])
+            Node(
+                package='mola_launcher',
+                executable='mola-cli',
+                output='screen',
+                remappings=active_tf_remaps,
+                arguments=[mola_system_yaml_file],
+                parameters=[{'use_sim_time': use_sim_time}],
+                on_exit=Shutdown()
+            ),
+
+            Node(
+                condition=IfCondition(use_rviz),
+                package='rviz2',
+                executable='rviz2',
+                name='rviz2',
+                remappings=active_tf_remaps,
+                parameters=[{'use_sim_time': use_sim_time}],
+                arguments=[
+                    '-d', [os.path.join(myDir, 'rviz2', 'lidar-odometry.rviz')]]
+            ),
+
+            # Optional standalone diagnostic_aggregator (see flag docs above).
+            Node(
+                condition=IfCondition(use_diagnostic_aggregator),
+                package='diagnostic_aggregator',
+                executable='aggregator_node',
+                name='diagnostic_aggregator',
+                parameters=[
+                    os.path.join(
+                        get_package_share_directory('mola_lidar_odometry'),
+                        'config', 'diagnostics_aggregator.yaml'),
+                    {'use_sim_time': use_sim_time},
+                ],
+            )
+        ])]
+
+    node_group = OpaqueFunction(function=make_node_group)
 
     return LaunchDescription([
         declare_namespace_cmd,
         declare_use_namespace_cmd,
+        declare_use_namespaced_tf_cmd,
+        declare_use_sim_time_cmd,
         enforce_planar_motion_arg,
         enforce_planar_motion_env_var,
         forward_ros_tf_odom_to_mola_arg,
@@ -630,6 +701,8 @@ def generate_launch_description():
         lidar_qos_depth_env_var,
         initial_localization_method_arg,
         initial_localization_method_env_var,
+        initial_pose_arg,
+        initial_pose_env_var,
         lidar_scan_validity_enable_env_var,
         lidar_scan_validity_minimum_point_count_arg,
         lidar_scan_validity_minimum_point_env_var,
