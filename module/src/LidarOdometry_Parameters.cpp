@@ -25,9 +25,6 @@
 // MOLA:
 #include <mola_yaml/yaml_helpers.h>
 
-// MRPT:
-#include <mrpt/gui/CDisplayWindowGUI.h>  // for nanogui controls
-
 namespace mola
 {
 
@@ -91,6 +88,7 @@ void LidarOdometry::Parameters::AdaptiveThreshold::initialize(const Yaml & cfg)
   YAML_LOAD_REQ(alpha, double);
   YAML_LOAD_OPT(maximum_sigma, double);
   YAML_LOAD_OPT(icp_quality_controller_setpoint, double);
+  YAML_LOAD_OPT(max_sigma_step, double);
 
   YAML_LOAD_OPT(recover_on_sustained_failure, bool);
   YAML_LOAD_OPT(recover_after_n_bad, int);
@@ -149,6 +147,7 @@ void LidarOdometry::Parameters::Visualization::initialize(const Yaml & cfg)
   YAML_LOAD_OPT(camera_rotates_with_vehicle, bool);
   YAML_LOAD_OPT(camera_orthographic, bool);
   YAML_LOAD_OPT(show_gravity_align_vector, bool);
+  YAML_LOAD_OPT(render_in_movable_frame, bool);
 
   initializeModelPart(cfg);
 }
@@ -238,6 +237,8 @@ void LidarOdometry::Parameters::MapUpdateOptions::initialize(const Yaml & cfg, P
                                       static_cast<unsigned>(min_nearby_poses_occupied)));
   YAML_LOAD_OPT(load_existing_local_map, std::string);
   YAML_LOAD_OPT(save_final_local_map, std::string);
+
+  YAML_LOAD_OPT(load_map_after_gui_init, bool);
 }
 
 void LidarOdometry::Parameters::TrajectoryOutputOptions::initialize(const Yaml & cfg)
@@ -257,6 +258,7 @@ void LidarOdometry::Parameters::InitialLocalizationOptions::initialize(const Yam
   MCP_LOAD_OPT(cfg, method);
 
   YAML_LOAD_OPT(additional_uncertainty_after_reloc_how_many_timesteps, uint32_t);
+  YAML_LOAD_OPT(additional_map_freeze_after_reloc_how_many_timesteps, uint32_t);
   YAML_LOAD_OPT(imu_initial_calibration_sample_count, uint32_t);
   YAML_LOAD_OPT(imu_initial_calibration_max_age, double);
   YAML_LOAD_OPT(use_imu_orientation, bool);
@@ -294,10 +296,10 @@ void LidarOdometry::Parameters::IMUGravityCorrection::initialize(const Yaml & cf
 
   if (enabled) {
     ASSERTMSG_(
-      averaging_samples >= 1 && averaging_samples <= 200,
+      averaging_samples >= 1 && averaging_samples < IMU_BUFFER_SIZE,
       mrpt::format(
-        "imu_gravity_correction.averaging_samples=%u is out of valid range [1, 200]",
-        static_cast<unsigned>(averaging_samples)));
+        "imu_gravity_correction.averaging_samples=%u is out of valid range [1, %zu]",
+        static_cast<unsigned>(averaging_samples), IMU_BUFFER_SIZE));
 
     ASSERTMSG_(
       sigma_deg > 0, mrpt::format("imu_gravity_correction.sigma_deg=%.4f must be > 0", sigma_deg));
