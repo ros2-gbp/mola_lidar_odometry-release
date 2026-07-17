@@ -410,10 +410,6 @@ General options
 - ``MOLA_MINIMUM_ICP_QUALITY`` (Default: ``0.50``): Minimum quality (from ``mp2p_icp`` quality evaluators), in the
   range [0, 1], to consider an ICP optimization valid.
 
-- ``MOLA_WRITE_DEBUG_ICP_LOG_IF_QUALITY_UNDER`` (Default: none): If set to a value in [0, 1], ``.icplog`` debug files
-  are saved whenever ICP quality drops below that threshold, independently of ``MP2P_ICP_GENERATE_DEBUG_FILES``.
-  Useful for targeted debugging of bad frames without enabling full logging.
-
 - ``MOLA_START_ACTIVE`` (Default: ``true``): If set to ``false``, the odometry pipeline will ignore incoming observations
   until active is set to ``true`` (e.g. via the GUI).
 
@@ -473,6 +469,17 @@ Local map update
 - ``MOLA_MIN_NEARBY_POSES_OCCUPIED`` (Default: ``1``): Minimum number of nearby local-map poses that must be occupied
   before a new keyframe is accepted into the map.
 
+  .. note::
+
+     **Non-repetitive / solid-state LiDARs (e.g. Livox AVIA)**: a single scan does not cover the full
+     field of view uniformly. Set this to ``2`` or higher so that multiple frames are accumulated from
+     each location before the robot moves on, producing denser local-map coverage.
+     For spinning LiDARs (Velodyne, Ouster, ...) the default of ``1`` is correct.
+
+- ``MOLA_SIMPLEMAP_MIN_NEARBY_POSES`` (Default: ``1``): Same criterion, applied to the simplemap keyframe
+  insertion instead of the local map.
+  Set to ``2+`` for non-repetitive LiDARs for the same reason as ``MOLA_MIN_NEARBY_POSES_OCCUPIED`` above.
+
 - ``MOLA_PUBLISH_LOCAL_MAP_UPDATES_EVERY_N`` (Default: ``40`` in GICP, ``5`` in NDT): Publish local map visualization
   updates every N ICP iterations.
 
@@ -508,6 +515,13 @@ ICP settings
 
 - ``MOLA_LO_ROBUST_KERNEL_PARAM`` (Default: ``6.0``): Parameter for the robust kernel (scale; in normalized
   covariance units for the GICP pipeline).
+
+- ``MOLA_LO_ROBUST_KERNEL_PRIOR_REF_BLEND`` (Default: ``0.0``): Blend factor in [0, 1] for the residual
+  reference used by the robust kernel in the Gauss-Newton solver. ``0.0`` (default) keeps the classic
+  behavior, where each factor is judged only by how much it diverges from the current linearization point.
+  With values ``>0`` the kernel residual is blended toward the value predicted at the prior mean pose
+  (e.g. the motion model / IMU prior), so correspondences inconsistent with the prior are down-weighted even
+  when the current iterate is already corrupted. Has no effect when no prior is supplied to ICP.
 
 - ``MOLA_ICP_COVARIANCE_METHOD`` (Default: ``Censi3D``; GICP pipeline only): Post-optimization SE(3) covariance
   estimation method. ``Censi3D`` is the sandwich estimator suited for cov-to-cov pipelines.
@@ -603,7 +617,7 @@ Initial localization
   initial pose at startup. Options:
 
   - ``InitLocalization::FixedPose``: Use a fixed pose defined by ``MOLA_INITIAL_*`` below.
-  - ``InitLocalization::IMUCalibration``: Collect IMU samples to determine initial orientation.
+  - ``InitLocalization::PitchAndRollFromIMU``: Collect IMU samples to determine initial orientation.
   - ``InitLocalization::FromStateEstimator``: Wait for an external state estimator to converge.
 
 - ``MOLA_INITIAL_X``, ``MOLA_INITIAL_Y``, ``MOLA_INITIAL_Z`` (Default: ``0.0`` [m]): Initial position when using
@@ -613,7 +627,7 @@ Initial localization
   when using ``InitLocalization::FixedPose``.
 
 - ``MOLA_LO_INITIAL_IMU_SAMPLES`` (Default: ``400``): Number of IMU samples to collect for initial orientation
-  calibration when using ``InitLocalization::IMUCalibration``.
+  calibration when using ``InitLocalization::PitchAndRollFromIMU``.
 
 - ``MOLA_LO_INITIAL_IMU_USE_ORIENTATION`` (Default: ``true``): Whether to use the IMU orientation quaternion (if
   provided by the driver) directly, instead of computing orientation from accelerometer readings.
@@ -681,6 +695,10 @@ ICP log files
   into a subdirectory ``icp-logs`` under the current directory. Those logs can be analyzed
   with the GUI tool: :ref:`icp-log-viewer <app_icp-log-viewer>`.
 
+- ``MOLA_WRITE_DEBUG_ICP_LOG_IF_QUALITY_UNDER`` (Default: none): If set to a value in [0, 1], ``.icplog`` debug files
+  are saved whenever ICP quality drops below that threshold, independently of ``MP2P_ICP_GENERATE_DEBUG_FILES``.
+  Useful for targeted debugging of bad frames without enabling full logging.
+
 .. note::
 
    Enabling ICP log files is the most powerful tool to **debug mapping or localization** issues or to understand what
@@ -694,6 +712,12 @@ If ``MP2P_ICP_GENERATE_DEBUG_FILES`` is not enabled, the rest of parameters that
   optimization steps are also stored in the ICP logs. Great to learn how ICP actually works, but increases log file sizes.
 - ``MP2P_ICP_LOG_FILES_SAVE_DETAILS_DECIMATION`` (Default: ``3``): If ``MP2P_ICP_LOG_FILES_SAVE_DETAILS`` is enabled,
   how many ICP internal iterations to drop for each saved one.
+- ``MOLA_DEBUG_DUMP_ICP_LOG_FROM_TIMESTAMP`` (Default: ``0``, disabled): If set to a non-zero value together with
+  ``MOLA_DEBUG_DUMP_ICP_LOG_TO_TIMESTAMP``, ICP log files are saved for all ICP runs whose timestamp falls within
+  the ``[FROM, TO]`` range (in seconds, as Unix epoch or dataset time). Useful to capture a specific time window
+  without enabling full logging.
+- ``MOLA_DEBUG_DUMP_ICP_LOG_TO_TIMESTAMP`` (Default: ``0``, disabled): Upper bound of the timestamp range for
+  selective ICP log dumping. Must be set together with ``MOLA_DEBUG_DUMP_ICP_LOG_FROM_TIMESTAMP``.
 
 
 Trace debug files
