@@ -41,7 +41,7 @@ programs, except ``mola-lidar-odometry-cli`` which is explicitly design not to h
 The labeled parts in the GUI are:
 
 1. The **main space** of the "main" GUI window: used to render the latest 3D local map, together with the incoming raw scan,
-   the 3D vehicle model (if provided), etc. Use the `same mouse and keyboard shortcuts <https://docs.mrpt.org/reference/latest/tutorial-3d-navigation-cheatsheet.html>`_
+   the 3D vehicle model (if provided), etc. Use the `same mouse and keyboard shortcuts <https://docs.mrpt.org/reference/stable/tutorial-3d-navigation-cheatsheet.html>`_
    than in any MRPT 3D window to rotate the view, pan and zoom, etc. The rest of small windows floating in this large windows are
    dubbed **"subwindows"**.
 2. **Dataset source UI**: All dataset sources (offline datasets, rawlog, rosbag2, etc.) offer a common API that can be operated
@@ -54,6 +54,47 @@ The labeled parts in the GUI are:
 6. **mola_lidar_odometry module own UI**: Direct access to the internals of the LO module. There are tabs providing direct access
    to variables that :ref:`normally can be set via environment variables <pipelines_env_vars>`, to make it easier to record a simple-maps directly from the GUI.
 7. **Log messages** with priority higher than ``INFO`` will be dumped to both, the terminal, and to this scrolling transparent terminal at the bottom.
+
+|
+
+.. _mola_lo_gui_visualizer_selection:
+
+Choosing a visualizer module
+---------------------------------
+MOLA provides two alternative visualizer modules, both allowing MRPT's OpenGL rendering,
+that can be used with all GUI applications:
+
+- **MolaVizImGui** (``mola_viz_imgui``): The most recent and modern visualizer built on Dear ImGui (default).
+- **MolaViz** (``mola_viz``): An older visualizer, based on nanogui.
+
+.. list-table::
+   :widths: 50 50
+   :header-rows: 1
+
+   * - MolaViz (default)
+     - MolaVizImGui
+   * - .. image:: https://mrpt.github.io/imgs/screenshot_molaviz_imgui.png
+          :alt: MolaVizImGui GUI screenshot
+          :width: 100%
+     - .. image:: https://mrpt.github.io/imgs/screenshot_molaviz.png
+          :alt: MolaViz GUI screenshot
+          :width: 100%
+
+To switch between them, set the ``MOLA_GUI_MODULE`` environment variable before launching
+any of the GUI applications:
+
+.. code-block:: bash
+
+   # Explicitly select MolaViz (nanogui-based):
+   MOLA_GUI_MODULE=mola::MolaViz mola-lo-gui-rosbag2 /path/to/your/dataset.mcap
+
+   # Select the alternative MolaVizImGui (Dear ImGui-based):
+   MOLA_GUI_MODULE=mola::MolaVizImGui mola-lo-gui-rosbag2 /path/to/your/dataset.mcap
+
+.. note::
+
+   ``MolaViz`` is the current default. ``MolaVizImGui`` is under active development
+   and may become the default in a future release once it reaches full feature parity.
 
 |
 
@@ -296,7 +337,7 @@ and used to generate metric maps using :ref:`sm2mm <app_sm2mm>`.
 
     We recommend using `evo <https://github.com/MichaelGrupp/evo>`_ to visualize
     and compare the output TUM trajectories. You can also use
-    `mrpt::poses::CPose3DInterpolator <https://docs.mrpt.org/reference/latest/class_mrpt_poses_CPose3DInterpolator.html>`_
+    `mrpt::poses::CPose3DInterpolator <https://docs.mrpt.org/reference/stable/class_mrpt_poses_CPose3DInterpolator.html>`_
     to load and parse TUM files in C++, or its Python wrapped version within ``pymrpt``.
 
 
@@ -310,6 +351,7 @@ Process a ROS 2 bag
 
         mola-lidar-odometry-cli \
           -c $(ros2 pkg prefix mola_lidar_odometry)/share/mola_lidar_odometry/pipelines/lidar3d-default.yaml \
+          --state-estimator-param-file $(ros2 pkg prefix mola_lidar_odometry)/share/mola_lidar_odometry/state-estimator-params/state-estimation-simple.yaml \
           --input-rosbag2 /PATH/TO/YOUR/rosbag.mcap \
           --lidar-sensor-label /ouster/points \
           --output-tum-path trajectory.tum \
@@ -374,6 +416,7 @@ Then, set the ``KITTI_BASE_DIR`` environment variable and launch the desired seq
 
         mola-lidar-odometry-cli \
           -c $(ros2 pkg prefix mola_lidar_odometry)/share/mola_lidar_odometry/pipelines/lidar3d-default.yaml \
+          --state-estimator-param-file $(ros2 pkg prefix mola_lidar_odometry)/share/mola_lidar_odometry/state-estimator-params/state-estimation-simple.yaml \
           --input-kitti-seq 00 \
           --output-tum-path kitti-00.tum
 
