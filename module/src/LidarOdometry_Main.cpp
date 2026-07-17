@@ -44,9 +44,6 @@
 #include <mrpt/system/string_utils.h>
 #include <mrpt/topography/conversions.h>
 
-// GUI:
-#include <mrpt/gui/CDisplayWindowGUI.h>
-
 // STD:
 #include <chrono>
 #include <thread>
@@ -74,11 +71,33 @@ IMPLEMENTS_MRPT_OBJECT(LidarOdometry, FrontEndBase, mola)
 
 LidarOdometry::LidarOdometry() = default;
 
-LidarOdometry::~LidarOdometry()
+LidarOdometry::~LidarOdometry() { shutdownCleanup(); }
+
+void LidarOdometry::onQuit() { shutdownCleanup(); }
+
+// Drains the worker thread pools and saves outputs to disk. Called from
+// onQuit() (while all other MOLA modules are still alive) and again from the
+// destructor (idempotent, no-op the second time) for callers that do not go
+// through MolaLauncherApp.
+//
+// onQuit() is invoked by MolaLauncherApp::executor_thread() for every module,
+// before any module is destroyed (see ExecutableBase::onQuit() docs). This
+// matters because worker_lidar_/worker_others_/worker_viz_ may have an
+// in-flight task (e.g. onLidar()) that calls back into other modules, e.g.
+// BridgeROS2's TF broadcaster via VizInterface/LocalizationSourceBase. If
+// that task is still running when another module's destructor runs (which
+// previously only happened from ~LidarOdometry(), after other modules may
+// have already been destroyed), it can use-after-free that module's
+// resources.
+void LidarOdometry::shutdownCleanup()
 {
   using namespace std::chrono_literals;
 
-  try  // a dtor should never throw
+  if (shutdown_cleanup_done_.exchange(true)) {
+    return;
+  }
+
+  try  // must never throw
   {
     {
       auto lck = mrpt::lockHelper(is_busy_mtx_);
@@ -87,7 +106,7 @@ LidarOdometry::~LidarOdometry()
 
     while (isBusy()) {
       MRPT_LOG_THROTTLE_WARN(
-        2.0, "Destructor: waiting for remaining tasks on the worker threads...");
+        2.0, "shutdownCleanup(): waiting for remaining tasks on the worker threads...");
       std::this_thread::sleep_for(100ms);
     }
     worker_lidar_.clear();
@@ -108,13 +127,13 @@ LidarOdometry::~LidarOdometry()
     // This must come after save map calls above:
     while (worker_disk_io_.pendingTasks() > 0) {
       MRPT_LOG_THROTTLE_WARN(
-        2.0, "Destructor: waiting for pending tasks on the lazy-load write thread...");
+        2.0, "shutdownCleanup(): waiting for pending tasks on the lazy-load write thread...");
       std::this_thread::sleep_for(100ms);
     }
     worker_disk_io_.clear();
 
   } catch (const std::exception & e) {
-    std::cerr << "[~LidarOdometry] Exception: " << e.what();
+    std::cerr << "[LidarOdometry::shutdownCleanup] Exception: " << e.what();
   }
 }
 
@@ -130,10 +149,29 @@ void LidarOdometry::spinOnce()
   // Executed here since
   // otherwise the GUI would never show up if inactive, or if the LIDAR
   // observations are misconfigured and are not been fed in.
-  if (visualizer_ && ((state_.local_map && state_.local_map->empty()) || !isActive())) {
+  // Note the explicit "!gui_.gui_created" check: in localization mode
+  // (start_active=true, start_mapping_enabled=false) a prior map is loaded, so
+  // the local map is not empty and the module is active. Without this check
+  // neither of the other two conditions would hold and the GUI (3D scene and
+  // UI controls, both built lazily on the first updateVisualization() call)
+  // would never show up until the first LiDAR scan arrives.
+  bool guiCreated = false;
+  {
+    auto lckGuiMtx = mrpt::lockHelper(state_gui_mtx_);
+    guiCreated = gui_.gui_created;
+  }
+  if (
+    visualizer_ &&
+    ((state_.local_map && state_.local_map->empty()) || !isActive() || !guiCreated)) {
     if (mrpt::Clock::nowDouble() - gui_.timestampLastUpdateUI > 1.0) {
       updateVisualization({}, {});
     }
+  }
+
+  // If map loading was deferred (load_map_after_gui_init=true), run it now,
+  // after the GUI has had a chance to render at least once:
+  if (pending_preload_map_ && guiCreated) {
+    doPreloadLocalMap();
   }
 
   // If SLAM/Localization is disabled, refresh the current map
@@ -159,9 +197,13 @@ void LidarOdometry::reset()
 {
   ASSERTMSG_(!lastInitConfig_.empty(), "initialize() must be called first.");
 
-  auto lck = mrpt::lockHelper(state_mtx_);
-
-  state_ = MethodState();
+  // Reset the state under the lock, then re-initialize without holding it:
+  // initialize() (via initialize_frontend()) takes state_mtx_ itself, and
+  // state_mtx_ is a plain (non-recursive) mutex.
+  {
+    auto lck = mrpt::lockHelper(state_mtx_);
+    state_ = MethodState();
+  }
   initialize(lastInitConfig_);
 }
 
@@ -216,6 +258,20 @@ LidarOdometry::lastEstimatedState() const
   const auto & tw = state_.last_motion_model_output->twist;
   const auto & pose = state_.last_lidar_pose;
   return {{pose, tw}};
+}
+
+double LidarOdometry::lastIcpQuality() const
+{
+  {
+    auto lckStateFlags = mrpt::lockHelper(state_flags_mtx_);
+    if (!state_.initialized || state_.fatal_error) {
+      return 0;
+    }
+  }
+
+  auto lck = mrpt::lockHelper(state_mtx_);
+
+  return state_.last_icp_quality;
 }
 
 void LidarOdometry::saveEstimatedTrajectoryToFile() const
@@ -628,6 +684,7 @@ void LidarOdometry::doWriteDebugTracesFile(const mrpt::Clock::time_point & scan_
 
 void LidarOdometry::addDropStats(bool frame_is_dropped)
 {
+  auto lck = mrpt::lockHelper(drop_stats_mtx_);
   state_.drop_frames_stats_good[state_.drop_frames_stats_next_index] = !frame_is_dropped;
   state_.drop_frames_stats_dropped[state_.drop_frames_stats_next_index] = frame_is_dropped;
   if (++state_.drop_frames_stats_next_index >= MethodState::DROP_STATS_WINDOW_LENGTH) {
@@ -637,7 +694,7 @@ void LidarOdometry::addDropStats(bool frame_is_dropped)
 
 double LidarOdometry::getDropStats() const
 {
-  auto lckStateFlags = mrpt::lockHelper(state_flags_mtx_);
+  auto lck = mrpt::lockHelper(drop_stats_mtx_);
   const auto good =
     std::count(state_.drop_frames_stats_good.begin(), state_.drop_frames_stats_good.end(), true);
   const auto bad = std::count(
