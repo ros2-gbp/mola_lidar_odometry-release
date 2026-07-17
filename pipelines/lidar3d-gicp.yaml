@@ -60,6 +60,7 @@ params:
   local_map_updates:
     enabled: "${MOLA_MAPPING_ENABLED|true}"
     load_existing_local_map: ${MOLA_LOAD_MM|""}
+    load_map_after_gui_init: ${MOLA_LO_LOAD_MAP_AFTER_GUI|false}
     save_final_local_map: ${MOLA_SAVE_MM|""} # If not empty, saves the final local metric map to a ".mm" file
 
     # Idea: don't integrate scans with a high rotational speed since they are probably not correctly deskewed:
@@ -79,26 +80,55 @@ params:
   # Useful to debug mapping issues. If empty, only the env var MP2P_ICP_GENERATE_DEBUG_FILES and the icp.params setting will define when to save logs.
   write_debug_icp_log_if_quality_under: ${MOLA_WRITE_DEBUG_ICP_LOG_IF_QUALITY_UNDER|""}
 
-  # Adaptive threshold, as in the KISS-ICP paper:
+  # Adaptive threshold:
   adaptive_threshold:
     enabled: true
-    initial_sigma: 0.50 # [m]
+    initial_sigma: ${MOLA_SIGMA_INITIAL|0.50} # [m]
     min_motion: ${MOLA_SIGMA_MIN_MOTION|0.04} # [m]
-    maximum_sigma: ${MOLA_SIGMA_MAX_MOTION|0.50} # [m]
-    icp_quality_controller_setpoint: 0.85
-    kp: 2.0
-    alpha: ${MOLA_ADAPT_THRESHOLD_ALPHA|0.99}
+    maximum_sigma: ${MOLA_SIGMA_MAX_MOTION|2.00} # [m]
+    max_sigma_step: ${MOLA_SIGMA_MAX_STEP|0.05} # [m]
+    icp_quality_controller_setpoint: ${MOLA_SIGMA_CONTROLLER_QUALITY_SETPOINT|0.85}
+    kp: ${MOLA_SIGMA_CONTROLLER_GAIN|2.0}
+    alpha: ${MOLA_ADAPT_THRESHOLD_ALPHA|0.90}
+    # Sustained-failure recovery: if enabled, sigma is grown multiplicatively
+    # after a streak of bad ICPs, capped at maximum_sigma, so the matcher
+    # window can re-open and ICP can recover. Enabled by default: without it,
+    # once sigma is driven down near min_motion by a run of easy/near-static
+    # scans (e.g. goodness consistently above icp_quality_controller_setpoint),
+    # a single larger inter-scan motion (a turn, a bump, or just ordinary
+    # scan-to-scan variability once sigma is already pinned at its floor) can
+    # push ICP into failure, and with sigma frozen the correspondence search
+    # window never reopens, so the pipeline stalls indefinitely
+    # (estimated_trajectory never grows again). Set to false to restore the
+    # old behavior. `maximum_sigma` must be set strictly above
+    # `initial_sigma`, or this mechanism is a no-op: sigma always starts
+    # each run AT initial_sigma, so a bad ICP on frame 1 (e.g. a slightly
+    # imprecise localization-only seed pose against a prebuilt map) has no
+    # room to grow into and can never recover (observed in testing as ICP
+    # goodness stuck just under min_icp_goodness for an entire run).
+    #
+    # recover_after_n_bad/recover_growth_factor default to a fast reaction
+    # (2 bad frames, x2.0 growth) rather than a slow one (5 bad frames,
+    # x1.5): every frame spent stuck is a frame of real, untracked vehicle
+    # motion accumulating; the slower defaults let that gap grow to the
+    # point where, once the search window finally reopens, ICP can lock onto
+    # a self-consistent but WRONG registration (observed in testing as a
+    # sudden ~30-40 deg yaw error that then persisted for the rest of a run)
+    # instead of recovering the true pose.
+    recover_on_sustained_failure: ${MOLA_ADAPT_THRESHOLD_RECOVER|true}
+    recover_after_n_bad: ${MOLA_ADAPT_THRESHOLD_RECOVER_AFTER_N_BAD|2}
+    recover_growth_factor: ${MOLA_ADAPT_THRESHOLD_RECOVER_GROWTH_FACTOR|2.0}
 
   # REP-107 diagnostics thresholds published on /diagnostics via mola_bridge_ros2.
   # Any of these can be omitted to keep its built-in default.
   diagnostics:
-    icp_quality_warn: 0.30         # [0-1] WARN if icp_quality below this
-    icp_quality_error: 0.10        # [0-1] ERROR if icp_quality below this
-    input_stale_sec: 3.0           # [s]   STALE if no observation for this long
-    input_error_sec: 5.0           # [s]   ERROR if no observation for this long
-    dropped_ratio_warn: 0.20       # [0-1] WARN if dropped-frames ratio exceeds
-    dropped_ratio_error: 0.50      # [0-1] ERROR if dropped-frames ratio exceeds
-    timing_utilization_warn: 0.80  # [0-1] WARN if avg process time / sensor period exceeds
+    icp_quality_warn: 0.30 # [0-1] WARN if icp_quality below this
+    icp_quality_error: 0.10 # [0-1] ERROR if icp_quality below this
+    input_stale_sec: 3.0 # [s]   STALE if no observation for this long
+    input_error_sec: 5.0 # [s]   ERROR if no observation for this long
+    dropped_ratio_warn: 0.20 # [0-1] WARN if dropped-frames ratio exceeds
+    dropped_ratio_error: 0.50 # [0-1] ERROR if dropped-frames ratio exceeds
+    timing_utilization_warn: 0.80 # [0-1] WARN if avg process time / sensor period exceeds
 
   # If enabled, a map will be stored in RAM and (if using the CLI) stored
   # to a ".simplemap" file for later use for localization, etc.
@@ -128,8 +158,16 @@ params:
   # to show live progress:
   visualization:
     map_update_decimation: 10
-    show_trajectory: true
+    show_trajectory: ${MOLA_GUI_SHOW_TRAJECTORY|true}
     trajectory_rgba: [0.1, 0.1, 0.1, 1.0]
+
+    show_console_messages: ${MOLA_GUI_SHOW_CONSOLE_MESSAGES|true}
+
+    # Enable or disable each of the three GUI panels:
+    show_tab_status: ${MOLA_GUI_SHOW_TAB_STATUS|true}
+    show_tab_control: ${MOLA_GUI_SHOW_TAB_CONTROL|true}
+    show_tab_view: ${MOLA_GUI_SHOW_TAB_VIEW|true}
+
     show_current_observation: ${MOLA_GUI_SHOW_CURRENT_OBS|false} # shows "live deskewed" LiDAR points
     show_last_deskewed_observations_decay: ${MOLA_GUI_SHOW_DESKEWED_DECAY|true} # shows "live deskewed" LiDAR points over time
     last_deskewed_observations_point_size: ${MOLA_GUI_LAST_CLOUDS_POINT_SIZE|1.0}
@@ -141,6 +179,7 @@ params:
     current_observation_colormap: ${MOLA_GUI_CURRENT_CLOUD_COLORMAP|cmHOT} # mrpt::img::TColormap
     current_observation_color_by_field: ${MOLA_GUI_CURRENT_CLOUD_COLOR_FIELD|intensity}
     current_observation_alpha: 0.20
+    show_gravity_align_vector: ${MOLA_GUI_SHOW_ESTIMATED_GRAVITY_VECTOR|false}
 
     background_color_gray_level: "${MOLA_GUI_BACKGROUND_GRAY_LEVEL|0.3}"
 
@@ -150,6 +189,7 @@ params:
     show_ground_grid: ${MOLA_GUI_SHOW_GROUND_GRID|true}
     ground_grid_spacing: 5.0 # [m]
     #current_pose_corner_size: 1.5
+    #sensor_poses_corner_size: 0.5  # XYZ corner for each LiDAR sensor pose; 0 to disable
     model:
       - file: ${MOLA_VEHICLE_MODEL_FILE|""} # Default: none
         tf.x: ${MOLA_VEHICLE_MODEL_X|0.0} # deg
@@ -186,18 +226,20 @@ params:
 # re-localization method to use at start up:
 initial_localization:
   method: "${MOLA_LO_INITIAL_LOCALIZATION_METHOD|InitLocalization::FixedPose}"
+  # Format: x(m) y(m) z(m) yaw(deg) pitch(deg) roll(deg)
   fixed_initial_pose:
-    [
-      "${MOLA_INITIAL_X|0.0}",
-      "${MOLA_INITIAL_Y|0.0}",
-      "${MOLA_INITIAL_Z|0.0}",
-      "${MOLA_INITIAL_YAW|0.0}",
-      "${MOLA_INITIAL_PITCH|0.0}",
-      "${MOLA_INITIAL_ROLL|0.0}",
-    ]
+    ["${MOLA_INITIAL_X|0.0}", "${MOLA_INITIAL_Y|0.0}", "${MOLA_INITIAL_Z|0.0}", "${MOLA_INITIAL_YAW|0.0}", "${MOLA_INITIAL_PITCH|0.0}", "${MOLA_INITIAL_ROLL|0.0}"]
   imu_initial_calibration_sample_count: "${MOLA_LO_INITIAL_IMU_SAMPLES|400}"
   imu_initial_calibration_max_age: 5.0
   use_imu_orientation: "${MOLA_LO_INITIAL_IMU_USE_ORIENTATION|true}"
+  # Right after a re-localization (or initial localization), also hold off
+  # local map / simplemap updates for this many timesteps (shares the same
+  # recovery-window counter as additional_uncertainty_after_reloc_how_many_
+  # timesteps above). 0 (default) disables this and is a no-op: this fires
+  # on every initial-localization convergence too, not just explicit
+  # relocalizations, so a nonzero default here would drop early keyframes
+  # on any dataset where the vehicle is already moving at t=0.
+  additional_map_freeze_after_reloc_how_many_timesteps: "${MOLA_LO_INIT_MAP_FREEZE_STEPS|0}"
 
   # Parameters for InitLocalization::FromStateEstimator:
   from_state_estimator_max_position_sigma: "${MOLA_LO_INIT_SE_MAX_POS_SIGMA|0.5}"
@@ -233,16 +275,29 @@ icp_settings_with_vel:
     debugFileNameFormat: "icp-logs/icp-run-${SEQ|NO_SEQ}-$UNIQUE_ID-local_$LOCAL_ID$LOCAL_LABEL-to-global_$GLOBAL_ID$GLOBAL_LABEL.icplog"
     decimationDebugFiles: ${MP2P_ICP_LOG_FILES_DECIMATION|10}
 
+    # Post-optimization SE(3) covariance estimation (see mp2p_icp::covariance).
+    # Censi3D is the realistic sandwich estimator for cov2cov pipelines;
+    # the per-axis floor absorbs unmodelled errors and keeps downstream
+    # filters numerically stable.
+    covariance:
+      method: ${MOLA_ICP_COVARIANCE_METHOD|Censi3D}
+      defaultPointSigma: ${MOLA_ICP_COV_DEFAULT_POINT_SIGMA|0.01} # [m]
+      floor_sigma_xyz: ${MOLA_ICP_COV_FLOOR_XYZ|0.001} # [m]
+      floor_sigma_angles_deg: ${MOLA_ICP_COV_FLOOR_ANGLES_DEG|0.1} # [deg]
+
   solvers:
     - class: mp2p_icp::Solver_GaussNewton
       params:
         maxIterations: 1
         robustKernel: "${MOLA_LO_ROBUST_KERNEL|RobustKernel::GemanMcClure}"
         robustKernelParam: "${MOLA_LO_ROBUST_KERNEL_PARAM|6.0}" # In GICP, errors are normalized by covariance
+        # Blend [0,1] for the robust kernel residual reference toward the prior
+        # mean pose (0=current iterate only, 1=prior mean only). See mp2p_icp.
+        robustKernelPriorRefBlend: "${MOLA_LO_ROBUST_KERNEL_PRIOR_REF_BLEND|0.0}"
         #innerLoopVerbose: true
 
-  # Sequence of one or more pairs (class, params) defining mp2p_icp::Matcher
-  # instances to pair geometric entities between pointclouds.
+        # Sequence of one or more pairs (class, params) defining mp2p_icp::Matcher
+        # instances to pair geometric entities between pointclouds.
   matchers:
     - class: mp2p_icp::Matcher_Cov2Cov
       params:
@@ -251,10 +306,7 @@ icp_settings_with_vel:
         allowMatchAlreadyMatchedGlobalPoints: true # faster
         # Both layers here must be of type 'mola::KeyframePointCloudMap'
         layerMatches:
-          - {
-              global: "${MOLA_LOCALMAP_LAYER_NAME|localmap}",
-              local: "observation",
-            }
+          - { global: "${MOLA_LOCALMAP_LAYER_NAME|localmap}", local: "observation" }
 
   quality:
     - class: mp2p_icp::QualityEvaluator_PairedRatio
@@ -278,16 +330,24 @@ localmap_generator:
       # metric_map_definition_ini_file: '${CURRENT_YAML_FILE_PATH}/localmap_definition_voxelmap.ini'
 
       metric_map_definition:
-        # Any class derived from mrpt::maps::CMetricMap https://docs.mrpt.org/reference/latest/group_mrpt_maps_grp.html
+        # Any class derived from mrpt::maps::CMetricMap https://docs.mrpt.org/reference/stable/group_mrpt_maps_grp.html
         class: mola::KeyframePointCloudMap
         plugin: "libmola_metric_maps.so" # Import additional custom user-defined map classes (search in LD_LIBRARY_PATH)
         creationOpts:
           max_search_keyframes: ${MOLA_LOCALMAP_MAX_SEARCH_KEYFRAMES|3}
           k_correspondences_for_cov: ${MOLA_LOCALMAP_K_CORRESPONDENCES_FOR_COV|20}
+          min_correspondences_for_cov: ${MOLA_LOCALMAP_MIN_CORRESPONDENCES_FOR_COV|5}
+          max_distance_for_cov: ${MOLA_LOCALMAP_MAX_DISTANCE_FOR_COV|2.0}
           use_view_direction_filter: ${MOLA_LOCALMAP_USE_VIEW_DIRECTION_FILTER|true}
           max_view_angle_deg: ${MOLA_LOCALMAP_VIEW_DIRECTION_FILTER_ANGLE_DEG|120}
           rotation_distance_weight: 2.0
           num_diverse_keyframes: ${MOLA_LOCALMAP_DIVERSE_KEYFRAMES|1} # Must be < max_search_keyframes
+          # If true, cov-to-cov ICP matching (Matcher_Cov2Cov) queries each active
+          # keyframe's own cached KD-tree + covariances directly, instead of building
+          # a merged submap from the active KF set. Faster (skips the merge/KD-tree
+          # rebuild) at the cost of a slightly less accurate covariance estimate
+          # (computed only from neighbors within the same source keyframe).
+          approximate_cov: ${MOLA_LOCALMAP_APPROXIMATE_COV|false}
         insertOpts:
           remove_frames_farther_than: "${MOLA_LOCAL_MAP_MAX_SIZE|$f{max(100.0, 1.50*ESTIMATED_OBSERVATION_RADIUS)}}" # [m]
         likelihoodOpts: ~ # none required
@@ -299,12 +359,12 @@ localmap_generator:
           max_overall_points: ${MOLA_LOCALMAP_VIZ_MAX_POINTS_OVERALL|500000} # Max number of points to render overall (e.g. to avoid FoxGlove WS overflow)
           #point_size: 1.0  # superseded by visualization.local_map_point_size above
 
-# ---------------------------------------------------------------------------------
-# LIDAR observations are, first, loaded using a generator
-# from "observations_generator".
-# then, optionally, filtered before being registered with ICP
-# against the local map with filter "observations_filter_1st_pass".
-# ---------------------------------------------------------------------------------
+          # ---------------------------------------------------------------------------------
+          # LIDAR observations are, first, loaded using a generator
+          # from "observations_generator".
+          # then, optionally, filtered before being registered with ICP
+          # against the local map with filter "observations_filter_1st_pass".
+          # ---------------------------------------------------------------------------------
 observations_generator:
   # Generators:
   #
@@ -331,7 +391,7 @@ observations_generator:
       # metric_map_definition_ini_file: '${CURRENT_YAML_FILE_PATH}/localmap_definition_voxelmap.ini'
 
       metric_map_definition:
-        # Any class derived from mrpt::maps::CMetricMap https://docs.mrpt.org/reference/latest/group_mrpt_maps_grp.html
+        # Any class derived from mrpt::maps::CMetricMap https://docs.mrpt.org/reference/stable/group_mrpt_maps_grp.html
         class: mola::KeyframePointCloudMap
         plugin: "libmola_metric_maps.so" # Import additional custom user-defined map classes (search in LD_LIBRARY_PATH)
         creationOpts: ~ # none required
@@ -443,8 +503,7 @@ insert_observation_into_local_map:
       input_pointcloud_layer: "decimated_for_map"
       target_layer: "${MOLA_LOCALMAP_LAYER_NAME|localmap}"
       input_layer_in_local_coordinates: true
-      robot_pose:
-        [robot_x, robot_y, robot_z, robot_yaw, robot_pitch, robot_roll]
+      robot_pose: [robot_x, robot_y, robot_z, robot_yaw, robot_pitch, robot_roll]
 
 # Pipeline starting from raw observations (passed through "Generator"), to be
 # sent out for visualization of the sliding-window of recent clouds as a dense local map
