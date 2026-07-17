@@ -54,6 +54,7 @@ params:
   local_map_updates:
     enabled: "${MOLA_MAPPING_ENABLED|true}"
     load_existing_local_map: ${MOLA_LOAD_MM|""}
+    load_map_after_gui_init: ${MOLA_LO_LOAD_MAP_AFTER_GUI|false}
     save_final_local_map: ${MOLA_SAVE_MM|""} # If not empty, saves the final local metric map to a ".mm" file
 
     # Idea: don't integrate scans with a high rotational speed since they are probably not correctly deskewed:
@@ -68,22 +69,44 @@ params:
   # Minimum ICP quality to insert it into the map:
   min_icp_goodness: ${MOLA_MINIMUM_ICP_QUALITY|0.50}
 
-  # Adaptive threshold, as in the KISS-ICP paper:
+  # Adaptive threshold:
   adaptive_threshold:
     enabled: true
-    initial_sigma: 0.50 # [m]
+    initial_sigma: ${MOLA_SIGMA_INITIAL|0.50} # [m]
     min_motion: ${MOLA_SIGMA_MIN_MOTION|0.04} # [m]
-    maximum_sigma: ${MOLA_SIGMA_MAX_MOTION|0.50} # [m]
-    icp_quality_controller_setpoint: 0.85
-    kp: 2.0
+    maximum_sigma: ${MOLA_SIGMA_MAX_MOTION|2.00} # [m]
+    max_sigma_step: ${MOLA_SIGMA_MAX_STEP|0.05} # [m]
+    icp_quality_controller_setpoint: ${MOLA_SIGMA_CONTROLLER_QUALITY_SETPOINT|0.85}
+    kp: ${MOLA_SIGMA_CONTROLLER_GAIN|2.0}
     alpha: ${MOLA_ADAPT_THRESHOLD_ALPHA|0.90}
-    # Optional sustained-failure recovery: if enabled, sigma is grown
-    # multiplicatively after a streak of bad ICPs, capped at maximum_sigma,
-    # so the matcher window can re-open and ICP can recover. With the flag
-    # off (default) behavior is unchanged.
-    recover_on_sustained_failure: ${MOLA_ADAPT_THRESHOLD_RECOVER|false}
-    recover_after_n_bad: ${MOLA_ADAPT_THRESHOLD_RECOVER_AFTER_N_BAD|5}
-    recover_growth_factor: ${MOLA_ADAPT_THRESHOLD_RECOVER_GROWTH_FACTOR|1.5}
+    # Sustained-failure recovery: if enabled, sigma is grown multiplicatively
+    # after a streak of bad ICPs, capped at maximum_sigma, so the matcher
+    # window can re-open and ICP can recover. Enabled by default: without it,
+    # once sigma is driven down near min_motion by a run of easy/near-static
+    # scans (e.g. goodness consistently above icp_quality_controller_setpoint),
+    # a single larger inter-scan motion (a turn, a bump, or just ordinary
+    # scan-to-scan variability once sigma is already pinned at its floor) can
+    # push ICP into failure, and with sigma frozen the correspondence search
+    # window never reopens, so the pipeline stalls indefinitely
+    # (estimated_trajectory never grows again). Set to false to restore the
+    # old behavior. `maximum_sigma` must be set strictly above
+    # `initial_sigma`, or this mechanism is a no-op: sigma always starts
+    # each run AT initial_sigma, so a bad ICP on frame 1 (e.g. a slightly
+    # imprecise localization-only seed pose against a prebuilt map) has no
+    # room to grow into and can never recover (observed in testing as ICP
+    # goodness stuck just under min_icp_goodness for an entire run).
+    #
+    # recover_after_n_bad/recover_growth_factor default to a fast reaction
+    # (2 bad frames, x2.0 growth) rather than a slow one (5 bad frames,
+    # x1.5): every frame spent stuck is a frame of real, untracked vehicle
+    # motion accumulating; the slower defaults let that gap grow to the
+    # point where, once the search window finally reopens, ICP can lock onto
+    # a self-consistent but WRONG registration (observed in testing as a
+    # sudden ~30-40 deg yaw error that then persisted for the rest of a run)
+    # instead of recovering the true pose.
+    recover_on_sustained_failure: ${MOLA_ADAPT_THRESHOLD_RECOVER|true}
+    recover_after_n_bad: ${MOLA_ADAPT_THRESHOLD_RECOVER_AFTER_N_BAD|2}
+    recover_growth_factor: ${MOLA_ADAPT_THRESHOLD_RECOVER_GROWTH_FACTOR|2.0}
 
   # If enabled, a map will be stored in RAM and (if using the CLI) stored
   # to a ".simplemap" file for later use for localization, etc.
@@ -173,14 +196,7 @@ initial_localization:
   method: "${MOLA_LO_INITIAL_LOCALIZATION_METHOD|InitLocalization::FixedPose}"
   # Format: x(m) y(m) z(m) yaw(deg) pitch(deg) roll(deg)
   fixed_initial_pose:
-    [
-      "${MOLA_INITIAL_X|0.0}",
-      "${MOLA_INITIAL_Y|0.0}",
-      "${MOLA_INITIAL_Z|0.0}",
-      "${MOLA_INITIAL_YAW|0.0}",
-      "${MOLA_INITIAL_PITCH|0.0}",
-      "${MOLA_INITIAL_ROLL|0.0}",
-    ]
+    ["${MOLA_INITIAL_X|0.0}", "${MOLA_INITIAL_Y|0.0}", "${MOLA_INITIAL_Z|0.0}", "${MOLA_INITIAL_YAW|0.0}", "${MOLA_INITIAL_PITCH|0.0}", "${MOLA_INITIAL_ROLL|0.0}"]
   imu_initial_calibration_sample_count: "${MOLA_LO_INITIAL_IMU_SAMPLES|400}"
   imu_initial_calibration_max_age: 5.0
   use_imu_orientation: "${MOLA_LO_INITIAL_IMU_USE_ORIENTATION|true}"
@@ -220,6 +236,9 @@ icp_settings_with_vel:
         maxIterations: 1
         robustKernel: "${MOLA_LO_ROBUST_KERNEL|RobustKernel::GemanMcClure}"
         robustKernelParam: "${MOLA_LO_ROBUST_KERNEL_PARAM|6.0}" # In GICP, errors are normalized by covariance
+        # Blend [0,1] for the robust kernel residual reference toward the prior
+        # mean pose (0=current iterate only, 1=prior mean only). See mp2p_icp.
+        robustKernelPriorRefBlend: "${MOLA_LO_ROBUST_KERNEL_PRIOR_REF_BLEND|0.0}"
         #innerLoopVerbose: true
 
   # Sequence of one or more pairs (class, params) defining mp2p_icp::Matcher
@@ -232,10 +251,7 @@ icp_settings_with_vel:
         allowMatchAlreadyMatchedGlobalPoints: true # faster
         # Both layers here must be of type 'mola::KeyframePointCloudMap'
         layerMatches:
-          - {
-              global: "${MOLA_LOCALMAP_LAYER_NAME|localmap}",
-              local: "observation",
-            }
+          - { global: "${MOLA_LOCALMAP_LAYER_NAME|localmap}", local: "observation" }
 
   quality:
     - class: mp2p_icp::QualityEvaluator_PairedRatio
@@ -259,7 +275,7 @@ localmap_generator:
       # metric_map_definition_ini_file: '${CURRENT_YAML_FILE_PATH}/localmap_definition_voxelmap.ini'
 
       metric_map_definition:
-        # Any class derived from mrpt::maps::CMetricMap https://docs.mrpt.org/reference/latest/group_mrpt_maps_grp.html
+        # Any class derived from mrpt::maps::CMetricMap https://docs.mrpt.org/reference/stable/group_mrpt_maps_grp.html
         class: mola::KeyframePointCloudMap
         plugin: "libmola_metric_maps.so" # Import additional custom user-defined map classes (search in LD_LIBRARY_PATH)
         creationOpts:
@@ -308,7 +324,7 @@ observations_generator:
       # metric_map_definition_ini_file: '${CURRENT_YAML_FILE_PATH}/localmap_definition_voxelmap.ini'
 
       metric_map_definition:
-        # Any class derived from mrpt::maps::CMetricMap https://docs.mrpt.org/reference/latest/group_mrpt_maps_grp.html
+        # Any class derived from mrpt::maps::CMetricMap https://docs.mrpt.org/reference/stable/group_mrpt_maps_grp.html
         class: mola::KeyframePointCloudMap
         plugin: "libmola_metric_maps.so" # Import additional custom user-defined map classes (search in LD_LIBRARY_PATH)
         creationOpts: ~ # none required
@@ -414,13 +430,7 @@ observations_filter_final_pass:
   # Remove layers to save memory and log file storage
   - class_name: mp2p_icp_filters::FilterDeleteLayer
     params:
-      pointcloud_layer_to_remove:
-        [
-          "raw",
-          "decimated_unfiltered",
-          "decimated_skewed_for_map",
-          "decimated_skewed_for_icp",
-        ]
+      pointcloud_layer_to_remove: ["raw", "decimated_unfiltered", "decimated_skewed_for_map", "decimated_skewed_for_icp"]
 
 # To populate the local map, one or more observation layers are merged
 # into the local map via this pipeline:
@@ -431,8 +441,7 @@ insert_observation_into_local_map:
       input_pointcloud_layer: "decimated_for_map"
       target_layer: "${MOLA_LOCALMAP_LAYER_NAME|localmap}"
       input_layer_in_local_coordinates: true
-      robot_pose:
-        [robot_x, robot_y, robot_z, robot_yaw, robot_pitch, robot_roll]
+      robot_pose: [robot_x, robot_y, robot_z, robot_yaw, robot_pitch, robot_roll]
 
 # Pipeline starting from raw observations (passed through "Generator"), to be
 # sent out for visualization of the sliding-window of recent clouds as a dense local map
