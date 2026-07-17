@@ -79,6 +79,9 @@
 #include <iostream>
 #include <string>
 
+namespace
+{
+
 struct Cli
 {
   // Declare supported cli switches ===========
@@ -111,7 +114,7 @@ struct Cli
     "",
     "state-estimator-param-file",
     "Path to YAML parameters file to configure the state estimator.",
-    false,
+    true,
     "/path/to/params.yaml",
     "/path/to/params.yaml",
     cmd};
@@ -271,8 +274,6 @@ struct Cli
 
 };  // end struct "Cli"
 
-namespace
-{
 #if defined(HAVE_MOLA_INPUT_RAWLOG)
 std::shared_ptr<mola::OfflineDatasetSource> dataset_from_rawlog(
   const std::string & rawlogFile, const mrpt::system::VerbosityLevel logLevel)
@@ -452,7 +453,7 @@ void mola_signal_handler(int s)
 {
   std::cerr << "Caught signal " << s << ". Shutting down..."
             << "\n";
-  exit(0);
+  exit(0);  // NOLINT
 }
 
 void mola_install_signal_handler()
@@ -468,6 +469,7 @@ void mola_install_signal_handler()
   sigaction(SIGINT, &sigIntHandler, nullptr);
 }
 
+// NOLINTNEXTLINE(readability-function-cognitive-complexity)
 int main_odometry(Cli & cli)
 {
   // Declare main LO module:
@@ -512,7 +514,8 @@ int main_odometry(Cli & cli)
                  "raw sensor data.\n";
   }
 
-  if (cli.arg_stateEstimatorParams.isSet()) {
+  // Make mandatory to specify state estimation config file, so defaults and initialize() are not skipped
+  {
     const auto seParamsFile = cli.arg_stateEstimatorParams.getValue();
     auto seParams = mrpt::containers::yaml::FromFile(seParamsFile);
     stateEstimator->initialize(mola::parse_yaml(seParams));
@@ -734,10 +737,11 @@ int main_odometry(Cli & cli)
 
       std::cout << mrpt::system::progress(pc, 30)
                 << mrpt::format(
-                     " %6zu/%6zu (%.02f%%) ETA=%s/T=%s | Pose=%s\n", i, N, 100 * pc,
+                     " %6zu/%6zu (%.02f%%) ETA=%s/T=%s | Pose=%s | q=%.01f%%\n", i, N, 100 * pc,
                      mrpt::system::formatTimeInterval(ETA).c_str(),
                      mrpt::system::formatTimeInterval(totalTime).c_str(),
-                     lastPose.has_value() ? lastPose->asString().c_str() : "(None)");
+                     lastPose.has_value() ? lastPose->asString().c_str() : "(None)",
+                     100.0 * liodom->lastIcpQuality());
       std::cout.flush();
     }
 
@@ -757,7 +761,8 @@ int main_odometry(Cli & cli)
 
   if (cli.arg_outPath.isSet()) {
     const auto fil = cli.arg_outPath.getValue();
-    std::cout << "\nSaving estimated path in TUM format to: " << fil << std::endl;
+    std::cout << "\nSaving estimated path in TUM format to: " << fil
+              << std::endl;  // NOLINT(performance-avoid-endl)
 
     const mrpt::poses::CPose3DInterpolator lastEstimatedTrajectory = liodom->estimatedTrajectory();
 
@@ -770,14 +775,15 @@ int main_odometry(Cli & cli)
     auto sm = liodom->reconstructedMap();
 
     std::cout << "\nSaving reconstructed map with " << sm.size() << " keyframes to: " << fil
-              << std::endl;
+              << std::endl;  // NOLINT(performance-avoid-endl)
 
     sm.saveToFile(fil);
   }
 
   if (outTwist) {
     const auto fil = cli.arg_outTwist.getValue();
-    std::cout << "\nSaving estimated twist to: " << fil << std::endl;
+    std::cout << "\nSaving estimated twist to: " << fil
+              << std::endl;  // NOLINT(performance-avoid-endl)
     outTwist->saveToTextFile(fil);
   }
 
@@ -791,7 +797,9 @@ int main(int argc, char ** argv)
     Cli cli;
 
     // Parse arguments:
-    if (!cli.cmd.parse(argc, argv)) return 1;  // should exit.
+    if (!cli.cmd.parse(argc, argv)) {
+      return 1;  // should exit.
+    }
 
     // Load plugins:
     if (cli.arg_plugins.isSet()) {
@@ -799,7 +807,7 @@ int main(int argc, char ** argv)
       const auto plugins = cli.arg_plugins.getValue();
       std::cout << "Loading plugin(s): " << plugins << "\n";
       if (!mrpt::system::loadPluginModules(plugins, errMsg)) {
-        std::cerr << errMsg << std::endl;
+        std::cerr << errMsg << std::endl;  // NOLINT(performance-avoid-endl)
         return 1;
       }
     }

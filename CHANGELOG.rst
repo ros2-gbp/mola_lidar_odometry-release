@@ -2,6 +2,180 @@
 Changelog for package mola_lidar_odometry
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+3.0.0 (2026-07-17)
+------------------
+* Merge pull request `#101 <https://github.com/MOLAorg/mola_lidar_odometry/issues/101>`_ from MOLAorg/fix/relocalize-tf-source-and-sigma-recovery
+  fix: two bugs blocking GNSS+IMU relocalization (FromStateEstimator)
+* fix: MOLA_LOCALIZATION_PUBLISH_TF_SOURCE used the wrong module-name string
+* fix: maximum_sigma default equal to initial_sigma made sustained-failure recovery a no-op
+* Remove dead mrpt/gui included
+* fix: enable adaptive-threshold recovery by default; add initial_pose launch arg
+* fix: show sensible errors if in localization only but there's no local map
+* feat: map freeze after relocalization (`#100 <https://github.com/MOLAorg/mola_lidar_odometry/issues/100>`_)
+* fix: drop stale LiDAR scans and keep the freshest under overload (`#99 <https://github.com/MOLAorg/mola_lidar_odometry/issues/99>`_)
+* feat: export as plot data the complete onLidar CPU time
+* fix: don't process/insert a scan into the map before initial localization converges
+* fix: don't discard a preexisting map on IMU releveling or bad-first-ICP restart
+* Merge pull request `#98 <https://github.com/MOLAorg/mola_lidar_odometry/issues/98>`_ from MOLAorg/feature/imu-leveling-preserve-xyzyaw
+  fix: preserve x/y/z/yaw prior in InitLocalization::PitchAndRollFromIMU
+* Merge pull request `#97 <https://github.com/MOLAorg/mola_lidar_odometry/issues/97>`_ from MOLAorg/feature/imu-bag-recv-timestamp-env-var
+  Wire MOLA_IMU_USE_BAG_RECV_TIME env var for IMU bag-recv-time timestamp override
+* fix: preserve x/y/z/yaw prior in InitLocalization::PitchAndRollFromIMU
+* lidar_odometry_from_rosbag2.yaml: wire MOLA_IMU_USE_BAG_RECV_TIME env var
+* debug: add env-gated ICP quality/adaptive-threshold trace
+* Merge pull request `#95 <https://github.com/MOLAorg/mola_lidar_odometry/issues/95>`_ from MOLAorg/feat/shared-keyframe-velocity-metadata
+  Carry per-keyframe velocity metadata in shared-keyframe push
+* refactor: remove dead pushKeyframeToSharedKeyframeMap helper
+* feat: carry per-keyframe velocity metadata in shared-keyframe push
+* Merge pull request `#94 <https://github.com/MOLAorg/mola_lidar_odometry/issues/94>`_ from MOLAorg/feat/icp-metric-plots
+* feat: stream ICP time/goodness to mola_viz_imgui plot windows
+* Merge pull request `#93 <https://github.com/MOLAorg/mola_lidar_odometry/issues/93>`_ from MOLAorg/feat/expose-approximate-cov-env-var
+* feat: expose KeyframePointCloudMap's approximate_cov as MOLA_LOCALMAP_APPROXIMATE_COV
+* docs: show ImGui as the new default
+* feat: expose new simple estimator GNSS fuse params
+* feat: pass georef to state estimator, if compatible
+* feat: expose color changing as public API
+* launch: default viz module to MolaVizImGui with per-app imgui_app_name
+  Sets a unique imgui_app_name in each launch file so Dear ImGui's
+  layout persistence stores a separate UI configuration per app.
+* fix: uncheck show trajectory never cleared old viz
+* Merge pull request `#92 <https://github.com/MOLAorg/mola_lidar_odometry/issues/92>`_ from MOLAorg/feat/viz-decay-lookat-frame-aware
+  feat: frame-aware decay clouds and camera look-at for mapper_3d
+* feat: frame-aware decay clouds and camera look-at for mapper_3d
+* Merge pull request `#91 <https://github.com/MOLAorg/mola_lidar_odometry/issues/91>`_ from MOLAorg/feat/use-viz-with-movable-frames
+* feat: viz with movable frames
+* Merge pull request `#90 <https://github.com/MOLAorg/mola_lidar_odometry/issues/90>`_ from MOLAorg/feat/push-to-central-map
+  feat: push KFs to central map server
+* Merge pull request `#89 <https://github.com/MOLAorg/mola_lidar_odometry/issues/89>`_ from MOLAorg/fix/imu-grav-align
+  fix: bugs in gravity-alignment from IMU accelerometer
+* Merge pull request `#88 <https://github.com/MOLAorg/mola_lidar_odometry/issues/88>`_ from MOLAorg/feat/delayed-map-load
+  feat: add delayed map load option
+* Merge pull request `#87 <https://github.com/MOLAorg/mola_lidar_odometry/issues/87>`_ from MOLAorg/fix/state-mtx-non-recursive
+  refactor: convert state_mtx\_ from recursive_mutex to plain mutex
+* Merge pull request `#86 <https://github.com/MOLAorg/mola_lidar_odometry/issues/86>`_ from MOLAorg/fix/lidar-odometry-shutdown-order-segfault
+  fix: avoid use-after-free during shutdown via LidarOdometry::onQuit()
+* Merge pull request `#85 <https://github.com/MOLAorg/mola_lidar_odometry/issues/85>`_ from MOLAorg/feat/ros2-launch-tf-no-ns-option
+* feat: add new ros2 launch argument to optionally disable /tf NS remappings
+* Merge pull request `#84 <https://github.com/MOLAorg/mola_lidar_odometry/issues/84>`_ from MOLAorg/feat/simpler-adaptive-sigma
+  feat: simplify adaptive sigma algorithm
+* chore: put all yaml files in sync re adaptive parameters
+* feat: simplify adaptive sigma algorithm
+* docs: explain how to select the viz module
+* Merge pull request `#83 <https://github.com/MOLAorg/mola_lidar_odometry/issues/83>`_ from MOLAorg/feat/ros1-input
+* feat: Add ros1 bag input helper scripts
+* Contributors: Jose Luis Blanco-Claraco
+
+2.2.1 (2026-06-04)
+------------------
+* simple state estimator: MOLA_NAVSTATE_VELOCITY_FILTER is now true by default
+* ci: fix Jazzy Jalisco EOL date in CI workflow comment (May 2024 - May 2029)
+* ci: scope arm64 apt-cacher-ng proxy to apt only (fix xmllint test) (`#82 <https://github.com/MOLAorg/mola_erathos_slam/issues/82>`_)
+* chore: add profiler to unit tests
+* ci: add tests run in self-hosted
+* fix self-runner label
+* CI: add self hosted runner jobs too
+* feat: selective disabling each of the imgui tabs
+* gicp yaml: expose more viz params and the new velocity filter param
+* docs: sync pipeline variables from actual yaml
+* Merge pull request `#81 <https://github.com/MOLAorg/mola_erathos_slam/issues/81>`_ from MOLAorg/clean-gui-code
+  GUI: clear dead code and reorganize ImGui tabs
+* fix: multithread issues
+* gui: split in 3 tabs when in imgui mode
+* chore: remove dead code for mola<2.6.0 compatibility
+* Merge pull request `#80 <https://github.com/MOLAorg/mola_erathos_slam/issues/80>`_ from MOLAorg/more-robust-multi-sensor
+  More robust multi sensor
+* fix: gracefully handle missing scans in multi-lidar settings
+* chore: add warning if dropped lidar scans in multi-sensor mode
+* chore: add debug-level traces for multi-lidar settings
+* Contributors: Jose Luis Blanco-Claraco
+
+2.2.0 (2026-05-11)
+------------------
+* fix: don't exit upon state estimator lack of convergence
+* Merge pull request `#79 <https://github.com/MOLAorg/mola_lidar_odometry/issues/79>`_ from MOLAorg/simplify-ci
+  CI: simplify clang-format helpers and use ros: docker image for jazzy stable
+* CI: simplify clang-format helpers and use ros: docker image for jazzy stable
+  - Replace the old formatter.sh with a new version supporting --check mode
+  - Simplify check-clang-format.yml to just apt-install clang-format-14 and run the script
+  - Use ros:jazzy pre-built image for jazzy stable CI build (faster, no setup-ros needed)
+* Update error threshold in lidar odometry test
+* fix: do not wipe out a loaded map if first scan is bad
+* fix: viz must clear current obs when unchecked live
+* fix: safer thread viz with just one thread
+* chore: set default for adaptive threshold 'alpha' low-pass filter 0.99 to 0.90 for adapting faster to changes
+* feat: show sensor pose corners in MolaViz
+* chore: fix comment formatting (seems to trigger a libfyaml/mola_yaml parser bug)
+* fix: initial pose from yaml files expected yaw/pitch/roll in degrees
+* Expose initial sigma as env var too
+* chore: expose viz module as env var (prepare for testing imgui)
+* CI: sensible job names
+* Merge pull request `#78 <https://github.com/MOLAorg/mola_lidar_odometry/issues/78>`_ from MOLAorg/bump-cmake-version
+  bump min req cmake version to 3.22
+* bump min req cmake version to 3.22
+* FIX: regression in last adaptive sigma PR
+* chore: add minimal agents.md
+* Merge pull request `#76 <https://github.com/MOLAorg/mola_lidar_odometry/issues/76>`_ from Zeal-Robotics/feat/sustained-failure-recovery
+  feat: optional adaptive-threshold recovery on sustained ICP failure
+* feat: optional adaptive-threshold recovery on sustained ICP failure
+  The KISS-ICP adaptive threshold only updates sigma on a good ICP, which
+  is correct for isolated bad scans but creates a deadlock under sustained
+  failure: once sigma is frozen at a small value, the matcher window
+  (2*sigma) is too tight to find correspondences, ICP stays bad, sigma
+  stays frozen, and the system cannot recover without an external
+  relocalize.
+  Add three opt-in fields to AdaptiveThreshold:
+  recover_on_sustained_failure (default false)
+  recover_after_n_bad          (default 5)
+  recover_growth_factor        (default 1.5)
+  After N consecutive bad ICPs, sigma is grown multiplicatively (capped at
+  maximum_sigma) so the next attempt has a wider correspondence search
+  radius. The counter resets on any good ICP, at which point the standard
+  KISS-ICP rule resumes and re-tightens sigma. With the flag off, behavior
+  is identical to before.
+  The four bundled pipeline YAMLs (lidar3d-gicp, -gicp-optimize-twist,
+  -icp, -ndt) gain matching ${MOLA_ADAPT_THRESHOLD_RECOVER*|default} hooks
+  so the feature can be toggled via env vars without forking the YAML.
+* Fix CI escaping
+* fix: CI code coverage flags
+* feat: Add new mola-lo-gui-ouster script
+* Update build-ros.yml to disable known regression in current stable Humble
+  Comment out the configuration for non-testing ROS build.
+* Merge pull request `#75 <https://github.com/MOLAorg/mola_lidar_odometry/issues/75>`_ from Zeal-Robotics/fix/cli-warn-no-state-estimator-yaml
+  fix(cli): warn when no --state-estimator-param-file is provided
+* fix(cli): warn when no --state-estimator-param-file is provided
+  When `mola-lidar-odometry-cli` is invoked without
+  `--state-estimator-param-file`, the state estimator is constructed but
+  `initialize()` is never called, so it silently runs with the built-in
+  C++ defaults. These differ from the bundled
+  `state-estimator-params/*.yaml` shipped with this package and used by
+  the corresponding `mola-cli-launchs/*.yaml` files, which makes the CLI
+  and the GUI launcher behave noticeably differently for the same
+  estimator.
+  Add an `else` branch that prints a clear warning naming the active
+  estimator class and pointing at the bundled YAMLs, so users know to
+  pass `--state-estimator-param-file` (or accept the C++ defaults
+  deliberately). No behaviour change otherwise.
+* fix: GUI update staled in some conditions
+* fix: don't reduce adaptive threshold on bad ICPs
+* fix: UI text labels never updated if ICP was bad
+* fix: clearing gravity vector
+* IMU buffer for gravity alignment: increase max circular buffer size
+* Merge pull request `#62 <https://github.com/MOLAorg/mola_lidar_odometry/issues/62>`_ from MOLAorg/wip/draw-gravity-align-as-arrow
+  Draw arrow from IMU gravity alignment
+* CI: Fix for new ROS rolling
+* feat: Optional visualization of IMU gravity alignment vector
+* tests: show error levels even if test pass
+* gicp: lower covariance floors
+* fix: decaying clouds were not cleared if unchecked UI box
+* icp pipeline yaml: add new covariance selection method params
+* feat: ros2 launch file new "use-sim-time:=true" argument
+* feat: Localmap is now also rendered using 'intensity' or whatever color channel
+* docs: clear README
+* Merge pull request `#72 <https://github.com/MOLAorg/mola_lidar_odometry/issues/72>`_ from manankharwar/patch-1
+  docs: add FusionCore to Related projects
+* Update README.md
+* Contributors: Jose Luis Blanco-Claraco, Robin Van Cauwenbergh
+
 2.1.0 (2026-04-29)
 ------------------
 * FIX: show_localmap was not loaded from YAML file; expose more pipeline env vars

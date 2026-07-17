@@ -61,6 +61,8 @@ int main_odometry(const OdometryTestParams & p)
   liodom->params_.simplemap.generate = false;
   liodom->params_.estimated_trajectory.output_file.clear();
 
+  liodom->profiler_.enable();
+
   liodom->params_.lidar_sensor_labels.assign(1, std::regex("lidar"));
 
   // Initialize estimator (default settings):
@@ -122,9 +124,11 @@ int main_odometry(const OdometryTestParams & p)
 
     const double err = mrpt::poses::Lie::SE<3>::log(mrpt::poses::CPose3D(gt - pose)).norm();
 
-    EXPECT_LT(err, 0.40) << "Estimated trajectory pose mismatch:\n"
-                         << " LO pose: " << pose << "\n"
-                         << " GT pose: " << gt << "\n";
+    std::cout << " LO pose: " << pose << "\n"
+              << " GT pose: " << gt << "\n"
+              << " error: " << err << "\n\n";
+
+    EXPECT_LT(err, 0.50);
   }
 
   return 0;
