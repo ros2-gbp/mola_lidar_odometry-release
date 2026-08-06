@@ -10,6 +10,7 @@ modules:
   # =====================
   - name: viz
     type: ${MOLA_GUI_MODULE|mola::MolaVizImGui}
+    enabled: ${MOLA_WITH_GUI|true}
     verbosity_level: "${MOLA_VERBOSITY_MOLA_VIZ|INFO}"
     params:
       imgui_app_name: lidar_odometry_from_rosbag1
@@ -57,11 +58,22 @@ modules:
     gui_preview_sensors:
       - raw_sensor_label: "${MOLA_LIDAR_NAME|lidar}"
         decimation: 1
+        enabled: ${MOLA_WITH_GUI|true}
         win_pos: 5 5 400 400
+      - raw_sensor_label: "${MOLA_CAMERA_SENSOR_NAME|camera}"
+        decimation: 1
+        enabled: ${MOLA_WITH_GUI|true}
+        win_pos: 5 370 600 200
 
     params:
-      # We use an environment variable to force the user to specify a bag file:
-      rosbag_filename: ${MOLA_INPUT_ROSBAG1}
+      # We use an environment variable to force the user to specify a bag file.
+      # Optionally, up to two additional bags can be replayed jointly with the
+      # first one, as a single merged stream: some datasets split /tf, the IMU
+      # or the odometry into their own bag files. Empty slots are ignored.
+      rosbag_filename:
+        - ${MOLA_INPUT_ROSBAG1}
+        - ${MOLA_INPUT_ROSBAG1_2|}
+        - ${MOLA_INPUT_ROSBAG1_3|}
       time_warp_scale: ${MOLA_TIME_WARP|1.0}
       start_paused: ${MOLA_DATASET_START_PAUSED|false}
 
@@ -100,6 +112,14 @@ modules:
           # If present, this will override whatever /tf tells about the sensor pose:
           fixed_sensor_pose: "${IMU_POSE_X|0} ${IMU_POSE_Y|0} ${IMU_POSE_Z|0} ${IMU_POSE_YAW|0} ${IMU_POSE_PITCH|0} ${IMU_POSE_ROLL|0}" # 'x y z yaw_deg pitch_deg roll_deg'
           use_fixed_sensor_pose: ${MOLA_USE_FIXED_IMU_POSE|false}
+
+        - topic: ${MOLA_CAMERA_TOPIC|''}
+          is_optional: true
+          sensorLabel: ${MOLA_CAMERA_SENSOR_NAME|camera}
+          type: CObservationImage
+          # If present, this will override whatever /tf tells about the sensor pose:
+          fixed_sensor_pose: "${CAMERA_POSE_X|0} ${CAMERA_POSE_Y|0} ${CAMERA_POSE_Z|0} ${CAMERA_POSE_YAW|0} ${CAMERA_POSE_PITCH|0} ${CAMERA_POSE_ROLL|0}" # 'x y z yaw_deg pitch_deg roll_deg'
+          use_fixed_sensor_pose: ${MOLA_USE_FIXED_CAMERA_POSE|false}
 
         # 2D wheel odometry (disabled by default)
         - topic: ${MOLA_ODOMETRY_TOPIC|''}
