@@ -46,6 +46,7 @@
 
 // STD:
 #include <chrono>
+#include <mutex>
 #include <thread>
 
 // Portable config path
@@ -82,8 +83,9 @@ void LidarOdometry::onQuit() { shutdownCleanup(); }
 //
 // onQuit() is invoked by MolaLauncherApp::executor_thread() for every module,
 // before any module is destroyed (see ExecutableBase::onQuit() docs). This
-// matters because worker_lidar_/worker_others_/worker_viz_ may have an
-// in-flight task (e.g. onLidar()) that calls back into other modules, e.g.
+// matters because worker_lidar_/worker_others_/worker_viz_/
+// worker_viz_local_map_ may have an in-flight task (e.g. onLidar(), or the
+// local-map render) that calls back into other modules, e.g.
 // BridgeROS2's TF broadcaster via VizInterface/LocalizationSourceBase. If
 // that task is still running when another module's destructor runs (which
 // previously only happened from ~LidarOdometry(), after other modules may
@@ -112,6 +114,7 @@ void LidarOdometry::shutdownCleanup()
     worker_lidar_.clear();
     worker_others_.clear();
     worker_viz_.clear();
+    worker_viz_local_map_.clear();
 
     if (params_.simplemap.generate) {
       saveReconstructedMapToFile();
@@ -160,11 +163,18 @@ void LidarOdometry::spinOnce()
     auto lckGuiMtx = mrpt::lockHelper(state_gui_mtx_);
     guiCreated = gui_.gui_created;
   }
-  if (
-    visualizer_ &&
-    ((state_.local_map && state_.local_map->empty()) || !isActive() || !guiCreated)) {
-    if (mrpt::Clock::nowDouble() - gui_.timestampLastUpdateUI > 1.0) {
-      updateVisualization({}, {});
+  // Evaluated before taking state_mtx_, since it uses state_flags_mtx_:
+  const bool isNowActive = isActive();
+
+  if (visualizer_) {
+    // updateVisualization() reads state_, so it must be called with state_mtx_
+    // held:
+    std::unique_lock<std::mutex> lckState(state_mtx_);
+
+    if (
+      ((state_.local_map && state_.local_map->empty()) || !isNowActive || !guiCreated) &&
+      mrpt::Clock::nowDouble() - gui_.timestampLastUpdateUI > 1.0) {
+      updateVisualization({}, {}, lckState);
     }
   }
 
@@ -202,6 +212,10 @@ void LidarOdometry::reset()
   // state_mtx_ is a plain (non-recursive) mutex.
   {
     auto lck = mrpt::lockHelper(state_mtx_);
+    // Replacing state_ wholesale also destroys the parameter source, the
+    // gravity estimator and the rest of the IMU-fed state, which the IMU worker
+    // thread reaches without state_mtx_:
+    auto lckImu = mrpt::lockHelper(imu_state_mtx_);
     state_ = MethodState();
   }
   initialize(lastInitConfig_);
@@ -666,7 +680,10 @@ void LidarOdometry::doWriteDebugTracesFile(const mrpt::Clock::time_point & scan_
 
   auto & of = debug_traces_of_.value();
 
-  auto vars = state_.parameter_source.getVariableValues();
+  auto vars = [this]() {
+    auto lckImu = mrpt::lockHelper(imu_state_mtx_);
+    return state_.parameter_source.getVariableValues();
+  }();
   vars["timestamp"] = mrpt::Clock::toDouble(scan_ref_time);
   vars["time_onLidar"] = profiler_.getLastTime("onLidar");
 
