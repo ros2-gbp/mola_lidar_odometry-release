@@ -36,17 +36,40 @@
 #include <mola_kernel/interfaces/SharedKeyframeMap.h>
 #define MOLA_HAS_SHARED_KEYFRAME_MAP_SINK 1
 #endif
+#if __has_include(<mola_kernel/interfaces/TransformTreeSource.h>)
+#include <mola_kernel/interfaces/TransformTreeSource.h>
+/** Feature macro: mola_kernel provides mola::TransformTreeSource, enabling
+ *  the optional /tf tree visualization. */
+#define MOLA_HAS_TRANSFORM_TREE_SOURCE 1
+#endif
 #include <mola_kernel/version.h>
 
 // Other packages:
 #include <mola_imu_preintegration/ImuInitialCalibrator.h>
-#include <mola_pose_list/SearchablePoseList.h>
+#if __has_include(<mola_imu_preintegration/MapGravityEstimator.h>)
+#include <mola_imu_preintegration/MapGravityEstimator.h>
+/** Feature macro: mola_imu_preintegration provides mola::imu::MapGravityEstimator,
+ *  used here to estimate the gravity direction IN THE MAP FRAME instead of
+ *  freezing it from a single accelerometer average at the first keyframe. */
+#define MOLA_LO_HAS_MAP_GRAVITY_ESTIMATOR 1
+#endif
+#include <mola_lidar_odometry/KeyframeDecider.h>
 
 // MP2P_ICP
 #include <mp2p_icp/ICP.h>
 #include <mp2p_icp/Parameterizable.h>
 #include <mp2p_icp_filters/FilterBase.h>
 #include <mp2p_icp_filters/Generator.h>
+
+// The yaw-free, rank-2 gravity prior is only available in recent mp2p_icp
+// versions. Keep building against older ones, falling back at run time to the
+// legacy path that folds tilt into the SE(3) pose prior.
+#if defined(__has_include)
+#if __has_include(<mp2p_icp/GravityPrior.h>)
+#include <mp2p_icp/GravityPrior.h>
+#define MOLA_LO_HAS_MP2P_GRAVITY_PRIOR 1
+#endif
+#endif
 
 // MRPT
 #include <mrpt/containers/circular_buffer.h>
@@ -67,6 +90,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <regex>
 #include <string>
 #include <vector>
@@ -138,6 +162,20 @@ public:
 
   struct Parameters : public mp2p_icp::Parameterizable
   {
+    /** Loads the keyframe-creation policy shared by the local-map and
+         *  simplemap sections. Lives here, and not in KeyframeDecisionOptions
+         *  itself, because the two distance thresholds may be formulas and
+         *  must register into THIS object's dynamic-parameter pool.
+         *  \param section_name Only used in error messages.
+         *  \param distances_required Whether the two distance thresholds must
+         *         be present in the YAML. Kept per-section for backwards
+         *         compatibility: the local-map section demands them, the
+         *         simplemap one defaults them.
+         */
+    void load_keyframe_policy(
+      mola::KeyframeDecisionOptions & o, const Yaml & cfg, const char * section_name,
+      bool distances_required);
+
     /** List of sensor labels or regex's to be matched to input observations
          *  to be used as raw lidar observations.
          */
@@ -188,29 +226,18 @@ public:
 
     MultipleLidarOptions multiple_lidars;
 
-    struct MapUpdateOptions
+    /** Keyframe-creation policy for the LOCAL METRIC MAP. The distance
+         * thresholds, the occupancy count and the temporal window all come
+         * from mola::KeyframeDecisionOptions, shared with SimpleMapOptions;
+         * they stay plain (non-nested) YAML keys of the `local_map_updates`
+         * section.
+         */
+    struct MapUpdateOptions : public mola::KeyframeDecisionOptions
     {
       /** If set to false, the odometry system can be used as
              * localization-only.
              */
       bool enabled = true;
-
-      /** Minimum Euclidean distance (x,y,z) between keyframes inserted
-             * into the local map [meters]. */
-      double min_translation_between_keyframes = 1.0;
-
-      /** Minimum rotation (in 3D space, yaw, pitch,roll, altogether)
-             * between keyframes inserted into
-             * the local map [in degrees]. */
-      double min_rotation_between_keyframes = 30.0;
-
-      /** If true, distance from the last map update are only considered.
-             * Use if mostly mapping without "closed loops".
-             *
-             *  If false (default), a KD-tree will be used to check the distance
-             * to *all* past map insert poses.
-             */
-      bool measure_from_last_kf_only = false;
 
       /** Should match the "remove farther than" option of the local
              * metric map. 0 means deletion of distant keyframes is disabled.
@@ -222,14 +249,6 @@ public:
              * how often to do the distant keyframes clean up.
              */
       uint32_t check_for_removal_every_n = 100;
-
-      /** Minimum number of stored poses within the threshold distance
-             *  before a volume is considered "occupied" and no new keyframe
-             *  is inserted there. Default=1 gives the classic behavior.
-             *  Increase to 2+ for non-repetitive-scan lidars (e.g. Livox)
-             *  so multiple scans are taken from each location.
-             */
-      uint32_t min_nearby_poses_occupied = 1;
 
       /** Publish updated map via mola::MapSourceBase once every N frames
              */
@@ -277,6 +296,44 @@ public:
       float current_pose_corner_size = 1.5f;  //! [m]
       float sensor_poses_corner_size = 0.5f;  //! [m], 0 to disable
 
+      /** Whether to render the current-pose XYZ corner at all (independently
+             * of current_pose_corner_size). Useful to turn off from a
+             * first-person camera, where the corner ends up filling the whole
+             * view. Can also be changed at runtime via
+             * setCurrentPoseCornerVisualization().
+             */
+      bool show_current_pose_corner = true;
+
+      // --- Robot /tf tree ---
+      /** Draws the subtree of coordinate frames below tf_tree_root_frame
+       * (e.g. a legged robot's joints) as it moves. Opt-in: it requires the
+       * data source to implement mola::TransformTreeSource, and costs one
+       * subtree snapshot per visualization update. */
+      bool show_tf_tree = false;
+
+      /** Subtree root. Empty (default) means "ask the data source" (its
+       * base_link_frame_id, via TransformTreeSource). */
+      std::string tf_tree_root_frame;
+
+      float tf_tree_corner_size = 0.1f;  //! [m]
+
+      /** Draws a link from each frame to its parent. Rendered as thin
+       * cylinders rather than GL lines, which MRPT cannot draw with a
+       * configurable thickness and are barely visible. */
+      bool tf_tree_show_links = true;
+
+      /** Radius of the tf_tree_show_links cylinders. */
+      float tf_tree_link_radius = 0.02f;  //! [m]
+
+      /** Draws each frame's name next to it. */
+      bool tf_tree_show_names = false;
+
+      /** Comma-separated frame names to leave out, together with their own
+       * subtrees. Datasets do publish inverted edges (e.g. "base -> odom"
+       * instead of "odom -> base"), which would otherwise drag a whole
+       * unrelated, far-away subtree into the robot's own tree. */
+      std::string tf_tree_exclude_frames;
+
       // --- Ground grid ---
       bool show_ground_grid = true;
       float ground_grid_spacing = 5.0f;
@@ -318,7 +375,6 @@ public:
       int map_update_decimation = 10;
 
       bool gui_subwindow_starts_hidden = false;
-      std::atomic<bool> show_console_messages{true};
 
       // --- Tab visibility ---
       bool show_tab_status = true;
@@ -420,26 +476,16 @@ public:
     std::map<AlignKind, ICP_case> icp;
 
     // === SIMPLEMAP GENERATION ====
-    struct SimpleMapOptions
+    /** Keyframe-creation policy for the SIMPLEMAP, which is also the one
+         * pushed to a mola::SharedKeyframeMap sink (the central mapper's
+         * keyframe backbone). Same shared policy as MapUpdateOptions, but
+         * tuned independently: unlike the local map, this one feeds loop
+         * closure, so it is the one that usually wants
+         * `nearby_keyframe_time_window` enabled.
+         */
+    struct SimpleMapOptions : public mola::KeyframeDecisionOptions
     {
       bool generate = false;
-
-      /** Minimum Euclidean distance (x,y,z) between keyframes inserted
-             * into the simplemap [meters]. */
-      double min_translation_between_keyframes = 1.0;
-
-      /** Minimum rotation (in 3D space, yaw, pitch,roll, altogether)
-             * between keyframes inserted into
-             * the map [in degrees]. */
-      double min_rotation_between_keyframes = 30.0;
-
-      /** If true, distance from the last map update are only considered.
-             * Use if mostly mapping without "closed loops".
-             *
-             *  If false (default), a KD-tree will be used to check the distance
-             * to *all* past map insert poses.
-             */
-      bool measure_from_last_kf_only = false;
 
       /** If not empty, the final simple map will be dumped to a file at
              * destruction time */
@@ -471,13 +517,6 @@ public:
 
       /** If enabled, saved keyframes will contain an additional 'deskewed' observation with the motion-compensated cloud. */
       bool save_deskewed_scans = false;
-
-      /** Minimum number of stored poses within the threshold distance
-             *  before a volume is considered "occupied" and no new keyframe
-             *  is inserted there. Default=1 gives the classic behavior.
-             *  Increase to 2+ for non-repetitive-scan lidars (e.g. Livox).
-             */
-      uint32_t min_nearby_poses_occupied = 1;
 
       void initialize(const Yaml & c, Parameters & parent);
     };
@@ -574,11 +613,37 @@ public:
 
     struct IMUGravityCorrection
     {
-      /// Enable accelerometer-based pitch/roll correction in ICP prior.
+      /// Enable accelerometer-based pitch/roll correction of the ICP solution.
       bool enabled = true;
 
-      /// Sigma [degrees] for the gravity-derived pitch/roll prior.
-      /// Lower values = more trust in IMU. Typical: 1–5 deg.
+      /// Apply the verticality constraint as mp2p_icp's yaw-free, rank-2
+      /// `gravityPrior` (recommended) instead of folding the gravity-derived
+      /// pitch/roll into the SE(3) pose prior.
+      ///
+      /// The legacy path (false) encodes tilt in a 6x6 prior information
+      /// matrix, whose diagonal only isolates roll/pitch near yaw=0 and which
+      /// injects translation directly. Kept selectable for reproducibility of
+      /// older results.
+      ///
+      /// Requires an mp2p_icp version providing mp2p_icp::GravityPrior; when
+      /// built against an older one this silently falls back to the legacy
+      /// path (with a warning), it does not fail.
+      bool use_rank2_prior = true;
+
+      /// Widen `sigma_deg` in quadrature by the MEASURED angular dispersion of
+      /// the buffered accelerometer directions, so the constraint stands down
+      /// automatically when the accelerometer is not actually measuring
+      /// gravity.
+      ///
+      /// Needed because the quasi-static acceptance gate alone is far too
+      /// permissive: accepting |norm(a) - g| <= 2 m/s^2 admits up to
+      /// asin(2/9.81) ~= 11.8 deg of aliased tilt. Without this, on a real
+      /// vehicle the gravity constraint asserts tilt information the reading
+      /// does not contain, and odometry gets worse rather than better.
+      bool adaptive_sigma = true;
+
+      /// Sigma [degrees] for the gravity-derived verticality constraint.
+      /// Lower values = more trust in IMU. Typical: 1 to 5 deg.
       double sigma_deg = 2.0;
 
       /// Number of recent accelerometer samples to average for gravity estimation.
@@ -587,6 +652,56 @@ public:
       /// Maximum age [seconds] for accelerometer samples used in averaging.
       /// Samples older than this are discarded. 0 = no age limit.
       double max_age_seconds = 2.0;
+
+      /// Estimate the map-frame gravity direction online, instead of freezing
+      /// it from one accelerometer average at the first keyframe.
+      ///
+      /// The frozen capture is only as good as `averaging_samples` worth of
+      /// accelerometer while the platform is not actually static: measured on
+      /// a handheld sequence, independent 50 ms averages disagree by ~4 deg
+      /// RMS, and whatever value happens to be captured then biases the
+      /// verticality reference for the whole run.
+      ///
+      /// mola::imu::MapGravityEstimator instead solves for gravity in the map
+      /// frame (plus IMU biases) from preintegrated IMU and this odometry's
+      /// own relative attitudes and velocities, so platform acceleration
+      /// cancels and no quasi-static window is needed. Its `up_map` and its
+      /// earned sigma then replace the frozen ones.
+      struct MapGravity
+      {
+        bool enabled = false;
+
+        /// Run a solve() every N closed intervals (a solve is a small
+        /// Gauss-Newton over the window, but not free).
+        uint32_t solve_every_n = 5;
+
+        /// Minimum wall-clock span [s] of one interval. Gravity is recovered as
+        /// (v_to - v_from - R_from*dV)/dt, so a velocity error eps shows up as
+        /// a gravity error eps/dt: closing an interval every scan (dt ~ 0.1 s)
+        /// turns a 0.1 m/s velocity error into ~6 deg of apparent tilt.
+        double min_interval_seconds = 1.0;
+
+        /// Run the estimator and log its result, but do NOT let it influence
+        /// the verticality constraint. The trajectory then comes out identical
+        /// to a run with `enabled: false`, which is what makes the estimate
+        /// scoreable against ground truth: with the feedback loop closed, the
+        /// map frame it is estimating is partly its own doing.
+        ///
+        /// Use this to validate the estimator on a new dataset before trusting
+        /// it, and keep it OFF in production.
+        bool log_only = false;
+
+        /// Options forwarded verbatim to mola::imu::MapGravityEstimator, so its
+        /// parameters do not have to be mirrored here. Note that its own
+        /// defaults are tuned for a different use: `window_size` in particular
+        /// wants to be much larger here (100+ rather than 20), since the whole
+        /// point is that verticality information accumulates.
+        mrpt::containers::yaml estimator_params;
+
+        void initialize(const Yaml & c);
+      };
+
+      MapGravity map_gravity;
 
       void initialize(const Yaml & c);
     };
@@ -698,6 +813,11 @@ public:
      *  trajectory appearance instead of toggling the scene object externally. */
   void setTrajectoryVisualization(bool show, const std::vector<float> & rgba);
 
+  /** Shows or hides the current-pose XYZ corner opengl object. Useful for a
+     *  host using a first-person camera placed at the vehicle pose, where the
+     *  corner would otherwise fill the whole view. */
+  void setCurrentPoseCornerVisualization(bool show);
+
   /** @} */
 
   /** @name Virtual interface of Relocalization
@@ -767,6 +887,11 @@ private:
 
     mrpt::poses::CPose3D last_keyframe_pose;
     std::optional<mrpt::poses::CPose3DPDFGaussianInf> prior;
+#if defined(MOLA_LO_HAS_MP2P_GRAVITY_PRIOR)
+    /// Yaw-free, rank-2 gravity observation (alternative to folding tilt into
+    /// `prior`; see buildGravityPrior()). Only set when the rank-2 path is on.
+    std::optional<mp2p_icp::GravityPrior> gravityPrior;
+#endif
     id_t global_id = mola::INVALID_ID;
     id_t local_id = mola::INVALID_ID;
     double time_since_last_keyframe = 0;
@@ -812,12 +937,15 @@ private:
     std::size_t drop_frames_stats_next_index = 0;
     // ------ ^^^ end of these flags are protected ^^^^      ---------
 
-    // All other fields are protected by state_mtx_
+    // All other fields are protected by state_mtx_, EXCEPT the ones marked
+    // below as protected by imu_state_mtx_ (the state the IMU worker thread
+    // feeds; see that mutex's docs for the full list and the lock order).
 
     // will be true after the first incoming LiDAR frame and re-localization is enabled and run
     bool initial_localization_done = false;
 
-    /// Used for pitch & roll initialization
+    /// Used for pitch & roll initialization.
+    /// Protected by imu_state_mtx_.
     std::optional<mola::imu::ImuInitialCalibrator> imu_initializer;
 
     /// Accumulates recent accelerometer readings and provides
@@ -841,9 +969,50 @@ private:
       /// max_age_seconds <= 0 means no age filtering.
       std::optional<std::pair<double, double>> estimatedPitchRoll(
         uint32_t required_samples, double max_age_seconds) const;
+
+      /// Empirical 1-sigma [rad] of the gravity DIRECTION over the samples
+      /// currently in the buffer: the RMS angle between each buffered sample's
+      /// direction and their mean direction.
+      ///
+      /// This is the honest uncertainty of the reading, measured rather than
+      /// assumed. While quasi-static it is small; under real vehicle dynamics
+      /// (braking, cornering, vibration) the accepted samples disagree and it
+      /// grows, so a caller that adds it in quadrature to its configured sigma
+      /// gets a verticality constraint that self-silences exactly when the
+      /// quasi-static assumption behind it stops holding.
+      ///
+      /// nullopt if fewer than 2 usable samples.
+      std::optional<double> directionDispersionSigma(double max_age_seconds) const;
     };
 
+    /// Protected by imu_state_mtx_.
     GravityEstimator gravity_estimator;
+
+#if defined(MOLA_LO_HAS_MAP_GRAVITY_ESTIMATOR)
+    /// Online estimate of gravity in the MAP frame (plus IMU biases), used to
+    /// replace the one-shot `gravity_calib_pitch_roll` capture when
+    /// `imu_gravity_correction.map_gravity.enabled`.
+    struct MapGravityState
+    {
+      mola::imu::MapGravityEstimator estimator;
+      mola::imu::ImuPreintegrator preintegrator;
+
+      /// Wall-clock stamp of the last IMU sample fed to the preintegrator, to
+      /// derive dt for the next one.
+      std::optional<double> last_imu_time;
+
+      /// Open interval start: stamp, attitude and map-frame velocity captured
+      /// when the previous scan was committed.
+      std::optional<double> open_t_from;
+      mrpt::poses::CPose3D open_R_from;
+      mrpt::math::TVector3D open_v_from{0, 0, 0};
+
+      uint32_t intervals_since_solve = 0;
+    };
+
+    /// Protected by imu_state_mtx_.
+    MapGravityState map_gravity;
+#endif
 
     /// Gravity-derived (pitch, roll), in radians, captured at the time the first
     /// keyframe (map origin) was created. The IMU gravity estimator reports
@@ -853,6 +1022,17 @@ private:
     /// offset is required to correctly re-express later absolute IMU tilt
     /// readings relative to the (possibly non-level) map frame.
     std::optional<std::pair<double, double>> gravity_calib_pitch_roll;
+
+    /// Vehicle pose at the instant `gravity_calib_pitch_roll` was captured.
+    /// The capture is attempted at the first keyframe, but the accelerometer
+    /// average is often not available yet there: at the very first scan the
+    /// IMU buffer holds only the few milliseconds that arrived before it, and
+    /// the quasi-static gate rejects most of those on a moving platform. It is
+    /// therefore retried on later scans, and the reading has to be transported
+    /// through the pose it was taken at to still refer to the map frame.
+    /// Equals `fixed_initial_pose` when the first attempt succeeds, which is
+    /// what makes the retry a strict extension of the original behavior.
+    std::optional<mrpt::poses::CPose3D> gravity_calib_pose;
 
     mrpt::poses::CPose3DPDFGaussian last_lidar_pose;  //!< in local map
 
@@ -889,9 +1069,19 @@ private:
     std::shared_ptr<mola::SharedKeyframeMap> shared_keyframe_map_sink;
 #endif
 
+#if defined(MOLA_HAS_TRANSFORM_TREE_SOURCE)
+    // Data source exposing a /tf tree (dataset reader or live ROS bridge), if
+    // any is present in the running MOLA system. Optional: nullptr if none is
+    // found, in which case the /tf tree visualization stays empty.
+    std::shared_ptr<mola::TransformTreeSource> transform_tree_source;
+#endif
+
     std::optional<NavState> last_motion_model_output;
 
-    /// The source of "dynamic variables" in ICP pipelines:
+    /// The source of "dynamic variables" in ICP pipelines.
+    /// Protected by imu_state_mtx_: besides the variable map and the realize()
+    /// flags, it owns the localVelocityBuffer that IMU samples write and the
+    /// LiDAR deskew stage reads.
     mp2p_icp::ParameterSource parameter_source;
 
     // KISS-ICP-like adaptive threshold method:
@@ -906,6 +1096,8 @@ private:
     std::optional<double> estimated_observation_radius;
     std::optional<double> instantaneous_observation_radius;
 
+    /// Invocations are protected by imu_state_mtx_: apply_generators() on an
+    /// IMU observation appends to parameter_source.localVelocityBuffer.
     mp2p_icp_filters::GeneratorSet obs_generators;
     mp2p_icp_filters::FilterPipeline pc_filterAdjustTimes;
     mp2p_icp_filters::FilterPipeline pc_prefilter;
@@ -933,8 +1125,8 @@ private:
 
     // to check for map updates. Defined as optional<> so we enforce
     // setting their type in the ctor:
-    std::optional<SearchablePoseList> distance_checker_local_map;
-    std::optional<SearchablePoseList> distance_checker_simplemap;
+    std::optional<KeyframeDecider> kf_decider_local_map;
+    std::optional<KeyframeDecider> kf_decider_simplemap;
 
     /// See check_for_removal_every_n
     uint32_t localmap_check_removal_counter = 0;
@@ -980,7 +1172,9 @@ private:
     // to the GUI thread directly: each update clones it into a fresh
     // CSetOfObjects wrapper before dispatch.
     mrpt::opengl::CSetOfLines::Ptr glEstimatedPath;
-    int mapUpdateCnt = std::numeric_limits<int>::max();
+    /// Decimation counter for the local map visualization. Saturating (never
+    /// wraps around), so its maximum value means "refresh at the next chance".
+    unsigned int mapUpdateCnt = std::numeric_limits<unsigned int>::max();
 
     // List of old observations to be unload()'ed, to save RAM if:
     // 1) building a simplemap, and
@@ -992,6 +1186,7 @@ private:
     std::map<std::string, mrpt::containers::circular_buffer<double>> recent_lidar_stamps;
 
     /// Used to estimate sensor rate
+    /// Protected by imu_state_mtx_.
     mrpt::containers::circular_buffer<double> recent_imu_stamps{1500};
 
     /// Used to estimate GNSS sensor rate
@@ -1045,6 +1240,39 @@ private:
   /// arrival-based period estimate above. Guarded by the wait-list mutex.
   double last_lidar_arrival_stamp_ = 0;
 
+#if defined(MOLA_LO_HAS_MP2P_GRAVITY_PRIOR)
+  /// Builds the yaw-free rank-2 gravity observation for the current scan from
+  /// the accelerometer gravity estimate, expressed against the map-frame
+  /// gravity direction captured at the map origin. nullopt if no reading yet.
+  /// Caller must hold state_mtx_.
+  [[nodiscard]] std::optional<mp2p_icp::GravityPrior> buildGravityPrior() const;
+#endif
+
+  /// The gravity sigma [rad] actually applied this scan: the configured
+  /// `imu_gravity_correction.sigma_deg`, optionally widened by the measured
+  /// direction dispersion (see `adaptive_sigma`). Caller must hold state_mtx_.
+  [[nodiscard]] double effectiveGravitySigmaRad() const;
+
+  /// Captures the map-origin verticality reference from the accelerometer, if
+  /// it has not been captured yet and an average is available. Safe (and
+  /// intended) to call on every scan: it is a no-op once captured.
+  /// `poseAtCapture` is the vehicle pose the reading belongs to, needed to
+  /// express it in the map frame. Caller must hold state_mtx_.
+  void captureMapOriginVerticality(const mrpt::poses::CPose3D & poseAtCapture);
+
+#if defined(MOLA_LO_HAS_MAP_GRAVITY_ESTIMATOR)
+  /// Feeds one IMU observation into the map-gravity preintegrator, in the
+  /// vehicle frame. Caller must hold state_mtx_.
+  void accumulateImuForMapGravity(const mrpt::obs::CObservationIMU & imu);
+
+  /// Closes the currently open preintegration interval at the just-committed
+  /// scan pose, appends it to the map-gravity estimator, and periodically
+  /// re-solves. Caller must hold state_mtx_.
+  void closeMapGravityInterval(
+    double timestamp, const mrpt::poses::CPose3D & pose, const mrpt::math::TTwist3D & twistLocal);
+
+#endif
+
   /** The worker thread pool with 1 thread for processing incoming observations*/
   mrpt::WorkerThreadsPool worker_others_{
     1 /*num threads*/, mrpt::WorkerThreadsPool::POLICY_FIFO, "worker_imu"};
@@ -1058,6 +1286,23 @@ private:
   // serial ordering so a newer clear cannot be overwritten by an older frame's lambda.
   mrpt::WorkerThreadsPool worker_viz_{1, mrpt::WorkerThreadsPool::POLICY_DROP_OLD, "worker_viz"};
 
+  /** Renders the local map for the gui. Same 1-thread POLICY_DROP_OLD rationale
+   *  as worker_viz_, but a pool of its own: with one thread, POLICY_DROP_OLD
+   *  caps the queue at a single pending task, so sharing worker_viz_ would let
+   *  the per-scan current-observation frames drop the (much rarer) local map
+   *  render before it ever runs, and would serialize the two renders.
+   *
+   *  Its task holds raw pointers into `*this` (the profiler and
+   *  local_map_content_mtx_, both declared *after* this pool and therefore
+   *  destroyed *before* it). That is safe only because shutdownCleanup() calls
+   *  clear() on this pool, which joins its thread, and shutdownCleanup() runs
+   *  from the destructor body, i.e. before any member is destroyed. Keep it in
+   *  that list if the shutdown path is ever reworked.
+   *  A still-*pending* render is dropped there rather than waited for: it would
+   *  delay shutdown by a full render to draw a frame nobody will see. */
+  mrpt::WorkerThreadsPool worker_viz_local_map_{
+    1, mrpt::WorkerThreadsPool::POLICY_DROP_OLD, "worker_viz_map"};
+
   MethodState state_;
   const MethodState & state() const { return state_; }
   MethodState stateCopy() const { return state_; }
@@ -1070,6 +1315,7 @@ private:
   MetricChannel::Ptr metric_icp_time_ms_;
   MetricChannel::Ptr metric_icp_goodness_;
   MetricChannel::Ptr metric_onlidar_time_ms_;
+  MetricChannel::Ptr metric_update_local_map_time_ms_;
 #endif
 
   // Accessing this struct in gui_ requires acquiring state_gui_mtx_
@@ -1102,6 +1348,39 @@ private:
   mutable std::mutex drop_stats_mtx_;
   mutable std::mutex state_flags_mtx_;
   mutable std::mutex state_mtx_;
+
+  /// Guards the state shared between the IMU worker thread and the LiDAR
+  /// worker thread, so the former no longer has to wait on state_mtx_, which
+  /// processLidarScan() holds for its whole body (filters, ICP, map update,
+  /// visualization). At 200 Hz IMU / 10 Hz LiDAR that made the IMU thread block
+  /// for essentially the entire duration of every scan, and since
+  /// releaseReadyLidarScansToWorker() runs at the end of onIMU(), that wait fed
+  /// straight back into scan submission latency.
+  ///
+  /// Covers, in MethodState: imu_initializer, gravity_estimator, map_gravity,
+  /// recent_imu_stamps, parameter_source (its variable map, the realize()
+  /// "evaluated" flags, and localVelocityBuffer), and any *invocation* of
+  /// obs_generators (which writes the velocity buffer and reads those flags).
+  ///
+  /// Lock order: state_mtx_ -> local_map_content_mtx_ -> imu_state_mtx_; never
+  /// the reverse. The IMU worker takes only this one (and never the local map),
+  /// so it cannot invert the order.
+  ///
+  /// Recursive because the accessors that take it compose (e.g.
+  /// updatePipelineDynamicVariables() -> updatePipelineTwistVariables(),
+  /// buildGravityPrior() -> effectiveGravitySigmaRad()); locking at accessor
+  /// granularity is what keeps the ownership rule above reviewable, rather than
+  /// threading a lock object through a dozen signatures.
+  mutable std::recursive_mutex imu_state_mtx_;
+
+  /// Guards the *contents* (layers) of MethodState::local_map.
+  /// Rendering the map is O(map size) and would stall every other user of
+  /// state_mtx_ (dataset reader, IMU worker, executor thread) if done under it,
+  /// so the render runs on worker_viz_local_map_ and takes only this one.
+  /// Lock order: a thread that needs both must take state_mtx_ first; it must
+  /// never be held while acquiring state_mtx_.
+  mutable std::mutex local_map_content_mtx_;
+
   mutable std::mutex state_trajectory_mtx_;
   mutable std::recursive_mutex state_simplemap_mtx_;
   mutable std::mutex state_gui_mtx_;
@@ -1157,19 +1436,30 @@ private:
   void updatePipelineTwistVariables(const mrpt::math::TTwist3D & tw);
   void updatePipelineDynamicVariablesRobotPoseOnly();
 
+  /// All these methods read state_, so the caller must own state_mtx_ and pass
+  /// its lock object down, which they assert on entry.
   void updateVisualization(
     const mp2p_icp::metric_map_t & currentObservation,
-    const mrpt::maps::CPointsMap::Ptr & deskewedCloud);
+    const mrpt::maps::CPointsMap::Ptr & deskewedCloud, std::unique_lock<std::mutex> & lckState);
 
   void updateVisualizationInitVehFrame();
   void updateVisualizationCurrentObservation(
     const mp2p_icp::metric_map_t & currentObservation,
     const mrpt::maps::CPointsMap::Ptr & deskewedCloud);
-  void updateVisualizationLocalMap(std::vector<std::function<void()>> & updateTasks);
+  /// Only decides *whether* to refresh the local map view and snapshots what
+  /// that takes; the O(map size) render itself is enqueued on
+  /// worker_viz_local_map_ (see local_map_content_mtx_).
+  void updateVisualizationLocalMap();
   void updateVisualizationPath(std::vector<std::function<void()>> & updateTasks);
+
+  /// Renders the /tf subtree below the configured root frame, as a child of
+  /// the vehicle frame (its poses are relative to the robot body). A no-op
+  /// unless enabled AND a mola::TransformTreeSource was found at init.
+  void updateVisualizationTfTree(
+    std::vector<std::function<void()>> & updateTasks, const std::string & vizFrame);
   void updateVisualizationGravityVector(std::vector<std::function<void()>> & updateTasks);
   void updateVisualizationTextLabels();
-  void updateVisualizationAlways();
+  void updateVisualizationAlways(std::unique_lock<std::mutex> & lckState);
 
   void internalBuildGUI();
   mola::gui::Tab buildTabStatus();
