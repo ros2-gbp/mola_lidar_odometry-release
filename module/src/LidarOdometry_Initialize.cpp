@@ -59,6 +59,10 @@ void LidarOdometry::initialize_frontend(const Yaml & c)
 
   {
     auto lckState = mrpt::lockHelper(state_mtx_);
+    // This block builds the generators/pipelines and attaches them to the
+    // parameter source, all of which the IMU worker thread reaches without
+    // state_mtx_ (sensors may already be feeding by now):
+    auto lckImu = mrpt::lockHelper(imu_state_mtx_);
 
     // One-shot deprecation warning for the legacy *_sensor_* names. Aliases
     // are still honored (dynamic variables are double-published; the *_sensor_*
@@ -230,7 +234,44 @@ void LidarOdometry::initialize_frontend(const Yaml & c)
 
     if (cfg.has("imu_gravity_correction")) {
       params_.imu_gravity_correction.initialize(cfg["imu_gravity_correction"]);
+
+#if defined(MOLA_LO_HAS_MAP_GRAVITY_ESTIMATOR)
+      if (params_.imu_gravity_correction.map_gravity.enabled) {
+        state_.map_gravity.estimator.parameters.load_from(
+          params_.imu_gravity_correction.map_gravity.estimator_params);
+        if (params_.imu_gravity_correction.map_gravity.log_only) {
+          MRPT_LOG_INFO(
+            "imu_gravity_correction.map_gravity enabled in LOG-ONLY mode: the "
+            "estimate is computed and logged but does not reach the verticality "
+            "reference, so the trajectory matches that of a disabled run.");
+        } else {
+          MRPT_LOG_INFO(
+            "imu_gravity_correction.map_gravity enabled: the verticality "
+            "reference will be estimated online instead of frozen at the first "
+            "keyframe.");
+        }
+      }
+#else
+      if (params_.imu_gravity_correction.map_gravity.enabled) {
+        MRPT_LOG_WARN(
+          "imu_gravity_correction.map_gravity is enabled but this build "
+          "lacks mola::imu::MapGravityEstimator; the verticality reference "
+          "will remain frozen at the first keyframe.");
+      }
+#endif
     }
+
+#if !defined(MOLA_LO_HAS_MP2P_GRAVITY_PRIOR)
+    // Built against an mp2p_icp without the rank-2 gravity prior: degrade to
+    // the legacy path instead of failing, so older setups keep working.
+    if (params_.imu_gravity_correction.enabled && params_.imu_gravity_correction.use_rank2_prior) {
+      MRPT_LOG_WARN(
+        "imu_gravity_correction.use_rank2_prior requires a newer mp2p_icp "
+        "providing mp2p_icp::GravityPrior; falling back to the legacy "
+        "pose-prior path.");
+      params_.imu_gravity_correction.use_rank2_prior = false;
+    }
+#endif
 
     if (c.has("initial_localization")) {
       params_.initial_localization.initialize(c["initial_localization"]);
@@ -446,6 +487,22 @@ void LidarOdometry::initialize_frontend(const Yaml & c)
   }
 #endif
 
+#if defined(MOLA_HAS_TRANSFORM_TREE_SOURCE)
+  // Optional: a data source exposing a /tf tree, used only by the (opt-in)
+  // tf-tree visualization. Absent in datasets without /tf, which is fine.
+  {
+    auto srcs = findService<mola::TransformTreeSource>();
+    if (!srcs.empty()) {
+      state_.transform_tree_source = std::dynamic_pointer_cast<TransformTreeSource>(srcs[0]);
+      MRPT_LOG_DEBUG("Detected a TransformTreeSource: /tf tree visualization is available.");
+    } else if (params_.visualization.show_tf_tree) {
+      MRPT_LOG_WARN(
+        "visualization.show_tf_tree is enabled, but no module in this system provides a "
+        "mola::TransformTreeSource: nothing will be drawn.");
+    }
+  }
+#endif
+
   // If using FromStateEstimator initialization, also subscribe to map updates
   // from the state estimator to receive geo-referencing information:
   if (params_.initial_localization.method == InitLocalization::FromStateEstimator) {
@@ -491,6 +548,9 @@ void LidarOdometry::doPreloadLocalMap()
       "Loading map from file: '" << params_.local_map_updates.load_existing_local_map << "'...");
 
     auto lckState = mrpt::lockHelper(state_mtx_);
+    // Guards the map contents against a concurrent visualization render,
+    // which runs without state_mtx_ (see local_map_content_mtx_ docs):
+    auto lckMapContents = mrpt::lockHelper(local_map_content_mtx_);
 
     const bool loadOk =
       state_.local_map->load_from_file(params_.local_map_updates.load_existing_local_map);
