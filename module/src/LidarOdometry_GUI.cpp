@@ -31,16 +31,139 @@
 #include <mrpt/obs/customizable_obs_viz.h>
 #include <mrpt/opengl/CArrow.h>
 #include <mrpt/opengl/CAssimpModel.h>
+#include <mrpt/opengl/CCylinder.h>
 #include <mrpt/opengl/CGridPlaneXY.h>
 #include <mrpt/opengl/COpenGLScene.h>
 #include <mrpt/opengl/CPointCloudColoured.h>
+#include <mrpt/opengl/CSetOfLines.h>
 #include <mrpt/opengl/CText.h>
 #include <mrpt/opengl/stock_objects.h>
 #include <mrpt/system/filesystem.h>
+#include <mrpt/system/string_utils.h>
 #include <mrpt/version.h>
+
+// STD:
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <map>
+#include <mutex>
+#include <set>
+#include <sstream>
 
 namespace mola
 {
+
+namespace
+{
+#if defined(MOLA_HAS_TRANSFORM_TREE_SOURCE)
+/** Splits "a, b ,c" into {"a","b","c"}, ignoring empty items. */
+std::set<std::string> splitCommaSeparated(const std::string & s)
+{
+  std::set<std::string> out;
+  std::stringstream ss(s);
+  std::string item;
+  while (std::getline(ss, item, ',')) {
+    item = mrpt::system::trim(item);
+    if (!item.empty()) {
+      out.insert(item);
+    }
+  }
+  return out;
+}
+
+// tf links render as CCylinder (thin tubes), visible even at a distance,
+// unlike GL lines, which MRPT cannot draw with a configurable thickness.
+// Few radial slices and no end caps keep the per-link triangle count low.
+constexpr uint32_t kTfLinkCylinderSlices = 6;
+
+// A CCylinder's local Z axis runs from its base (at the object's origin) to
+// its top (at height `len`). Orient it so that axis points from `a` to `b`:
+// pitch = acos(nz), yaw = atan2(ny, nx) for the unit direction (nx,ny,nz),
+// derived from MRPT's R = Rz(yaw)*Ry(pitch)*Rx(roll) convention applied to
+// local Z (roll is a free rotation about the cylinder's own axis, so 0 is
+// fine). Returns nullptr for a degenerate (near-zero-length) link.
+mrpt::opengl::CCylinder::Ptr makeTfLinkCylinder(
+  const mrpt::math::TPoint3D & a, const mrpt::math::TPoint3D & b, float radius)
+{
+  const mrpt::math::TPoint3D d = b - a;
+  const double len = d.norm();
+  if (len < 1e-6) {
+    return {};
+  }
+  const double pitch = std::acos(std::clamp(d.z / len, -1.0, 1.0));
+  const double yaw = std::atan2(d.y, d.x);
+
+  auto glCyl =
+    mrpt::opengl::CCylinder::Create(radius, radius, static_cast<float>(len), kTfLinkCylinderSlices);
+  glCyl->setHasBases(false, false);
+  glCyl->setColor_u8(0x80, 0x80, 0x80, 0xff);
+  glCyl->setPose(mrpt::poses::CPose3D(a.x, a.y, a.z, yaw, pitch, 0.0));
+  return glCyl;
+}
+
+/** Fills `out` with one XYZ corner per frame of `tree` (plus, optionally, the
+ *  parent->child links and the frame names), keeping the poses exactly as
+ *  given, i.e. relative to the tree's own root.
+ *
+ *  `subtreeRoot` (empty = the whole tree) selects which subtree to draw;
+ *  `excluded` frames are dropped together with their own subtrees.
+ *
+ *  \return how many frames were actually drawn.
+ */
+size_t renderTfTree(
+  const mola::TransformTree & tree, const std::string & subtreeRoot,
+  const std::set<std::string> & excluded, float cornerSize, bool showLinks, float linkRadius,
+  bool showNames, mrpt::opengl::CSetOfObjects & out)
+{
+  // Nodes come ordered parents-before-children, so both the "keep only this
+  // subtree" and the "drop this frame" tests propagate down in a single pass:
+  const bool wholeTree = subtreeRoot.empty() || subtreeRoot == tree.root;
+  std::set<std::string> kept;
+  std::set<std::string> dropped;
+  std::map<std::string, mrpt::poses::CPose3D> posesByFrame;
+  size_t nDrawn = 0;
+
+  for (const auto & node : tree.nodes) {
+    if (!wholeTree && node.frame != subtreeRoot && kept.count(node.parent) == 0) {
+      continue;
+    }
+    if (excluded.count(node.frame) != 0 || dropped.count(node.parent) != 0) {
+      dropped.insert(node.frame);
+      continue;
+    }
+    kept.insert(node.frame);
+    nDrawn++;
+    posesByFrame[node.frame] = node.pose_in_root;
+
+    if (cornerSize > 0) {
+      auto corner = mrpt::opengl::stock_objects::CornerXYZSimple(cornerSize);
+      corner->setPose(node.pose_in_root);
+      out.insert(corner);
+    }
+
+    if (showNames) {
+      auto label = mrpt::opengl::CText::Create(node.frame);
+      label->setLocation(node.pose_in_root.translation());
+      out.insert(label);
+    }
+
+    if (showLinks && !node.parent.empty()) {
+      if (const auto it = posesByFrame.find(node.parent); it != posesByFrame.end()) {
+        if (auto glCyl = makeTfLinkCylinder(
+              it->second.translation(), node.pose_in_root.translation(), linkRadius);
+            glCyl) {
+          out.insert(glCyl);
+        }
+      }
+    }
+  }
+
+  return nDrawn;
+}
+#endif
+
+}  // namespace
 
 mola::gui::Tab LidarOdometry::buildTabStatus()
 {
@@ -187,17 +310,81 @@ mola::gui::Tab LidarOdometry::buildTabView()
     }});
 
   tab.widgets.emplace_back(CheckBox{
-    "Show log messages", params_.visualization.show_console_messages, [this](bool checked) {
-      this->enqueue_request(
-        [this, checked]() { params_.visualization.show_console_messages = checked; });
-    }});
-
-  tab.widgets.emplace_back(CheckBox{
     "Show gravity-alignment vector", params_.visualization.show_gravity_align_vector,
     [this](bool checked) {
       this->enqueue_request(
         [this, checked]() { params_.visualization.show_gravity_align_vector = checked; });
     }});
+
+  {
+    Row row;
+    row.widgets.emplace_back(CheckBox{
+      "Show /tf tree", params_.visualization.show_tf_tree, [this](bool checked) {
+        this->enqueue_request([this, checked]() { params_.visualization.show_tf_tree = checked; });
+      }});
+    row.widgets.emplace_back(TextBox{
+      "size", std::to_string(params_.visualization.tf_tree_corner_size), 5,
+      [this](std::string s) {  // NOLINT
+        float v = 0;
+        try {
+          v = std::stof(s);
+        } catch (const std::exception &) {
+          return false;
+        }
+        if (v < 0) {
+          return false;
+        }
+        this->enqueue_request([this, v]() { params_.visualization.tf_tree_corner_size = v; });
+        return true;
+      }});
+    tab.widgets.emplace_back(std::move(row));
+  }
+
+  {
+    Row row;
+    row.widgets.emplace_back(
+      CheckBox{"tf links", params_.visualization.tf_tree_show_links, [this](bool checked) {
+                 this->enqueue_request(
+                   [this, checked]() { params_.visualization.tf_tree_show_links = checked; });
+               }});
+    row.widgets.emplace_back(
+      CheckBox{"tf names", params_.visualization.tf_tree_show_names, [this](bool checked) {
+                 this->enqueue_request(
+                   [this, checked]() { params_.visualization.tf_tree_show_names = checked; });
+               }});
+    row.widgets.emplace_back(TextBox{
+      "link radius", std::to_string(params_.visualization.tf_tree_link_radius), 5,
+      [this](std::string s) {  // NOLINT
+        float v = 0;
+        try {
+          v = std::stof(s);
+        } catch (const std::exception &) {
+          return false;
+        }
+        if (v < 0) {
+          return false;
+        }
+        this->enqueue_request([this, v]() { params_.visualization.tf_tree_link_radius = v; });
+        return true;
+      }});
+    tab.widgets.emplace_back(std::move(row));
+  }
+
+  {
+    Row row;
+    row.widgets.emplace_back(TextBox{
+      "tf root", params_.visualization.tf_tree_root_frame, 13, [this](std::string f) {  // NOLINT
+        this->enqueue_request([this, f]() { params_.visualization.tf_tree_root_frame = f; });
+        return true;
+      }});
+    row.widgets.emplace_back(TextBox{
+      "exclude", params_.visualization.tf_tree_exclude_frames, 13,
+      [this](std::string f) {  // NOLINT
+        this->enqueue_request([this, f]() { params_.visualization.tf_tree_exclude_frames = f; });
+        return true;
+      }});
+    tab.widgets.emplace_back(std::move(row));
+  }
 
   const float sensorPosesSize = params_.visualization.sensor_poses_corner_size > 0.0f
                                   ? params_.visualization.sensor_poses_corner_size
@@ -238,9 +425,6 @@ void LidarOdometry::internalBuildGUI()
       const mrpt::Clock::time_point timestamp) {
       using namespace std::string_literals;
 
-      if (!params_.visualization.show_console_messages) {
-        return;
-      }
       if (level < this->getMinLoggingLevel()) {
         return;
       }
@@ -330,6 +514,50 @@ void doRecolorize(
   mrpt::obs::recolorize3Dpc(cloud, org_cloud, rp);
 };
 
+// A deep copy of `m`, cheap enough to make while holding
+// local_map_content_mtx_. It exists to keep that mutex OUT of the render:
+// get_visualization() costs ~6x this copy (167.9 ms vs 28.1 ms mean on an
+// Oxford Spires local map) and touches nothing but the copy, so holding the
+// map mutex across it stalled the LiDAR worker's own map insertion for
+// ~110 ms at a time.
+//
+// Point layers are copied into a plain CGenericPointsMap rather than cloned
+// through their own type: insertAnotherMap() carries every per-point field
+// over and skips non-finite slots, while the target has no spatial index to
+// build. Cloning e.g. mola::IncrementalPointCloud via its copy constructor
+// would instead bulk-build a k-d tree that the renderer never queries.
+// The copy sees, in addition to the live points, the storage slots that are
+// tombstoned but not reclaimed yet; that population measured <2% of storage
+// on Oxford Spires (live/storage 0.999 mean, 0.982 worst), i.e. visually
+// irrelevant, and it is the same trade-off doPublishUpdatedLocalMap() already
+// makes when copying layers out for ROS.
+mp2p_icp::metric_map_t cheapLayerSnapshot(const mp2p_icp::metric_map_t & m)
+{
+  // Shallow copy first, so any metadata this struct grows (id, label, lines,
+  // planes, georeferencing, ...) is carried over without enumerating it here:
+  mp2p_icp::metric_map_t out = m;
+
+  for (auto & [name, layer] : out.layers) {
+    if (!layer) {
+      continue;
+    }
+
+    if (const auto pts = std::dynamic_pointer_cast<mrpt::maps::CPointsMap>(layer); pts) {
+      auto copy = mrpt::maps::CGenericPointsMap::Create();
+      copy->insertAnotherMap(pts.get(), mrpt::poses::CPose3D::Identity());
+      // The renderer reads both of these off the layer:
+      copy->renderOptions = pts->renderOptions;
+      copy->genericMapParams = pts->genericMapParams;
+      layer = copy;
+    } else {
+      // Voxel maps and friends: the RTTI copy is what they support.
+      layer = std::dynamic_pointer_cast<mrpt::maps::CMetricMap>(layer->duplicateGetSmartPtr());
+    }
+  }
+
+  return out;
+}
+
 // Upserts a 3D object, optionally as a child of a movable scene frame node
 // (parentFrame). Falls back to a root insert when built against an older
 // mola_kernel that lacks the movable-frame API.
@@ -377,6 +605,11 @@ void LidarOdometry::setTrajectoryVisualization(bool show, const std::vector<floa
   });
 }
 
+void LidarOdometry::setCurrentPoseCornerVisualization(bool show)
+{
+  enqueue_request([this, show]() { params_.visualization.show_current_pose_corner = show; });
+}
+
 std::string LidarOdometry::vizParentFrame() const
 {
 #if defined(MOLA_KERNEL_VIZ_HAS_MOVABLE_FRAMES)
@@ -389,14 +622,16 @@ std::string LidarOdometry::vizParentFrame() const
 
 void LidarOdometry::updateVisualization(
   const mp2p_icp::metric_map_t & currentObservation,
-  const mrpt::maps::CPointsMap::Ptr & deskewedCloud)
+  const mrpt::maps::CPointsMap::Ptr & deskewedCloud, std::unique_lock<std::mutex> & lckState)
 {
   const ProfilerEntry tle(profiler_, "updateVisualization");
 
   gui_.timestampLastUpdateUI = mrpt::Clock::nowDouble();
 
-  // In this point, we are called by the LIDAR worker thread, so it's safe
-  // to read the state without mutexes.
+  // We may be called either from the LIDAR worker thread or from the executor
+  // thread (spinOnce()), so state_ is read under state_mtx_, already held by
+  // the caller (see lckState).
+  ASSERT_(lckState.owns_lock());
   ASSERT_(visualizer_);
 
   // Movable scene-frame to draw under (empty = viewport root):
@@ -420,7 +655,8 @@ void LidarOdometry::updateVisualization(
   // the parent (MolaViz::update_3d_object deep-reads it on the GUI
   // thread while the lidar worker may keep producing new frames).
   auto glVehicle = mrpt::opengl::CSetOfObjects::Create();
-  if (const auto l = params_.visualization.current_pose_corner_size; l > 0) {
+  if (const auto l = params_.visualization.current_pose_corner_size;
+      params_.visualization.show_current_pose_corner && l > 0) {
     glVehicle->insert(mrpt::opengl::stock_objects::CornerXYZ(l));
   }
   if (const auto l = params_.visualization.sensor_poses_corner_size; l > 0) {
@@ -437,6 +673,10 @@ void LidarOdometry::updateVisualization(
   updateTasks.emplace_back([visualizer = visualizer_, glVehicle, vizFrame]() {
     vizUpsert3D(visualizer, "liodom/vehicle", glVehicle, vizFrame);
   });
+
+  // Robot /tf tree (opt-in):
+  // ---------------------------
+  updateVisualizationTfTree(updateTasks, vizFrame);
 
   // Update current observation
   // ----------------------------
@@ -531,19 +771,15 @@ void LidarOdometry::updateVisualization(
     MRPT_LOG_INFO(s);
   }
 
-  updateVisualizationAlways();
+  updateVisualizationAlways(lckState);
 }
 
-void LidarOdometry::updateVisualizationAlways()
+void LidarOdometry::updateVisualizationAlways(std::unique_lock<std::mutex> & lckState)
 {
+  ASSERT_(lckState.owns_lock());
+
   // Local map: update whenever map content changed, independent of ICP quality.
-  {
-    std::vector<std::function<void()>> updateTasks;
-    updateVisualizationLocalMap(updateTasks);
-    for (const auto & ut : updateTasks) {
-      ut();
-    }
-  }
+  updateVisualizationLocalMap();
 
   // Sub-window with custom UI
   // -------------------------------------
@@ -710,13 +946,24 @@ void LidarOdometry::updateVisualizationCurrentObservation(
   (void)fut;
 }
 
-void LidarOdometry::updateVisualizationLocalMap(std::vector<std::function<void()>> & updateTasks)
+void LidarOdometry::updateVisualizationLocalMap()
 {
   const std::string vizFrame = vizParentFrame();
-  if (
-    params_.visualization.show_localmap && state_.local_map &&
-    ((state_.mapUpdateCnt++ > params_.visualization.map_update_decimation) &&
-     state_.local_map_needs_viz_update)) {
+
+  bool decimationReached = false;
+  if (params_.visualization.show_localmap && state_.local_map) {
+    const auto decimation =
+      static_cast<unsigned int>(std::max(0, params_.visualization.map_update_decimation));
+    decimationReached = state_.mapUpdateCnt > decimation;
+
+    // Saturating increment: the counter is *set* to its maximum value elsewhere
+    // to request an immediate refresh, so it must not wrap around.
+    if (state_.mapUpdateCnt < std::numeric_limits<unsigned int>::max()) {
+      state_.mapUpdateCnt++;
+    }
+  }
+
+  if (decimationReached && state_.local_map_needs_viz_update) {
     const ProfilerEntry tle2(profiler_, "updateVisualization.update_local_map");
 
     state_.mapUpdateCnt = 0;
@@ -732,26 +979,105 @@ void LidarOdometry::updateVisualizationLocalMap(std::vector<std::function<void()
     rp.points.allLayers.render_voxelmaps_free_space =
       params_.visualization.local_map_render_voxelmap_free_space;
 
-    // local map:
-    auto glMap = state_.local_map->get_visualization(rp);
+    // local map: this recolors/renders every point currently in the map, an
+    // O(map size) cost that keeps growing with it (e.g. under
+    // mola::IncrementalPointCloud, whose local map never shrinks back below
+    // its eviction cube), and it used to run right here, on the LiDAR worker
+    // thread: measured at ~55 ms mean / ~120 ms max on a GrandTour mission,
+    // which is what turned one onLidar in ~18 into a >100 ms spike and backed
+    // up the scan queue. So it is handed to a worker instead, where it takes
+    // only the finer-grained local_map_content_mtx_ (never state_mtx_, hence
+    // no inversion of the lock order documented in the class declaration).
+    //
+    // Snapshot all values the worker will need. Avoid any access to state_ or
+    // params_ from the lambda; keeping a shared_ptr to the map also means a
+    // concurrent reset() cannot drop the last reference mid-render.
+    const auto localMap = state_.local_map;
+    auto viz = visualizer_;
+    const auto * profilerPtr = &profiler_;
+    auto * mapContentsMtx = &local_map_content_mtx_;
 
-    updateTasks.emplace_back([visualizer = visualizer_, glMap, vizFrame]() {
-      vizUpsert3D(visualizer, "liodom/localmap", glMap, vizFrame);
+    (void)worker_viz_local_map_.enqueue([=]() {
+      const ProfilerEntry tle3(*profilerPtr, "updateVisualization.update_local_map_thread");
+
+      // Copy under the map mutex, render outside it: see cheapLayerSnapshot().
+      mp2p_icp::metric_map_t snapshot;
+      {
+        const ProfilerEntry tleCopy(*profilerPtr, "updateVisualization.update_local_map_copy");
+        auto lckMapContents = mrpt::lockHelper(*mapContentsMtx);
+        snapshot = cheapLayerSnapshot(*localMap);
+      }
+
+      const auto glMap = snapshot.get_visualization(rp);
+      vizUpsert3D(viz, "liodom/localmap", glMap, vizFrame);
     });
   }
 
   // Clear the local map if the user clicks on "hide it" at runtime:
   if (!params_.visualization.show_localmap) {
-    auto glMap = mrpt::opengl::CSetOfObjects::Create();
-    updateTasks.emplace_back([visualizer = visualizer_, glMap, vizFrame]() {
-      vizUpsert3D(visualizer, "liodom/localmap", glMap, vizFrame);
+    // Routed through the same worker so it is ordered after any render already
+    // enqueued above and cannot be overwritten by it.
+    auto viz = visualizer_;
+    (void)worker_viz_local_map_.enqueue([=]() {
+      auto glMap = mrpt::opengl::CSetOfObjects::Create();
+      vizUpsert3D(viz, "liodom/localmap", glMap, vizFrame);
     });
 
     // Force an immediate redraw the next time the local map is shown again,
     // since it may not change on its own (e.g. localization-only mode):
     state_.local_map_needs_viz_update = true;
-    state_.mapUpdateCnt = std::numeric_limits<int>::max();
+    state_.mapUpdateCnt = std::numeric_limits<unsigned int>::max();
   }
+}
+
+void LidarOdometry::updateVisualizationTfTree(
+  std::vector<std::function<void()>> & updateTasks, const std::string & vizFrame)
+{
+#if defined(MOLA_HAS_TRANSFORM_TREE_SOURCE)
+  const auto & vp = params_.visualization;
+
+  auto glTree = mrpt::opengl::CSetOfObjects::Create();
+
+  if (vp.show_tf_tree && state_.transform_tree_source) {
+    // ALWAYS query from the robot body frame, whatever subtree is to be shown:
+    // the returned poses are relative to the queried root, and the result is
+    // drawn at the vehicle pose below, so querying from any other frame would
+    // offset the whole tree by the (unknown here) body -> root transform.
+    // tf_tree_root_frame then only selects which subtree of it to draw.
+    std::string queryRoot = state_.transform_tree_source->transform_tree_default_root();
+    if (queryRoot.empty()) {
+      queryRoot = vp.tf_tree_root_frame;
+    }
+
+    // Query at the scan time, so the joints match the rendered cloud rather
+    // than the wall clock (the source falls back to its latest data itself).
+    if (const auto tree =
+          state_.transform_tree_source->transform_tree(queryRoot, state_.last_obs_timestamp);
+        tree) {
+      const size_t n = renderTfTree(
+        *tree, vp.tf_tree_root_frame, splitCommaSeparated(vp.tf_tree_exclude_frames),
+        vp.tf_tree_corner_size, vp.tf_tree_show_links, vp.tf_tree_link_radius,
+        vp.tf_tree_show_names, *glTree);
+
+      MRPT_LOG_THROTTLE_DEBUG_FMT(
+        5.0, "[tf tree] Rendering %zu of %zu frame(s) under '%s'.", n, tree->nodes.size(),
+        queryRoot.c_str());
+    } else {
+      MRPT_LOG_THROTTLE_WARN_FMT(
+        5.0, "[tf tree] Root frame '%s' is not known to the data source.", queryRoot.c_str());
+    }
+  }
+
+  // The tree poses are relative to the robot body, so draw it at the same
+  // pose as the vehicle model:
+  glTree->setPose(state_.last_lidar_pose.mean);
+  updateTasks.emplace_back([visualizer = visualizer_, glTree, vizFrame]() {
+    vizUpsert3D(visualizer, "liodom/tf_tree", glTree, vizFrame);
+  });
+#else
+  (void)updateTasks;
+  (void)vizFrame;
+#endif
 }
 
 void LidarOdometry::updateVisualizationPath(std::vector<std::function<void()>> & updateTasks)
@@ -810,9 +1136,12 @@ void LidarOdometry::updateVisualizationGravityVector(
 
   const ProfilerEntry tle2(profiler_, "updateVisualization.update_gravity");
 
-  const auto gravityPR = state_.gravity_estimator.estimatedPitchRoll(
-    params_.imu_gravity_correction.averaging_samples,
-    params_.imu_gravity_correction.max_age_seconds);
+  const auto gravityPR = [this]() {
+    auto lckImu = mrpt::lockHelper(imu_state_mtx_);
+    return state_.gravity_estimator.estimatedPitchRoll(
+      params_.imu_gravity_correction.averaging_samples,
+      params_.imu_gravity_correction.max_age_seconds);
+  }();
 
   if (!gravityPR.has_value()) {
     return;
@@ -848,6 +1177,8 @@ void LidarOdometry::updateVisualizationTextLabels()
     state_.adapt_thres_sigma, state_.last_icp_iterations));
 
   {
+    // recent_imu_stamps is appended by the IMU worker thread:
+    auto lckImu = mrpt::lockHelper(imu_state_mtx_);
     const auto [rate_lidar, rate_imu, rate_gnss] = state_.get_sensor_rates();
     gui_.lbSensorRates->set(mrpt::format(
       "LiDAR=%6.02f Hz | IMU=%6.02f Hz | GNSS=%5.02f Hz", rate_lidar, rate_imu, rate_gnss));
@@ -873,9 +1204,12 @@ void LidarOdometry::updateVisualizationTextLabels()
       "Dropped frames: %5.02f%% (avr queue=%4.02f)", getDropStats() * 100.0, averageLidarQueue));
   }
 
+  // The deciders are created lazily on the first processed scan, while the GUI
+  // may refresh before that (or while initial localization is still pending):
   gui_.lbMapStats->set(mrpt::format(
-    "Keyframes: Localmap=%zu, simplemap=%zu", state_.distance_checker_local_map->size(),
-    state_.distance_checker_simplemap->size()));
+    "Keyframes: Localmap=%zu, simplemap=%zu",
+    state_.kf_decider_local_map ? state_.kf_decider_local_map->size() : 0u,
+    state_.kf_decider_simplemap ? state_.kf_decider_simplemap->size() : 0u));
 
   if (state_.last_motion_model_output) {
     const auto & tw = state_.last_motion_model_output->twist;
