@@ -17,14 +17,25 @@ params:
 
   sigma_imu_angular_velocity: ${MOLA_NAVSTATE_SIGMA_IMU_ANG_VEL|0.05} # [rad/s]
 
+  # Wheel-odometry velocity fusion (CObservationOdometry with hasVelocities=true).
+  # Kept tighter than sigma_relative_pose_* above: wheel encoders give a direct
+  # per-cycle velocity reading, more trustworthy than a pose difference from a
+  # lower-rate/noisier source. Lower further for platforms with accurate
+  # encoders and no wheel slip; raise for loose terrain (mud, gravel, vegetation).
+  sigma_wheel_odom_linear_vel: ${MOLA_NAVSTATE_SIGMA_WHEEL_ODOM_LINVEL|0.1} # [m/s]
+  sigma_wheel_odom_angular_vel: ${MOLA_NAVSTATE_SIGMA_WHEEL_ODOM_ANGVEL|0.05} # [rad/s]
+
   # Velocity Kalman filter: if true, each fuse_*() measurement is fused via a
   # per-component scalar Kalman filter instead of being written directly.
   # Process noise reuses sigma_random_walk_acceleration_linear/angular.
   # Set to true when IMU or ICP produce noisy velocity readings.
   velocity_filter_enabled: ${MOLA_NAVSTATE_VELOCITY_FILTER|true}
 
-  # Optional initial guess for the twist (vx vy vz: m/s, wx wy wz: rad/s):
+  # Optional initial guess for the twist (vx vy vz: m/s, wx wy wz: rad/s),
+  # used only until the first real velocity measurement is fused:
   initial_twist: [ "${MOLA_INITIAL_VX|0.0}", 0.0, 0.0, 0.0, 0.0, 0.0 ]
+  initial_twist_sigma_lin: ${MOLA_INITIAL_TWIST_SIGMA_LIN|20.0} # [m/s]
+  initial_twist_sigma_ang: ${MOLA_INITIAL_TWIST_SIGMA_ANG|3.0} # [rad/s]
 
   # If enabled, the estimator will enforce z, pitch, and roll to be always 0:
   enforce_planar_motion: ${MOLA_NAVSTATE_ENFORCE_PLANAR_MOTION|false}
