@@ -219,12 +219,20 @@ struct Cli
                              "Skip the first N dataset entries {0=default, not used}")
                            ->check(CLI::NonNegativeNumber);
 
+    // The four options below take an environment-variable fallback, spelled
+    // exactly as the mola-cli-launchs/*.yaml files already spell it. A single
+    // dataset profile (scripts/lib/profiles/*.sh) can then drive this offline
+    // CLI and the online launch files from one set of exported variables,
+    // instead of each caller keeping its own flags-vs-env translation table.
+    // An explicit command-line flag still wins over the environment.
     arg_lidarLabel.value = "lidar1";
-    arg_lidarLabel.opt = cmd.add_option(
-      "--lidar-sensor-label", arg_lidarLabel.value,
-      "If provided, this supersedes the values in the 'lidar_sensor_labels' "
-      "entry of the odometry pipeline, defining the sensorLabel/topic name to "
-      "read LIDAR data from. It can be a regular expression {std::regex}");
+    arg_lidarLabel.opt = cmd
+                           .add_option(
+                             "--lidar-sensor-label", arg_lidarLabel.value,
+                             "If provided, this supersedes the values in the 'lidar_sensor_labels' "
+                             "entry of the odometry pipeline, defining the sensorLabel/topic name "
+                             "to read LIDAR data from. It can be a regular expression {std::regex}")
+                           ->envname("MOLA_LIDAR_TOPIC");
 
     arg_imuLabel.value = "imu";
     arg_imuLabel.opt = cmd
@@ -233,6 +241,7 @@ struct Cli
                            "If provided, this supersedes the values in the 'imu_sensor_label' "
                            "entry of the odometry pipeline, defining the sensorLabel/topic name to "
                            "read IMU data from. It can be a regular expression {std::regex}")
+                         ->envname("MOLA_IMU_TOPIC")
                          ->capture_default_str();
 
     arg_baseLinkName.value = "base_link";
@@ -243,6 +252,7 @@ struct Cli
           "Only for rosbag input sources. This defines the /tf frame_id used as "
           "reference frame for the vehicle or robot. It is used to get sensors poses with "
           "respect to the vehicle from /tf data.")
+        ->envname("MOLA_TF_BASE_LINK")
         ->capture_default_str();
 
     arg_tfTopic.value = "/tf";
@@ -252,6 +262,7 @@ struct Cli
           "--tf-topic", arg_tfTopic.value,
           "Only for rosbag2 input: /tf topic name in the bag. Override for namespaced bags "
           "(e.g. '/robot1/tf').")
+        ->envname("MOLA_TF_TOPIC")
         ->capture_default_str();
 
     arg_tfStaticTopic.value = "/tf_static";
@@ -261,6 +272,7 @@ struct Cli
           "--tf-static-topic", arg_tfStaticTopic.value,
           "Only for rosbag2 input: /tf_static topic name in the bag. Override for namespaced "
           "bags (e.g. '/robot1/tf_static').")
+        ->envname("MOLA_TF_STATIC_TOPIC")
         ->capture_default_str();
 
     arg_progressBarPeriod.value = -1.0;
@@ -428,7 +440,7 @@ std::shared_ptr<mola::OfflineDatasetSource> dataset_from_rosbag2(
           sensorLabel: 'gps'
           #type: CObservationGPS  # This will be determined automatically by Rosbag2Dataset
           is_optional: true
-          fixed_sensor_pose: "${GPS_POSE_X|0} ${GPS_POSE_Y|0} ${GPS_POSE_Z|0} ${GPS_POSE_YAW|0} ${GPS_POSE_PITCH|0} ${GPS_POSE_ROLL|0}"  # 'x y z yaw_deg pitch_deg roll_deg'
+          fixed_sensor_pose: "${GNSS_POSE_X|0} ${GNSS_POSE_Y|0} ${GNSS_POSE_Z|0} ${GNSS_POSE_YAW|0} ${GNSS_POSE_PITCH|0} ${GNSS_POSE_ROLL|0}"  # 'x y z yaw_deg pitch_deg roll_deg'
           use_fixed_sensor_pose: ${MOLA_USE_FIXED_GNSS_POSE|false}
         - topic: '%s'
           type: CObservationIMU
@@ -490,13 +502,47 @@ std::shared_ptr<mola::OfflineDatasetSource> dataset_from_rosbag1(
         - topic: ${MOLA_GNSS_TOPIC|'/gps'}
           sensorLabel: 'gps'
           is_optional: true
-          fixed_sensor_pose: "${GPS_POSE_X|0} ${GPS_POSE_Y|0} ${GPS_POSE_Z|0} ${GPS_POSE_YAW|0} ${GPS_POSE_PITCH|0} ${GPS_POSE_ROLL|0}"  # 'x y z yaw_deg pitch_deg roll_deg'
+          fixed_sensor_pose: "${GNSS_POSE_X|0} ${GNSS_POSE_Y|0} ${GNSS_POSE_Z|0} ${GNSS_POSE_YAW|0} ${GNSS_POSE_PITCH|0} ${GNSS_POSE_ROLL|0}"  # 'x y z yaw_deg pitch_deg roll_deg'
           use_fixed_sensor_pose: ${MOLA_USE_FIXED_GNSS_POSE|false}
         - topic: '%s'
           type: CObservationIMU
           # If present, this will override whatever /tf tells about the sensor pose:
           fixed_sensor_pose: "${IMU_POSE_X|0} ${IMU_POSE_Y|0} ${IMU_POSE_Z|0} ${IMU_POSE_YAW|0} ${IMU_POSE_PITCH|0} ${IMU_POSE_ROLL|0}" # 'x y z yaw_deg pitch_deg roll_deg''
           use_fixed_sensor_pose: ${MOLA_USE_FIXED_IMU_POSE|false}
+        # Wheel odometry (disabled by default -- an empty topic name means
+        # no handler is installed, matching lidar_odometry_from_rosbag1.yaml/
+        # rosbag2.yaml's MOLA_ODOMETRY_TOPIC convention exactly, name and
+        # empty-by-default alike, rather than opting every dataset whose bag
+        # happens to carry a topic literally named "/odom" -- a very common
+        # name across unrelated robots/conventions -- into wheel-odom fusion
+        # silently). Set MOLA_ODOMETRY_TOPIC explicitly to enable, e.g. for a
+        # separate odom_*.bag comma-joined into rosbag_filename above
+        # (Rosbag1Dataset merges all listed bags into one topic space).
+        # is_optional is set for readability/consistency with the gps entry
+        # above, but Rosbag1Dataset doesn't actually implement that key (grep
+        # confirms it) -- harmless here regardless, since an empty or absent
+        # topic name is simply never seen in the bag, so no handler ever
+        # fires; nothing about "optional" behavior is being relied on.
+        #
+        # No fixed_sensor_pose here, and this is NOT interchangeable with the
+        # lidar/imu/gps entries above: mrpt::obs::CObservationOdometry cannot
+        # carry a sensor pose at all (getSensorPose()/setSensorPose() are
+        # both no-ops in that class), and Rosbag1Dataset::toOdometry() makes
+        # no attempt to apply one from config either way. If the wheel-
+        # odometry frame has ANY nontrivial rotation relative to base_link,
+        # fusing it here injects motion in the wrong frame -- verified this
+        # is a real, non-hypothetical trap: lidar_odometry_from_citrusfarm.yaml's
+        # odom_wheels entry carries a ~180deg-yaw fixed_sensor_pose (a real
+        # calibration value, matching its lidar entry's rotation) that gets
+        # silently discarded exactly this way, which is why that dataset's
+        # wheel odometry is deliberately NOT enabled anywhere it's actually
+        # invoked (plans-mola-server's run-single-test.sh) as of 2026-08-11.
+        # Fine for a dataset whose wheel-odometry frame is already
+        # (approximately) base_link-aligned, e.g. BotanicGarden's Xsens IMU.
+        - topic: ${MOLA_ODOMETRY_TOPIC|''}
+          sensorLabel: ${MOLA_ODOM_SENSOR_LABEL|odom_wheels}
+          type: CObservationOdometry
+          is_optional: true
 )"""",
     bagsYaml.c_str(), cli.arg_baseLinkName.getValue().c_str(),
     cli.arg_lidarLabel.getValue().c_str(), cli.arg_imuLabel.getValue().c_str())));
@@ -655,6 +701,21 @@ int main_odometry(Cli & cli)
                  "raw sensor data.\n";
   }
 
+  // This is an OFFLINE batch tool: it consumes the dataset as fast as the
+  // pipeline allows, and reproducibility is the whole point of running it.
+  // The smoother's shipped YAML defaults `async_backend` to true, which is the
+  // right setting for a real-time deployment (queries are served from a
+  // lock-free predictor re-anchored on the backend's last completed solve) and
+  // the wrong one here twice over: that serving path is non-deterministic, and
+  // with no clock pacing the front end outruns the backend by construction, so
+  // how stale the anchor is becomes a function of host load rather than of the
+  // data.
+  //
+  // Default it off for this binary, without overwriting an explicit setting
+  // (third argument 0), so anyone who really wants the real-time path can still
+  // ask for it. Datasets whose YAML does not read this variable are unaffected.
+  setenv("MOLA_ASYNC_BACKEND", "false", 0 /* do not overwrite */);
+
   // Make mandatory to specify state estimation config file, so defaults and initialize() are not skipped
   {
     const auto seParamsFile = cli.arg_stateEstimatorParams.getValue();
@@ -777,6 +838,9 @@ int main_odometry(Cli & cli)
   if (cli.arg_outTwist.isSet()) {
     outTwist.emplace();
   }
+  /// Timestamp of the last observation fed, to stamp the twist of the state the
+  /// end-of-input flush may still produce:
+  std::optional<mrpt::Clock::time_point> lastObsTimestamp;
 
   // Save GT, if available:
   if (cli.arg_outPath.isSet() && dataset->hasGroundTruthTrajectory()) {
@@ -933,6 +997,22 @@ int main_odometry(Cli & cli)
         outTwist->insert(
           obs->timestamp, mrpt::math::TPose3D(tw.vx, tw.vy, tw.vz, tw.wz, tw.wy, tw.wx));
       }
+      lastObsTimestamp = obs->timestamp;
+    }
+  }
+
+  // The dataset is over, so scans still waiting for IMU data covering their
+  // time span will never get it. Process them now, before reading the results
+  // below, or the tail of the trajectory is lost:
+  liodom->flushPendingLidarScans();
+
+  // The flush may have produced one more state, after the loop wrote its last
+  // twist entry:
+  if (outTwist && lastObsTimestamp) {
+    if (const auto optPoseAndTwist = liodom->lastEstimatedState(); optPoseAndTwist) {
+      const auto & [pose, tw] = optPoseAndTwist.value();
+      outTwist->insert(
+        *lastObsTimestamp, mrpt::math::TPose3D(tw.vx, tw.vy, tw.vz, tw.wz, tw.wy, tw.wx));
     }
   }
 
@@ -966,6 +1046,38 @@ int main_odometry(Cli & cli)
 
   return 0;
 }
+
+// Prints the options whose value came from their envname() fallback rather
+// than from the command line. CLI11 does not record the provenance, so this
+// re-derives it: an option that ended up set, has an env fallback, that
+// variable is present, and none of its flag spellings appears in argv.
+void report_options_taken_from_env(const CLI::App & cmd, int argc, char ** argv)
+{
+  const std::vector<std::string> args(argv + 1, argv + argc);
+
+  for (const auto * opt : cmd.get_options()) {
+    const auto & envName = opt->get_envname();
+    if (envName.empty() || opt->count() == 0) {
+      continue;
+    }
+    if (::getenv(envName.c_str()) == nullptr) {
+      continue;
+    }
+    bool onCommandLine = false;
+    for (const auto & name : opt->get_lnames()) {
+      const std::string flag = "--" + name;
+      for (const auto & a : args) {
+        if (a == flag || a.rfind(flag + "=", 0) == 0) {
+          onCommandLine = true;
+        }
+      }
+    }
+    if (!onCommandLine) {
+      std::cout << "Note: " << opt->get_name() << " taken from the environment ($" << envName
+                << "): '" << opt->as<std::string>() << "'\n";
+    }
+  }
+}
 }  // namespace
 
 int main(int argc, char ** argv)
@@ -979,6 +1091,12 @@ int main(int argc, char ** argv)
     } catch (const CLI::ParseError & e) {
       return cli.cmd.exit(e);
     }
+
+    // Options that took their value from the environment change what this
+    // run does without appearing anywhere in the command line, so say so.
+    // Relevant because --lidar-sensor-label / --imu-sensor-label supersede
+    // the pipeline YAML for every input source, rosbag or not.
+    report_options_taken_from_env(cli.cmd, argc, argv);
 
     // Load plugins:
     if (cli.arg_plugins.isSet()) {
