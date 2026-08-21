@@ -21,6 +21,7 @@
 
 // This module:
 #include <mola_lidar_odometry/LidarOdometry.h>
+#include <mola_lidar_odometry/MapFrameRelevel.h>
 
 // mp2p_icp:
 #include <mp2p_icp_filters/FilterDeskew.h>
@@ -123,6 +124,8 @@ void LidarOdometry::closeMapGravityInterval(
             mrpt::RAD2DEG(r.roll_correction), mrpt::RAD2DEG(r.roll_sigma), r.bias_acc.x,
             r.bias_acc.y, r.bias_acc.z, r.bias_gyro.x, r.bias_gyro.y, r.bias_gyro.z,
             r.num_intervals);
+
+          evaluateMapFrameRelevel(r);
         }
       }
     } else {
@@ -140,8 +143,191 @@ void LidarOdometry::closeMapGravityInterval(
     mg.preintegrator.reset_integration();
   }
 }
-#endif
 
+#if defined(MOLA_LO_CAN_RELEVEL_MAP_FRAME)
+void LidarOdometry::evaluateMapFrameRelevel(const mola::imu::MapGravityEstimator::Result & r)
+{
+  // Caller holds state_mtx_ and imu_state_mtx_.
+  const auto & p = params_.imu_gravity_correction.map_gravity;
+  auto & mg = state_.map_gravity;
+
+  if (!p.relevel_map_frame || p.log_only || mg.relevel_decided) {
+    return;
+  }
+
+  // Readiness is a data-quantity question, deliberately expressed as an
+  // interval count and not as the reported sigmas: those are measured to be
+  // roughly an order of magnitude more confident than the estimate is
+  // accurate, so gating on them would not mean what it says.
+  if (r.num_intervals < p.relevel_min_intervals) {
+    return;
+  }
+
+  // The map frame is the frame everything else is anchored to, so once
+  // anything external has been tied to it, moving it is no longer a private
+  // gauge choice:
+  if (
+    state_.map_has_been_loaded || state_.external_georef.has_value() ||
+    (state_.local_map && state_.local_map->georeferencing.has_value())) {
+    mg.relevel_decided = true;
+    MRPT_LOG_INFO(
+      "Map-frame re-leveling stood down: the map frame is already tied to a "
+      "loaded or geo-referenced map.");
+    return;
+  }
+
+  const double tiltDeg = mrpt::RAD2DEG(r.tilt);
+
+  // A tilt this large is not a leaning map, it is a broken estimate; refusing
+  // is cheaper than rotating the whole session by it.
+  constexpr double MAX_PLAUSIBLE_TILT_DEG = 45.0;
+  if (!std::isfinite(tiltDeg) || tiltDeg > MAX_PLAUSIBLE_TILT_DEG) {
+    mg.relevel_decided = true;
+    MRPT_LOG_WARN_FMT(
+      "Map-frame re-leveling stood down: implausible estimated tilt of %.2f deg.", tiltDeg);
+    return;
+  }
+
+  // The magnitude gate. The estimate carries an error of its own, so applying
+  // it to an already-level map frame replaces a small error with a larger one.
+  // Only fire when the tilt removed clearly exceeds the error introduced.
+  if (tiltDeg < p.relevel_min_tilt_deg) {
+    mg.relevel_decided = true;
+    MRPT_LOG_INFO_FMT(
+      "Map-frame re-leveling stood down: estimated tilt %.2f deg is below "
+      "relevel_min_tilt_deg=%.2f deg, so correcting it would not be a net gain "
+      "(%zu intervals, t=%.3f).",
+      tiltDeg, p.relevel_min_tilt_deg, r.num_intervals, r.timestamp);
+    return;
+  }
+
+  mg.relevel_decided = true;
+  mg.pending_relevel =
+    mrpt::poses::CPose3D::FromRotationAndTranslation(r.correction, mrpt::math::TVector3D(0, 0, 0));
+}
+
+void LidarOdometry::applyMapFrameRelevel()
+{
+  // Caller holds state_mtx_ only: the rotation below needs the local-map and
+  // simplemap mutexes, and the lock order forbids taking those while holding
+  // imu_state_mtx_ (which the solve loop that requested this does hold).
+  std::optional<mrpt::poses::CPose3D> pending;
+  {
+    auto lckImu = mrpt::lockHelper(imu_state_mtx_);
+    std::swap(pending, state_.map_gravity.pending_relevel);
+  }
+  if (!pending.has_value()) {
+    return;
+  }
+
+  const auto & b = *pending;
+  const ProfilerEntry tle(profiler_, "onLidar.map_frame_relevel");
+
+  // 1/6: the local map contents.
+  {
+    auto lckMapContents = mrpt::lockHelper(local_map_content_mtx_);
+    if (state_.local_map) {
+      transform_to_new_map_frame(*state_.local_map, b);
+      state_.local_map->metadata["map_frame_relevel_rotation"] = "'" + b.asString() + "'";
+    }
+  }
+  state_.mark_local_map_as_updated(true /*force_republish*/);
+
+  // 2/6: the keyframes already written to the simplemap.
+  {
+    auto lckSM = mrpt::lockHelper(state_simplemap_mtx_);
+    transform_to_new_map_frame(state_.reconstructed_simplemap, b);
+  }
+
+  // 3/6: the published trajectory.
+  {
+    auto lckTraj = mrpt::lockHelper(state_trajectory_mtx_);
+    transform_to_new_map_frame(state_.estimated_trajectory, b);
+  }
+
+  // 4/6: cached poses and the keyframe-density bookkeeping. The deciders hold
+  // map-frame poses, so leaving them behind would make the next distance check
+  // compare frames rather than positions.
+  state_.last_lidar_pose.changeCoordinatesReference(b);
+  if (state_.last_motion_model_output) {
+    state_.last_motion_model_output->pose.changeCoordinatesReference(b);
+    // `twist` is in the vehicle frame, hence invariant.
+  }
+  if (state_.kf_decider_local_map) {
+    state_.kf_decider_local_map->transform_left_multiply(b);
+  }
+  if (state_.kf_decider_simplemap) {
+    state_.kf_decider_simplemap->transform_left_multiply(b);
+  }
+  state_.last_deskewed_scan_for_publishing.reset();
+
+  // 5/6: the state estimator, whose stored poses are map-frame too.
+  if (state_.navstate_fuse) {
+#if defined(MOLA_KERNEL_NAVSTATE_FILTER_HAS_TRANSFORM_FRAME)
+    const bool ok = state_.navstate_fuse->transform_frame(b);
+#else
+    const bool ok = false;
+#endif
+    if (!ok) {
+      // Without frame support the only consistent option is to drop the
+      // estimator state: keeping poses in the old frame would feed the next
+      // ICP an initial guess off by the correction.
+      MRPT_LOG_WARN(
+        "The state estimator cannot re-express its state in a new frame; "
+        "resetting it instead. Expect one scan without a motion model.");
+      state_.navstate_fuse->reset();
+      state_.last_motion_model_output.reset();
+    }
+  }
+
+  // 6/6: the verticality reference is now level by construction, and the
+  // map-gravity estimator's window was expressed in the frame just rotated.
+  {
+    auto lckImu = mrpt::lockHelper(imu_state_mtx_);
+    state_.gravity_calib_pitch_roll = std::make_pair(0.0, 0.0);
+    state_.gravity_calib_pose = mrpt::poses::CPose3D::Identity();
+
+    auto & mg = state_.map_gravity;
+    mg.estimator.reset();
+    mg.preintegrator.reset_integration();
+    mg.open_t_from.reset();
+    mg.intervals_since_solve = 0;
+    mg.applied_relevel = b;
+  }
+
+  MRPT_LOG_INFO_FMT(
+    "Map frame re-leveled once, about the map origin, by [%s] (tilt %.3f deg). "
+    "All map products from here on are gravity-aligned.",
+    b.asString().c_str(),
+    mrpt::RAD2DEG(mrpt::poses::Lie::SO<3>::log(b.getRotationMatrix()).norm()));
+}
+#else
+// Built against a mola/mola_pose_list/mola_kernel without the pieces the gauge
+// change needs. The feature stands down rather than rotating part of the state.
+void LidarOdometry::evaluateMapFrameRelevel(const mola::imu::MapGravityEstimator::Result &)
+{
+  auto & mg = state_.map_gravity;
+  if (!params_.imu_gravity_correction.map_gravity.relevel_map_frame || mg.relevel_decided) {
+    return;
+  }
+  mg.relevel_decided = true;
+  MRPT_LOG_WARN(
+    "map_gravity.relevel_map_frame is enabled but this build cannot apply it: it needs "
+    "SearchablePoseList::transform_left_multiply() and NavStateFilter::transform_frame(), "
+    "which this mola_pose_list / mola_kernel does not provide. Standing down; upgrade "
+    "those packages to use it.");
+}
+
+void LidarOdometry::applyMapFrameRelevel() {}
+#endif
+#endif  // MOLA_LO_HAS_MAP_GRAVITY_ESTIMATOR
+
+// Deliberately NOT inside the map-gravity block above: the rank-2 prior is a
+// mp2p_icp feature and stands on its own, using the map-frame gravity estimate
+// only when there is one (see the inner guard below). Its declaration and its
+// call site are gated on MOLA_LO_HAS_MP2P_GRAVITY_PRIOR alone, so gating the
+// definition on both leaves the symbol undefined whenever a build has the
+// newer mp2p_icp but the older mola_imu_preintegration.
 #if defined(MOLA_LO_HAS_MP2P_GRAVITY_PRIOR)
 std::optional<mp2p_icp::GravityPrior> LidarOdometry::buildGravityPrior() const
 {
@@ -216,7 +402,7 @@ std::optional<mp2p_icp::GravityPrior> LidarOdometry::buildGravityPrior() const
   g.sigma_rad = std::sqrt(s * s + extraSigmaRad * extraSigmaRad);
   return g;
 }
-#endif
+#endif  // MOLA_LO_HAS_MP2P_GRAVITY_PRIOR
 
 void LidarOdometry::captureMapOriginVerticality(const mrpt::poses::CPose3D & poseAtCapture)
 {
@@ -236,6 +422,47 @@ void LidarOdometry::captureMapOriginVerticality(const mrpt::poses::CPose3D & pos
     return;
   }
 
+  // The data is there, but is it gravity? This one reading defines the map's vertical for the
+  // whole run, so defer it while the buffered directions disagree too much, the same way the
+  // capture is already retried when there is no data at all. Deferring forever is not an
+  // option either: a platform that is never still still needs a reference, so after a timeout
+  // the reading is taken as-is.
+  const double maxDisp =
+    mrpt::DEG2RAD(params_.imu_gravity_correction.map_origin_max_dispersion_deg);
+  bool takenOnTimeout = false;
+
+  if (maxDisp > 0) {
+    const auto disp = state_.gravity_estimator.directionDispersionSigma(
+      params_.imu_gravity_correction.max_age_seconds);
+
+    if (disp.has_value() && *disp > maxDisp) {
+      const double now = state_.last_obs_timestamp.has_value()
+                           ? mrpt::Clock::toDouble(*state_.last_obs_timestamp)
+                           : 0.0;
+
+      if (!state_.gravity_calib_first_available_time.has_value()) {
+        state_.gravity_calib_first_available_time = now;
+      }
+      const double waited = now - *state_.gravity_calib_first_available_time;
+      const double timeout = params_.imu_gravity_correction.map_origin_capture_timeout;
+
+      if (timeout <= 0 || waited < timeout) {
+        MRPT_LOG_THROTTLE_INFO_FMT(
+          2.0,
+          "Deferring the map-origin verticality capture: accelerometer dispersion %.2f deg > "
+          "%.2f deg (waited %.1f s)",
+          mrpt::RAD2DEG(*disp), mrpt::RAD2DEG(maxDisp), waited);
+        return;
+      }
+      takenOnTimeout = true;
+      MRPT_LOG_WARN_FMT(
+        "Taking the map-origin verticality reference after %.1f s with an accelerometer "
+        "dispersion of %.2f deg (> %.2f deg): the platform never became still, so the map's "
+        "vertical carries that motion.",
+        waited, mrpt::RAD2DEG(*disp), mrpt::RAD2DEG(maxDisp));
+    }
+  }
+
   state_.gravity_calib_pitch_roll = pr;
   state_.gravity_calib_pose = poseAtCapture;
 
@@ -244,9 +471,9 @@ void LidarOdometry::captureMapOriginVerticality(const mrpt::poses::CPose3D & pos
   // tilt behavior is questioned later starts here.
   const auto [p0, r0] = *pr;
   MRPT_LOG_INFO_FMT(
-    "Map-origin verticality reference captured from the accelerometer: "
+    "Map-origin verticality reference captured from the accelerometer%s: "
     "pitch=%.3f roll=%.3f deg (tilt %.3f deg), at pose [%s]",
-    mrpt::RAD2DEG(p0), mrpt::RAD2DEG(r0),
+    takenOnTimeout ? " (on dispersion-gate timeout)" : "", mrpt::RAD2DEG(p0), mrpt::RAD2DEG(r0),
     mrpt::RAD2DEG(std::acos(std::clamp(std::cos(p0) * std::cos(r0), -1.0, 1.0))),
     poseAtCapture.asString().c_str());
 }
@@ -275,7 +502,8 @@ double LidarOdometry::effectiveGravitySigmaRad() const
 }
 
 // here happens the main stuff:
-void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOLINT
+void LidarOdometry::processLidarScan(  // NOLINT
+  const CObservation::ConstPtr & obs, const std::optional<double> imuCoverageEndTime)
 {
   using namespace std::string_literals;
 
@@ -286,6 +514,11 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
   // entry for this scan.
   struct OnLidarTimeMetricReporter
   {
+    // Deleting the copy/move members below makes this a non-aggregate, so it
+    // needs an explicit constructor for the brace initialization used at the
+    // end of the struct.
+    explicit OnLidarTimeMetricReporter(LidarOdometry * s) : self(s) {}
+
     OnLidarTimeMetricReporter(const OnLidarTimeMetricReporter &) = delete;
     OnLidarTimeMetricReporter & operator=(const OnLidarTimeMetricReporter &) = delete;
     OnLidarTimeMetricReporter(OnLidarTimeMetricReporter &&) = delete;
@@ -320,6 +553,15 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
   const auto this_obs_tim = obs->timestamp;
 
   std::unique_lock<std::mutex> lckState(state_mtx_);
+
+  // Feed all the IMU data belonging to this scan's time span into the
+  // IMU-derived state, in timestamp order, before anything reads it. The scan
+  // was held back until that data existed (see sendLidarScanToProcessQueue),
+  // so the set of samples consumed here is fixed by the timestamps alone:
+  if (imuCoverageEndTime) {
+    const ProfilerEntry tleImu(profiler_, "onLidar.0.consume_imu");
+    consumePendingImu(*imuCoverageEndTime);
+  }
 
   // for rate stats:
   state_.append_lidar_stamp(obs->sensorLabel, obs->timestamp, *this);
@@ -741,6 +983,13 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
     // correspondence threshold:
     in.align_kind = hasMotionModel ? AlignKind::RegularOdometry : AlignKind::NoMotionModel;
 
+    // Run totals (reported at shutdown). Counted here rather than where the
+    // warning is emitted, because that one is throttled.
+    state_.registrations_attempted++;
+    if (!hasMotionModel) {
+      state_.registration_no_motion_model++;
+    }
+
     in.icp_params = params_.icp[in.align_kind].icp_parameters;
     in.last_keyframe_pose = state_.last_lidar_pose.mean;
 
@@ -955,6 +1204,9 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
     const bool icpIsGood = (out.goodness >= params_.min_icp_goodness);
 
     state_.last_icp_was_good = icpIsGood;
+    if (!icpIsGood) {
+      state_.registration_icp_rejected++;
+    }
     state_.last_icp_quality = out.goodness;
     state_.last_icp_iterations = out.icp_iterations;
 
@@ -1008,6 +1260,11 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
         mrpt::Clock::toDouble(scan_ref_time), state_.last_lidar_pose.mean,
         state_.last_motion_model_output->twist);
     }
+
+    // If that solve asked for the map frame to be leveled, do it here: before
+    // this scan reaches the local map or the simplemap, so nothing is ever
+    // written in the frame that is about to be replaced.
+    applyMapFrameRelevel();
 #endif
 
     // Update for stats in CSV format:
@@ -1211,6 +1468,7 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
     state_.estimated_trajectory.clear();
     state_.gravity_calib_pitch_roll.reset();  // new map origin: recapture at next first KF
     state_.gravity_calib_pose.reset();
+    state_.gravity_calib_first_available_time.reset();
     updateLocalMap = false;
     state_.last_icp_was_good = true;
 
@@ -1602,6 +1860,19 @@ void LidarOdometry::appendKeyframeMetadataObs(
     auto lckImu = mrpt::lockHelper(imu_state_mtx_);
     return state_.parameter_source.localVelocityBuffer.toYAML();
   }();
+
+#if defined(MOLA_LO_HAS_MAP_GRAVITY_ESTIMATOR)
+  // A map-frame gauge change makes the keyframe poses of this run
+  // non-comparable with those of a run without it, so record it where the
+  // poses themselves are stored.
+  {
+    auto lckImu = mrpt::lockHelper(imu_state_mtx_);
+    if (state_.map_gravity.applied_relevel.has_value()) {
+      kf_metadata["map_frame_relevel_rotation"] =
+        "'"s + state_.map_gravity.applied_relevel->asString() + "'"s;
+    }
+  }
+#endif
 
   // convert yaml to string:
   std::stringstream ss;
