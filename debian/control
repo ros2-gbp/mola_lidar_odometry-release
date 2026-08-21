@@ -1,0 +1,12 @@
+Source: ros-lyrical-mola-lidar-odometry
+Section: misc
+Priority: optional
+Maintainer: "Jose-Luis Blanco-Claraco" <joseluisblancoc@gmail.com>
+Build-Depends: debhelper (>= 9.0.0), cmake, libcli11-dev, ros-lyrical-ament-cmake, ros-lyrical-ament-cmake-gtest, ros-lyrical-ament-cmake-gtest <!nocheck>, ros-lyrical-ament-cmake-xmllint, ros-lyrical-ament-cmake-xmllint <!nocheck>, ros-lyrical-ament-lint-auto <!nocheck>, ros-lyrical-ament-lint-cmake <!nocheck>, ros-lyrical-mola-common, ros-lyrical-mola-imu-preintegration, ros-lyrical-mola-input-kitti-dataset, ros-lyrical-mola-input-kitti360-dataset, ros-lyrical-mola-input-mulran-dataset, ros-lyrical-mola-input-paris-luco-dataset, ros-lyrical-mola-input-rawlog, ros-lyrical-mola-input-rosbag2, ros-lyrical-mola-kernel, ros-lyrical-mola-metric-maps <!nocheck>, ros-lyrical-mola-pose-list, ros-lyrical-mola-state-estimation-simple, ros-lyrical-mola-state-estimation-smoother, ros-lyrical-mola-test-datasets <!nocheck>, ros-lyrical-mola-yaml, ros-lyrical-mp2p-icp, ros-lyrical-mrpt-libmaps, ros-lyrical-ros-environment, ros-lyrical-rosbag2-storage-mcap <!nocheck>, ros-lyrical-ros-workspace
+Homepage: https://docs.mola-slam.org/
+Standards-Version: 3.9.2
+
+Package: ros-lyrical-mola-lidar-odometry
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, libcli11-dev, ros-lyrical-mola-bridge-ros2, ros-lyrical-mola-common, ros-lyrical-mola-imu-preintegration, ros-lyrical-mola-input-kitti-dataset, ros-lyrical-mola-input-kitti360-dataset, ros-lyrical-mola-input-mulran-dataset, ros-lyrical-mola-input-paris-luco-dataset, ros-lyrical-mola-input-rawlog, ros-lyrical-mola-input-rosbag2, ros-lyrical-mola-kernel, ros-lyrical-mola-launcher, ros-lyrical-mola-pose-list, ros-lyrical-mola-state-estimation-simple, ros-lyrical-mola-state-estimation-smoother, ros-lyrical-mola-viz, ros-lyrical-mola-viz-imgui, ros-lyrical-mola-yaml, ros-lyrical-mp2p-icp, ros-lyrical-mrpt-libmaps, ros-lyrical-ros-workspace
+Description: LIDAR odometry system based on MOLA and MRPT components
