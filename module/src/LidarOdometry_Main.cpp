@@ -46,6 +46,7 @@
 
 // STD:
 #include <chrono>
+#include <limits>
 #include <mutex>
 #include <thread>
 
@@ -101,6 +102,10 @@ void LidarOdometry::shutdownCleanup()
 
   try  // must never throw
   {
+    // Before the workers are told to stop: no further input is coming, so any
+    // scan still waiting for IMU data must be processed now or be lost.
+    flushPendingLidarScans();
+
     {
       auto lck = mrpt::lockHelper(is_busy_mtx_);
       destructor_called_ = true;
@@ -115,6 +120,22 @@ void LidarOdometry::shutdownCleanup()
     worker_others_.clear();
     worker_viz_.clear();
     worker_viz_local_map_.clear();
+
+    // Run totals, once, in a form a harness can scrape. `no_motion_model` is
+    // the number the corpus had no aggregate for: it is the difference between
+    // "the state estimator is helping" and "the front end has been registering
+    // scans from a zero-motion guess", and until now it surfaced only as a
+    // throttled warning line that nothing counted.
+    if (state_.registrations_attempted > 0) {
+      const double pctNoModel =
+        100.0 * state_.registration_no_motion_model / state_.registrations_attempted;
+      const double pctRejected =
+        100.0 * state_.registration_icp_rejected / state_.registrations_attempted;
+      MRPT_LOG_INFO_FMT(
+        "Run totals: registrations=%zu no_motion_model=%zu (%.2f%%) icp_rejected=%zu (%.2f%%)",
+        state_.registrations_attempted, state_.registration_no_motion_model, pctNoModel,
+        state_.registration_icp_rejected, pctRejected);
+    }
 
     if (params_.simplemap.generate) {
       saveReconstructedMapToFile();
@@ -213,12 +234,47 @@ void LidarOdometry::reset()
   {
     auto lck = mrpt::lockHelper(state_mtx_);
     // Replacing state_ wholesale also destroys the parameter source, the
-    // gravity estimator and the rest of the IMU-fed state, which the IMU worker
+    // gravity estimator and the rest of the IMU-derived state, which the input
     // thread reaches without state_mtx_:
     auto lckImu = mrpt::lockHelper(imu_state_mtx_);
     state_ = MethodState();
+    pending_imu_.clear();
+    latest_imu_time_ = 0;
+    latest_obs_time_ = 0;
+  }
+  {
+    // Scans still waiting for IMU belong to the pre-reset session:
+    auto lck = mrpt::lockHelper(worker_lidar_wait_for_imu_list_mtx_);
+    worker_lidar_wait_for_imu_list_.trim_to(0);
   }
   initialize(lastInitConfig_);
+}
+
+void LidarOdometry::flushPendingLidarScans()
+{
+  using namespace std::chrono_literals;
+
+  // Infinity: release regardless of IMU coverage. The scans are waiting for
+  // data that will never arrive, so the alternative is to discard them.
+  auto fut = releaseLidarScansToWorker(std::numeric_limits<double>::infinity());
+
+  // Wait on the scan's own task, not on the busy counters: onLidar() only
+  // raises worker_tasks_lidar once it is already running, so there is a window
+  // in which the task is dequeued but no counter shows it, and the caller could
+  // move on (and shutdownCleanup() set destructor_called_) before it starts.
+  if (fut.valid()) {
+    try {
+      fut.get();
+    } catch (const std::future_error &) {
+      // The pool discarded the task under its "keep freshest" policy, which
+      // breaks the promise. Nothing to wait for then.
+    }
+  }
+
+  // Anything else still in flight (e.g. a GNSS task) is covered by the counters:
+  while (isBusy()) {
+    std::this_thread::sleep_for(1ms);
+  }
 }
 
 bool LidarOdometry::isBusy() const
