@@ -304,8 +304,21 @@ void LidarOdometry::Parameters::InitialLocalizationOptions::initialize(const Yam
 
   YAML_LOAD_OPT(additional_uncertainty_after_reloc_how_many_timesteps, uint32_t);
   YAML_LOAD_OPT(additional_map_freeze_after_reloc_how_many_timesteps, uint32_t);
+  YAML_LOAD_OPT(imu_initial_calibration_window_seconds, double);
+  YAML_LOAD_OPT(imu_initial_calibration_min_samples, uint32_t);
+  YAML_LOAD_OPT(imu_initial_calibration_max_dispersion_deg, double);
+  YAML_LOAD_OPT(imu_initial_calibration_dispersion_timeout, double);
   YAML_LOAD_OPT(imu_initial_calibration_sample_count, uint32_t);
   YAML_LOAD_OPT(imu_initial_calibration_max_age, double);
+
+  // Backwards compatibility: a configuration written for the sample-count knob alone keeps its
+  // exact former behavior, so upgrading does not silently change what it averages. As soon as
+  // the time window is named in the YAML, it is the one in charge and the sample count is
+  // ignored (a fixed sample count cannot be met inside a fixed window at an arbitrary rate).
+  imu_initial_calibration_legacy_mode = cfg.has("imu_initial_calibration_sample_count") &&
+                                        !cfg.has("imu_initial_calibration_window_seconds");
+
+  ASSERT_(imu_initial_calibration_window_seconds > 0 || imu_initial_calibration_legacy_mode);
   YAML_LOAD_OPT(use_imu_orientation, bool);
   YAML_LOAD_OPT(from_state_estimator_max_position_sigma, double);
   YAML_LOAD_OPT(from_state_estimator_max_orientation_sigma_deg, double);
@@ -340,6 +353,8 @@ void LidarOdometry::Parameters::IMUGravityCorrection::initialize(const Yaml & cf
   YAML_LOAD_OPT(sigma_deg, double);
   YAML_LOAD_OPT(averaging_samples, uint32_t);
   YAML_LOAD_OPT(max_age_seconds, double);
+  YAML_LOAD_OPT(map_origin_max_dispersion_deg, double);
+  YAML_LOAD_OPT(map_origin_capture_timeout, double);
 
   if (enabled) {
     ASSERTMSG_(
@@ -363,6 +378,15 @@ void LidarOdometry::Parameters::IMUGravityCorrection::MapGravity::initialize(con
   YAML_LOAD_OPT(solve_every_n, uint32_t);
   ASSERT_(solve_every_n >= 1);
   YAML_LOAD_OPT(log_only, bool);
+  YAML_LOAD_OPT(relevel_map_frame, bool);
+  YAML_LOAD_OPT(relevel_min_intervals, uint32_t);
+  ASSERT_(relevel_min_intervals >= 1);
+  YAML_LOAD_OPT(relevel_min_tilt_deg, double);
+  ASSERTMSG_(
+    relevel_min_tilt_deg > 0,
+    mrpt::format(
+      "imu_gravity_correction.map_gravity.relevel_min_tilt_deg=%.4f must be > 0",
+      relevel_min_tilt_deg));
   YAML_LOAD_OPT(min_interval_seconds, double);
   ASSERTMSG_(
     min_interval_seconds > 0,
@@ -377,7 +401,8 @@ void LidarOdometry::Parameters::IMUGravityCorrection::MapGravity::initialize(con
     const auto key = k.as<std::string>();
     if (
       key == "enabled" || key == "solve_every_n" || key == "min_interval_seconds" ||
-      key == "log_only") {
+      key == "log_only" || key == "relevel_map_frame" || key == "relevel_min_intervals" ||
+      key == "relevel_min_tilt_deg") {
       continue;
     }
     estimator_params[key] = v;
