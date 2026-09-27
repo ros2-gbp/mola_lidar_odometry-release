@@ -1,3 +1,26 @@
+## mola_lidar_odometry (jazzy) - 3.3.0-1
+
+The packages in the `mola_lidar_odometry` repository were released into the `jazzy` distro by running `/home/jlblanco/code/bloom-venv/bin/bloom-release -y -r jazzy mola_lidar_odometry` on `Sun, 27 Sep 2026 23:48:25 -0000`
+
+The `mola_lidar_odometry` package was released.
+
+Version of package(s) in repository `mola_lidar_odometry`:
+
+- upstream repository: https://github.com/MOLAorg/mola_lidar_odometry.git
+- release repository: https://github.com/ros2-gbp/mola_lidar_odometry-release.git
+- rosdistro version: `3.2.0-1`
+- old version: `3.2.0-1`
+- new version: `3.3.0-1`
+
+Versions of tools used:
+
+- bloom version: `0.14.3`
+- catkin_pkg version: `0.5.2`
+- rosdep version: `0.22.2`
+- rosdistro version: `0.9.0`
+- vcstools version: `0.1.42`
+
+
 ## mola_lidar_odometry (rolling) - 3.2.0-1
 
 The packages in the `mola_lidar_odometry` repository were released into the `rolling` distro by running `/mnt/linux/home/jlblanco/code/bloom-venv/bin/bloom-release -y -r rolling mola_lidar_odometry` on `Fri, 21 Aug 2026 13:37:40 -0000`
