@@ -96,10 +96,10 @@
 #include <mrpt/core/WorkerThreadsPool.h>
 #include <mrpt/maps/CSimpleMap.h>
 #include <mrpt/obs/obs_frwds.h>
-#include <mrpt/opengl/CSetOfLines.h>
-#include <mrpt/opengl/CSetOfObjects.h>
 #include <mrpt/poses/CPose3DInterpolator.h>
 #include <mrpt/typemeta/TEnumType.h>
+#include <mrpt/viz/CSetOfLines.h>
+#include <mrpt/viz/CSetOfObjects.h>
 
 // STD:
 #include <array>
@@ -225,6 +225,22 @@ public:
          */
     std::optional<std::regex> gnss_sensor_label;
 
+    /** If set (non-empty), the linear velocity written to the pipelines'
+     *  dynamic variables (vx,vy,vz), which FilterDeskew uses to de-skew scans,
+     *  is the mean velocity of this odometry source (CObservationRobotPose or
+     *  CObservationOdometry, exact sensor label) over each LiDAR sweep, instead
+     *  of the state estimator's. The angular part (wx,wy,wz) stays the
+     *  estimator's.
+     *
+     *  The estimator's twist is derived from this module's own registrations, so
+     *  de-skewing with it closes a loop: a de-skew error shifts the registered
+     *  pose, which shifts the next velocity. Keeping that loop stable takes a
+     *  heavily filtered velocity, which then lags the real motion. An
+     *  independent source such as leg or wheel odometry has no such loop.
+     *  If the source does not cover a sweep, the estimator's twist is used.
+     */
+    std::optional<std::string> deskew_odometry_sensor_label;
+
     /** Minimum time (seconds) between scans for being attempted to be
          * aligned. Scans faster than this rate will be just silently ignored.
          */
@@ -315,6 +331,18 @@ public:
              */
       uint32_t publish_map_updates_every_n = 5;
 
+      /** Whether to publish the local map at all via mola::MapSourceBase.
+             *
+             * Publishing deep-copies the whole local map, which on a large
+             * scene costs a noticeable fraction of the per-scan budget, and
+             * it is done unconditionally: there is deliberately no check for
+             * whether anyone is subscribed, so that a subscriber arriving
+             * late still receives a map. That trade is right for a live node
+             * and wrong for a batch run, where no subscriber will ever
+             * appear, so the offline CLI defaults this off.
+             */
+      bool publish_local_map = true;
+
       /** If non-empty, the local map will be loaded from the given `*.mm`
              * file instead of generating it from scratch.
              * This can be used for multi-session SLAM, or for
@@ -340,6 +368,24 @@ public:
     /** Minimum ICP "goodness" (in the range [0,1]) for a new KeyFrame to be
          * accepted during regular lidar odometry & mapping */
     double min_icp_goodness = 0.4;
+
+    /** Multiplies the information matrix of the pose prior handed to the ICP
+         * solver. The prior contributes ONE residual against as many residuals
+         * as there are pairings, so at unit weight it acts as a tie-breaker
+         * rather than a constraint: a registration can settle far from the
+         * prediction while the prior barely resists. Raising this makes the
+         * prediction an actual constraint on where the registration may land,
+         * which is what a platform with a trustworthy motion source wants.
+         * 1.0, the default, changes nothing. */
+    double icp_prior_weight = 1.0;
+
+    /** Largest distance, in sigmas of the motion-model prediction, that a
+         * registration may sit from that prediction and still be accepted.
+         * ICP quality only measures how well the pairings agree, so a
+         * registration that settles on a plausible but wrong surface scores
+         * perfectly; this bounds how far the answer may move instead.
+         * Zero disables the check. */
+    double max_registration_mahalanobis = 0;
 
     /** If defined, .icplog files will be saved if ICP quality drops below the given threshold */
     std::optional<double> write_debug_icp_log_if_quality_under;
@@ -564,6 +610,21 @@ public:
              */
       double save_gnss_max_age = 1.0;  // [s]
 
+      /** Same as `save_gnss_max_age`, for the IMU: the IMU observation
+        * closest in time to the keyframe is stored in the simplemap
+        * CSensoryFrame, and this is the maximum age (seconds) for which
+        * one is still considered valid.
+        *
+        * Only the IMU *absolute attitude* observes the map azimuth
+        * independently of GNSS, and it is the simplemap, not the live
+        * run, that offline tools such as `mola-sm-georeferencing` see.
+        * Without it, the georeferenced yaw rests entirely on the GNSS
+        * position spread, which is ill-conditioned for short or noisy
+        * trajectories. The stored observation is a few hundred bytes
+        * next to a keyframe's point cloud.
+        */
+      double save_imu_max_age = 0.1;  // [s]
+
       /** If enabled, a directory will be create alongside the .simplemap
              *  and pointclouds will be externally serialized there, for much
              * faster loading and processing of simplemaps.
@@ -583,6 +644,22 @@ public:
     };
 
     SimpleMapOptions simplemap;
+
+    // === INPUT QUEUE ====
+    /** When a new scan arrives while the worker is still busy, the default is to
+     *  keep only the freshest one. That is the right behavior on a robot, where
+     *  a stale scan is worth less than keeping up with the world, and the wrong
+     *  one for an offline batch run, whose whole point is that every scan gets
+     *  processed and the result is reproducible: how many scans are dropped then
+     *  depends on the replay rate and on whatever else the machine happens to be
+     *  doing, so two runs over the same data are not comparable.
+     *
+     *  Setting this to false makes the producer block until the worker is free,
+     *  instead of the queue evicting the older scan. The replay is then lossless
+     *  at any replay rate. Nothing else changes: the pipeline itself is
+     *  untouched, and the run simply takes as long as it takes.
+     */
+    bool drop_stale_scans = true;
 
     // === OUTPUT TRAJECTORY ====
     struct TrajectoryOutputOptions
@@ -757,6 +834,58 @@ public:
       /// 0 defers indefinitely until a quiet reading shows up.
       double map_origin_capture_timeout = 3.0;
 
+      /// Take the verticality reading from an odometry source's ABSOLUTE
+      /// attitude instead of from the accelerometer.
+      ///
+      /// Only the "up" axis is taken, never the position or the heading. The
+      /// source's reference frame differs from the map frame by an unknown yaw
+      /// and translation, and neither of those touches the direction of
+      /// gravity, so the vertical transfers between the two frames exactly
+      /// while nothing else does.
+      ///
+      /// The motivation is that an accelerometer only measures gravity while
+      /// the platform is quasi-static, so on a legged or otherwise
+      /// continuously-accelerating platform `adaptive_sigma` correctly stands
+      /// the constraint down almost all of the time, leaving the vertical
+      /// unconstrained for the whole run. A kinematic-inertial state estimator
+      /// on the platform itself does not have that limitation and publishes an
+      /// attitude that stays gravity-referenced while walking.
+      ///
+      /// The map-origin reference is then captured from the same source (see
+      /// captureMapOriginVerticality), because mixing a reading from one
+      /// source with a reference from another injects the constant offset
+      /// between them as a permanent map tilt.
+      ///
+      /// Only honored by the rank-2 prior path; `use_rank2_prior: false`
+      /// ignores it, with a warning at initialization.
+      struct OdometryAttitude
+      {
+        bool enabled = false;
+
+        /// Sensor label of the odometry observation to read. It must carry a
+        /// full 3D attitude, i.e. arrive as mrpt::obs::CObservationRobotPose;
+        /// planar CObservationOdometry has no pitch or roll to offer and is
+        /// ignored.
+        std::string sensor_label = "odom_wheels";
+
+        /// Sigma [degrees] of the verticality constraint when the reading
+        /// comes from this source. `adaptive_sigma` does not apply here: it
+        /// widens by accelerometer dispersion, which says nothing about an
+        /// external attitude estimate.
+        double sigma_deg = 1.0;
+
+        /// Maximum age [s] of the reading, measured against the newest
+        /// observation timestamp seen by the system. Older readings are
+        /// ignored and the accelerometer is used instead, so a source that
+        /// stops publishing degrades to the previous behavior rather than
+        /// freezing the vertical. 0 = no age limit.
+        double max_age_seconds = 0.5;
+
+        void initialize(const Yaml & c);
+      };
+
+      OdometryAttitude odometry_attitude;
+
       /// Estimate the map-frame gravity direction online, instead of freezing
       /// it from one accelerometer average at the first keyframe.
       ///
@@ -875,6 +1004,8 @@ public:
     double max_time_to_wait_for_imu = 0.5;
 
     uint32_t gnss_queue_max_size = 100;
+
+    uint32_t imu_queue_max_size = 500;
 
     ///  Minimum inverse covariance in (X,Y,Z) for a valid motion model
     double min_motion_model_xyz_cov_inv = 1.0;
@@ -1197,6 +1328,50 @@ private:
     /// the map-origin verticality capture, so the dispersion gate's timeout can be measured.
     std::optional<double> gravity_calib_first_available_time;
 
+    /// Newest verticality reading taken from an odometry source's absolute
+    /// attitude, when `imu_gravity_correction.odometry_attitude` is enabled.
+    /// Protected by imu_state_mtx_.
+    struct OdometryAttitudeState
+    {
+      /// "Up" direction in the vehicle frame.
+      mrpt::math::TVector3D up_body{0, 0, 1};
+
+      /// Observation timestamp, on the same sensor-time scale as
+      /// `latest_obs_time_`, so the two can be compared directly.
+      double timestamp = 0;
+
+      bool valid = false;
+    };
+
+    /// Protected by imu_state_mtx_.
+    OdometryAttitudeState odom_attitude;
+
+    /// Recent poses of the `deskew_odometry_sensor_label` source, keyed by
+    /// timestamp [s]. Protected by imu_state_mtx_.
+    std::map<double, mrpt::poses::CPose3D> deskew_odometry_poses;
+
+    /// Timestamp [s] of the previous scan, to estimate the sweep duration used
+    /// with `deskew_odometry_sensor_label`. Protected by imu_state_mtx_.
+    std::optional<double> deskew_prev_scan_stamp;
+
+    /// Whether the current scan's twist variables came from the de-skew
+    /// odometry source. Protected by imu_state_mtx_.
+    bool deskew_twist_from_odometry = false;
+
+    /// True when the map-origin verticality reference was captured from the
+    /// odometry attitude source. The per-scan reading is then taken from that
+    /// same source and from nowhere else: a reading referenced against a
+    /// vertical defined by a different sensor carries the constant offset
+    /// between the two as a permanent map tilt, which is the error this
+    /// reference exists to prevent.
+    /// Protected by imu_state_mtx_.
+    bool gravity_calib_from_odometry = false;
+
+    /// When the map-origin capture first had to wait for the odometry attitude
+    /// source, on the sensor-time scale. Bounds that wait.
+    /// Protected by imu_state_mtx_.
+    std::optional<double> odom_attitude_wait_since;
+
     /// Vehicle pose at the instant `gravity_calib_pitch_roll` was captured.
     /// The capture is attempted at the first keyframe, but the accelerometer
     /// average is often not available yet there: at the very first scan the
@@ -1214,6 +1389,9 @@ private:
     std::map<std::string, mrpt::poses::CPose3D> last_lidar_sensor_poses;  //!< sensor pose per label
     bool last_icp_was_good = true;
     double last_icp_quality = .0;
+    /// True if last_lidar_pose is the motion model prediction, since the
+    /// registration was not accepted:
+    bool last_pose_from_prediction = false;
     std::size_t last_icp_iterations = 0;
 
     std::optional<mrpt::Clock::time_point> first_ever_timestamp;
@@ -1276,6 +1454,7 @@ private:
     size_t registrations_attempted = 0;
     size_t registration_no_motion_model = 0;
     size_t registration_icp_rejected = 0;
+    size_t registration_gate_rejected = 0;
 
     // Automatic estimation of the observation bounding-radius (measured from
     // base_link, not from the sensor — see ESTIMATED_OBSERVATION_RADIUS docs):
@@ -1346,18 +1525,23 @@ private:
     // closest to each LIDAR observation:
     std::map<mrpt::Clock::time_point, std::shared_ptr<const mrpt::obs::CObservationGPS>> last_gnss_;
 
+    // IMU: same as last_gnss_ above, but for the simplemap only. Independent
+    // of pending_imu_, which the LiDAR worker drains as it consumes readings.
+    // Guarded by imu_state_mtx_.
+    std::map<mrpt::Clock::time_point, std::shared_ptr<const mrpt::obs::CObservationIMU>> last_imu_;
+
     // Visualization:
     // Cache only the *expensive*, read-only-after-load vehicle model
     // children (typically CAssimpModel). Each update builds a fresh
     // CSetOfObjects around them and hands it to MolaViz, so we never
     // share a long-lived, mutable object pointer with the GUI thread.
     // glVehicleCachedBuilt tracks whether loading has already happened.
-    std::vector<mrpt::opengl::CRenderizable::Ptr> glVehicleModels;
+    std::vector<mrpt::viz::CVisualObject::Ptr> glVehicleModels;
     bool glVehicleModelsLoaded = false;
     // Worker-private growing buffer for the estimated path. Never handed
     // to the GUI thread directly: each update clones it into a fresh
     // CSetOfObjects wrapper before dispatch.
-    mrpt::opengl::CSetOfLines::Ptr glEstimatedPath;
+    mrpt::viz::CSetOfLines::Ptr glEstimatedPath;
     /// Decimation counter for the local map visualization. Saturating (never
     /// wraps around), so its maximum value means "refresh at the next chance".
     unsigned int mapUpdateCnt = std::numeric_limits<unsigned int>::max();
@@ -1404,6 +1588,16 @@ private:
   ScanImuWaitList worker_lidar_wait_for_imu_list_;
   std::mutex worker_lidar_wait_for_imu_list_mtx_;
 
+  /// Serializes the whole wait-then-enqueue sequence used when
+  /// Parameters::drop_stale_scans is false. onNewObservation() is not
+  /// serialized by the framework, so the LiDAR and the IMU callback can reach
+  /// the submit path from two threads at once: both would see an empty queue,
+  /// both would enqueue, and POLICY_DROP_OLD would evict one of them, which is
+  /// the very drop this mode exists to prevent. Held across a whole release
+  /// batch, so submission order matches the scans' own order as well. Unused in
+  /// the default mode, where the pool's policy is the intended behavior.
+  std::mutex lossless_submit_mtx_;
+
   /// Newest timestamp (seconds, sensor clock) present in pending_imu_. A
   /// waiting scan may only be released to the worker once this reaches the
   /// scan's own IMU coverage end time, i.e. once every IMU sample the scan will
@@ -1449,6 +1643,23 @@ private:
   /// `imu_gravity_correction.sigma_deg`, optionally widened by the measured
   /// direction dispersion (see `adaptive_sigma`). Caller must hold state_mtx_.
   [[nodiscard]] double effectiveGravitySigmaRad() const;
+
+  /// The newest verticality reading from the odometry attitude source, as an
+  /// "up" direction in the vehicle frame, or nullopt when that source is
+  /// disabled, has produced nothing yet, or its newest reading is older than
+  /// `odometry_attitude.max_age_seconds`. Caller must hold imu_state_mtx_.
+  [[nodiscard]] std::optional<mrpt::math::TVector3D> odometryUpBody() const;
+
+  /// Stores a pose of the `deskew_odometry_sensor_label` source. Called inline
+  /// from onNewObservation(), like onIMU(), so what a scan sees depends only on
+  /// the input sequence.
+  void onDeskewOdometry(const mrpt::obs::CObservation::ConstPtr & o);
+
+  /// Mean twist (vehicle frame) of the de-skew odometry source over
+  /// [t0, t0+span], or over its available part if it covers at least half of
+  /// it. Caller must hold imu_state_mtx_.
+  [[nodiscard]] std::optional<mrpt::math::TTwist3D> deskewTwistFromOdometry(
+    double t0, double span) const;
 
   /// Captures the map-origin verticality reference from the accelerometer, if
   /// it has not been captured yet and an average is available. Safe (and
@@ -1635,6 +1846,12 @@ private:
   void onIMU(const CObservation::ConstPtr & o);
   void onIMUImpl(const CObservation::ConstPtr & o);
 
+  /** Stores the "up" direction implied by an odometry observation's absolute
+   *  attitude, for use as the verticality reading. Like onIMU(), it only
+   *  buffers, so it runs inline on the caller's thread and the stored value
+   *  stays a function of the input sequence alone. */
+  void onOdometryAttitude(const CObservation::ConstPtr & o);
+
   /** Feeds every pending IMU observation with a timestamp not newer than
    *  `upToTime` into the IMU-derived state (de-skew velocity buffer, initial
    *  pitch/roll calibrator, gravity estimators), in timestamp order, and drops
@@ -1649,7 +1866,8 @@ private:
   void doUpdateAdaptiveThreshold();
 
   void doInitializeEstimatedObservationRadius(const mrpt::obs::CObservation & o);
-  void doUpdateEstimatedObservationRadius(const mp2p_icp::metric_map_t & m);
+  /// Returns false if no layer of `m` had usable points, so nothing was updated.
+  bool doUpdateEstimatedObservationRadius(const mp2p_icp::metric_map_t & m);
 
   /// Returns false if the scan/observation is not valid:
   bool doCheckIsValidObservation(const mp2p_icp::metric_map_t & m);
@@ -1739,6 +1957,13 @@ private:
    *          than on sampled busy counters. */
   std::future<void> submitReadyLidarScanToWorker(
     const CObservation::ConstPtr & o, std::optional<double> imuCoverageEndTime);
+
+  /** The Parameters::drop_stale_scans==false path of the above: waits for the
+   *  worker queue to drain, then enqueues, so nothing is ever evicted.
+   *  \note The caller must already hold lossless_submit_mtx_. */
+  std::future<void> submitLidarScanLossless_locked(
+    const CObservation::ConstPtr & o, std::optional<double> imuCoverageEndTime);
+
   /// Number of LiDAR scans currently running or queued on worker_lidar_ (0, 1, or 2).
   int pendingLidarScanCount() const;
 
