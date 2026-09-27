@@ -169,9 +169,9 @@ void LidarOdometry::Parameters::Visualization::initializeModelPart(const Yaml & 
   const auto models = cfg["model"].asSequenceRange();
   for (const auto & e : models) {
     ASSERT_(e.isMap());
-    auto c = e.asMap();
+    const mrpt::containers::yaml c(e);
     auto & m = model.emplace_back();
-    ASSERT_(c.count("file") != 0);
+    ASSERT_(c.has("file"));
     m.file = c["file"].as<std::string>();
 
     if (m.file.empty()) {
@@ -179,25 +179,25 @@ void LidarOdometry::Parameters::Visualization::initializeModelPart(const Yaml & 
       continue;
     }
 
-    if (c.count("tf.x") != 0) {
+    if (c.has("tf.x")) {
       m.tf.x = c["tf.x"].as<float>();
     }
-    if (c.count("tf.y") != 0) {
+    if (c.has("tf.y")) {
       m.tf.y = c["tf.y"].as<float>();
     }
-    if (c.count("tf.z") != 0) {
+    if (c.has("tf.z")) {
       m.tf.z = c["tf.z"].as<float>();
     }
-    if (c.count("tf.yaw") != 0) {
+    if (c.has("tf.yaw")) {
       m.tf.yaw = mrpt::DEG2RAD(c["tf.yaw"].as<float>());
     }
-    if (c.count("tf.pitch") != 0) {
+    if (c.has("tf.pitch")) {
       m.tf.pitch = mrpt::DEG2RAD(c["tf.pitch"].as<float>());
     }
-    if (c.count("tf.roll") != 0) {
+    if (c.has("tf.roll")) {
       m.tf.roll = mrpt::DEG2RAD(c["tf.roll"].as<float>());
     }
-    if (c.count("scale") != 0) {
+    if (c.has("scale")) {
       m.scale = c["scale"].as<float>();
     }
   }
@@ -263,6 +263,7 @@ void LidarOdometry::Parameters::SimpleMapOptions::initialize(const Yaml & cfg, P
   YAML_LOAD_OPT(add_non_keyframes_too, bool);
   YAML_LOAD_OPT(generate_lazy_load_scan_files, bool);
   YAML_LOAD_OPT(save_gnss_max_age, double);
+  YAML_LOAD_OPT(save_imu_max_age, double);
   YAML_LOAD_OPT(save_deskewed_scans, bool);
 }
 
@@ -280,6 +281,7 @@ void LidarOdometry::Parameters::MapUpdateOptions::initialize(const Yaml & cfg, P
   DECLARE_PARAMETER_IN_OPT(cfg, max_distance_to_keep_keyframes, parent);
   DECLARE_PARAMETER_IN_OPT(cfg, check_for_removal_every_n, parent);
   DECLARE_PARAMETER_IN_OPT(cfg, publish_map_updates_every_n, parent);
+  YAML_LOAD_OPT(publish_local_map, bool);
   YAML_LOAD_OPT(load_existing_local_map, std::string);
   YAML_LOAD_OPT(save_final_local_map, std::string);
 
@@ -367,8 +369,35 @@ void LidarOdometry::Parameters::IMUGravityCorrection::initialize(const Yaml & cf
       sigma_deg > 0, mrpt::format("imu_gravity_correction.sigma_deg=%.4f must be > 0", sigma_deg));
   }
 
+  if (cfg.has("odometry_attitude")) {
+    odometry_attitude.initialize(cfg["odometry_attitude"]);
+  }
+
   if (cfg.has("map_gravity")) {
     map_gravity.initialize(cfg["map_gravity"]);
+  }
+}
+
+void LidarOdometry::Parameters::IMUGravityCorrection::OdometryAttitude::initialize(const Yaml & cfg)
+{
+  YAML_LOAD_OPT(enabled, bool);
+  YAML_LOAD_OPT(sensor_label, std::string);
+  YAML_LOAD_OPT(sigma_deg, double);
+  YAML_LOAD_OPT(max_age_seconds, double);
+
+  if (enabled) {
+    ASSERTMSG_(
+      !sensor_label.empty(),
+      "imu_gravity_correction.odometry_attitude.sensor_label cannot be empty when enabled");
+    ASSERTMSG_(
+      sigma_deg > 0,
+      mrpt::format(
+        "imu_gravity_correction.odometry_attitude.sigma_deg=%.4f must be > 0", sigma_deg));
+    ASSERTMSG_(
+      max_age_seconds >= 0,
+      mrpt::format(
+        "imu_gravity_correction.odometry_attitude.max_age_seconds=%.4f must be >= 0",
+        max_age_seconds));
   }
 }
 
