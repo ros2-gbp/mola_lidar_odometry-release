@@ -102,9 +102,10 @@ any of the GUI applications:
 
 .. tip::
 
-   See the :ref:`MOLA in ROS 2 cookbook <mola_ros2_cookbook>` §5.1 for a
-   side-by-side walkthrough of ``mola-lo-gui-rosbag2`` with namespaced
-   bags, smoother, and live parameter editor.
+   See :ref:`offline rosbag2 recipes <mola_ros2_cookbook_5_1>` in the ROS 2
+   configurations page for ready-to-copy ``mola-lo-gui-rosbag2`` and
+   ``mola-lo-cli-rosbag2`` commands (LO, LIO, smoother, namespaced bags),
+   with a live parameter editor.
 
 This command will open the mola_viz GUI and build a map from ROS 2 bags:
 
@@ -323,6 +324,11 @@ Runs MOLA-LO on a sequence of the Mulran dataset.
 - ``MOLA_GUI_MODULE`` (Default: ``mola::MolaVizImGui``): selects the
   :ref:`visualizer backend <mola_lo_gui_visualizer_selection>`.
 
+- ``MOLA_GUI_TARGET_FPS`` (Default: ``30``): GUI refresh rate, ``mola::MolaVizImGui``
+  only. The whole 3D view is redrawn on every frame, so the GPU load (and, to a
+  lesser extent, the CPU load) grows with it: lower it (e.g. ``15``) on weak machines,
+  or raise it (e.g. ``60``) for smoother interaction.
+
 
 |
 
@@ -364,6 +370,22 @@ Process a ROS 2 bag
 
 .. note::
     Remember changing ``--lidar-sensor-label /ouster/points`` to your actual raw (unfiltered) LiDAR topic (``sensor_msgs/PointCloud2``).
+
+.. warning::
+    ``--output-simplemap`` keeps every keyframe scan in RAM and stores it inside the ``.simplemap`` file:
+    lazy-load generation (``MOLA_SIMPLEMAP_GENERATE_LAZY_LOAD=true``) is **ignored** with this flag.
+    For long datasets, drop ``--output-simplemap`` and use instead:
+
+    .. code-block:: bash
+
+        MOLA_GENERATE_SIMPLEMAP=true \
+        MOLA_SIMPLEMAP_OUTPUT=$(pwd)/myMap.simplemap \
+        MOLA_SIMPLEMAP_GENERATE_LAZY_LOAD=true \
+        mola-lidar-odometry-cli \
+          [...]  # the rest does not change, without --output-simplemap
+
+    Scans are then written to ``myMap_Images/`` next to the map while running, which ``sm2mm`` and
+    other tools find by themselves.
 
 .. dropdown:: Does your bag lack ``/tf``?
     :icon: alert
@@ -458,7 +480,9 @@ Then, set the ``KITTI_BASE_DIR`` environment variable and launch the desired seq
                   --output-twist output-twist.txt
                                       Save the estimated twist as a TXT file
                   --output-simplemap output-map.simplemap
-                                      Enables building and saving the simplemap for the mapping session
+                                      Enables building and saving the simplemap for the mapping
+                                      session. Note: incompatible with lazy-load simplemaps; for those,
+                                      use MOLA_GENERATE_SIMPLEMAP=true and MOLA_SIMPLEMAP_OUTPUT instead
                   --only-first-n INT:NONNEGATIVE
                                       Run for the first N steps only {0=default, not used}
                   --skip-first-n INT:NONNEGATIVE

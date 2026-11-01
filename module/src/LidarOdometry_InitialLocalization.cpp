@@ -23,11 +23,65 @@
 #include <mola_lidar_odometry/LidarOdometry.h>
 #include <mrpt/obs/CObservationIMU.h>
 
+#if __has_include(<mola_relocalization/relocalization.h>)
+#include <mola_relocalization/relocalization.h>
+#endif
+
+#include <mrpt/maps/CPointsMap.h>
+#include <mrpt/poses/CPose3D.h>
+
+#include <algorithm>
+#include <cmath>
+#include <optional>
+#include <vector>
+
 namespace mola
 {
+namespace
+{
+// Height of the ground around `center`: a low percentile of the z of the
+// points of all layers with points within `radius` (horizontal distance),
+// rotated by R. Empty if there are too few points.
+std::optional<double> ground_height(
+  const mp2p_icp::metric_map_t & m, const mrpt::math::TPoint2D & center, double radius,
+  const mrpt::math::CMatrixDouble33 & R)
+{
+  std::vector<double> zs;
+  for (const auto & [name, layer] : m.layers) {
+    // Points maps, or any other map with a points view (e.g. keyframe maps):
+    const auto * pts = mrpt::maps::asPointsMap(*layer);
+    if (!pts) {
+      continue;
+    }
+    const auto & xs = pts->getPointsBufferRef_x();
+    const auto & ys = pts->getPointsBufferRef_y();
+    const auto & zz = pts->getPointsBufferRef_z();
+    for (size_t i = 0; i < xs.size(); i++) {
+      if (!std::isfinite(xs[i]) || !std::isfinite(ys[i]) || !std::isfinite(zz[i])) {
+        continue;
+      }
+      const double x = R(0, 0) * xs[i] + R(0, 1) * ys[i] + R(0, 2) * zz[i];
+      const double y = R(1, 0) * xs[i] + R(1, 1) * ys[i] + R(1, 2) * zz[i];
+      if (std::hypot(x - center.x, y - center.y) > radius) {
+        continue;
+      }
+      zs.push_back(R(2, 0) * xs[i] + R(2, 1) * ys[i] + R(2, 2) * zz[i]);
+    }
+  }
+  constexpr size_t kMinPoints = 20;
+  if (zs.size() < kMinPoints) {
+    return {};
+  }
+  // Not the minimum, which a few noisy points below the ground would set:
+  const auto low = zs.begin() + zs.size() / 10;
+  std::nth_element(zs.begin(), low, zs.end());
+  return *low;
+}
+}  // namespace
 
 void LidarOdometry::handleInitialLocalizationDoInitFromPose(
-  const mrpt::poses::CPose3DPDFGaussian & initPose, bool resetStateEstimator)
+  const mrpt::poses::CPose3DPDFGaussian & initPose, bool resetStateEstimator,
+  const std::optional<mrpt::Clock::time_point> & stamp)
 {
   if (resetStateEstimator) {
     ASSERT_(state_.navstate_fuse);
@@ -35,11 +89,10 @@ void LidarOdometry::handleInitialLocalizationDoInitFromPose(
 
     // Fake an evolution to be able to have an initial velocity estimation:
     // Use a tiny time step to let the filter remain with a large uncertainty about twist:
-    ASSERT_(state_.last_obs_timestamp.has_value());
-    const auto t1 =
-      mrpt::Clock::fromDouble(mrpt::Clock::toDouble(*state_.last_obs_timestamp) - 2e-3);
-    const auto t2 =
-      mrpt::Clock::fromDouble(mrpt::Clock::toDouble(*state_.last_obs_timestamp) - 1e-3);
+    ASSERT_(stamp.has_value() || state_.last_obs_timestamp.has_value());
+    const double t = mrpt::Clock::toDouble(stamp ? *stamp : *state_.last_obs_timestamp);
+    const auto t1 = mrpt::Clock::fromDouble(t - 2e-3);
+    const auto t2 = mrpt::Clock::fromDouble(t - 1e-3);
     state_.navstate_fuse->fuse_pose(t1, initPose, params_.publish_reference_frame);
     state_.navstate_fuse->fuse_pose(t2, initPose, params_.publish_reference_frame);
 
@@ -56,6 +109,7 @@ void LidarOdometry::handleInitialLocalizationDoInitFromPose(
 
   // also, keep it as the last pose for subsequent ICP runs:
   state_.last_lidar_pose = initPose;
+  state_.initial_pose = initPose.mean;
 }
 
 void LidarOdometry::handleInitialLocalization()
@@ -223,22 +277,35 @@ void LidarOdometry::onExternalMapUpdate(const MapSourceBase::MapUpdate & mu)
     return;
   }
 
-  auto lck = mrpt::lockHelper(state_mtx_);
-
-  // Store the external geo-reference
-  state_.external_georef = mu.georeferencing;
+  // Not state_mtx_: this may be called back from within a call into the
+  // estimator made with state_mtx_ held. Applied before the next scan.
+  {
+    auto lck = mrpt::lockHelper(received_external_georef_mtx_);
+    received_external_georef_ = mu.georeferencing;
+  }
 
   MRPT_LOG_INFO_STREAM(
     "Received external geo-referencing from state estimator: "
     << "lat=" << mu.georeferencing->geo_coord.lat.getAsString()
     << ", lon=" << mu.georeferencing->geo_coord.lon.getAsString()
     << ", T_enu_to_map=" << mu.georeferencing->T_enu_to_map.mean.asString());
+}
+
+void LidarOdometry::applyReceivedExternalGeoref()
+{
+  {
+    auto lck = mrpt::lockHelper(received_external_georef_mtx_);
+    if (!received_external_georef_) {
+      return;
+    }
+    state_.external_georef = received_external_georef_;
+  }
 
   // If we don't have geo-ref in local map yet, set it:
-  if (!state_.local_map->georeferencing.has_value()) {
+  if (state_.local_map && !state_.local_map->georeferencing.has_value()) {
     state_.local_map->georeferencing.emplace();
-    state_.local_map->georeferencing->geo_coord = mu.georeferencing->geo_coord;
-    state_.local_map->georeferencing->T_enu_to_map = mu.georeferencing->T_enu_to_map;
+    state_.local_map->georeferencing->geo_coord = state_.external_georef->geo_coord;
+    state_.local_map->georeferencing->T_enu_to_map = state_.external_georef->T_enu_to_map;
 
     state_.mark_local_map_georef_as_updated();
     MRPT_LOG_INFO("Applied external geo-referencing to local map");
@@ -269,11 +336,22 @@ void LidarOdometry::handleInitialLocalizationStateEstimation()
   const double elapsed =
     mrpt::system::timeDifference(*state_.waiting_for_state_estimator_since, mrpt::Clock::now());
 
+  const bool hasGeoref = state_.local_map->georeferencing.has_value();
+
   if (il.from_state_estimator_timeout > 0 && elapsed > il.from_state_estimator_timeout) {
-    MRPT_LOG_ERROR_FMT(
-      "Timeout (%.1f s) waiting for state estimator to converge. "
-      "Check GNSS/IMU sensors.",
-      il.from_state_estimator_timeout);
+    if (!hasGeoref) {
+      // Keep waiting: a map may still be loaded at runtime (map_load service).
+      MRPT_LOG_ERROR_FMT(
+        "No geo-referencing after %.1f s, so the state estimator pose cannot be used yet. "
+        "Load a geo-referenced map (e.g. via the map_load service), or enable geo-reference "
+        "estimation in the state estimator. Still waiting.",
+        il.from_state_estimator_timeout);
+    } else {
+      MRPT_LOG_ERROR_FMT(
+        "Timeout (%.1f s) waiting for state estimator to converge. "
+        "Check GNSS/IMU sensors.",
+        il.from_state_estimator_timeout);
+    }
     state_.waiting_for_state_estimator_since.reset();
     return;
   }
@@ -282,25 +360,13 @@ void LidarOdometry::handleInitialLocalizationStateEstimation()
   mrpt::poses::CPose3DPDFGaussian estimatedPose;
 
   // Note: state_mtx_ is already held by the caller (processLidarScan), which
-  // also serializes us against onExternalMapUpdate (writes
-  // state_.external_georef from another thread under the same mutex).
-  {
-    const bool hasGeoRef =
-      state_.local_map->georeferencing.has_value() || state_.external_georef.has_value();
-
-    if (!hasGeoRef) {
-      MRPT_LOG_THROTTLE_INFO(
-        5.0, "Waiting for geo-referencing (from loaded map or state estimator)...");
-      return;  // Not ready yet
-    }
-
-    // Apply external georef to local map if needed
-    if (!state_.local_map->georeferencing.has_value() && state_.external_georef.has_value()) {
-      state_.local_map->georeferencing.emplace();
-      state_.local_map->georeferencing->geo_coord = state_.external_georef->geo_coord;
-      state_.local_map->georeferencing->T_enu_to_map = state_.external_georef->T_enu_to_map;
-      state_.mark_local_map_georef_as_updated();
-    }
+  // has already applied any geo-referencing received from the estimator.
+  if (!hasGeoref) {
+    MRPT_LOG_THROTTLE_INFO(
+      5.0,
+      "Waiting for geo-referencing, from a loaded map (at start or via map_load) or from the "
+      "state estimator...");
+    return;  // Not ready yet
   }
 
   // Now check if state estimator has converged
@@ -312,13 +378,32 @@ void LidarOdometry::handleInitialLocalizationStateEstimation()
 #endif
 
   // Additional covariance check with our own thresholds
+  const auto & gs = il.global_search;
+  bool needsGlobalSearch = false;
   if (converged) {
     const double pos_sigma_max = std::sqrt(
       std::max({estimatedPose.cov(0, 0), estimatedPose.cov(1, 1), estimatedPose.cov(2, 2)}));
     const double ori_sigma_max_deg = mrpt::RAD2DEG(std::sqrt(
       std::max({estimatedPose.cov(3, 3), estimatedPose.cov(4, 4), estimatedPose.cov(5, 5)})));
 
-    if (
+    // Nothing to search in without a map: initialize directly from the estimator.
+    if (gs.enabled && state_.local_map && !state_.local_map->empty()) {
+      // Search if the uncertainty region may exceed ICP's convergence basin:
+      const double xySigma = std::sqrt(std::max(estimatedPose.cov(0, 0), estimatedPose.cov(1, 1)));
+      const double yawSigmaDeg = mrpt::RAD2DEG(std::sqrt(estimatedPose.cov(3, 3)));
+      needsGlobalSearch =
+        std::max(gs.sigma_factor * xySigma, gs.min_half_width_xy) > gs.icp_basin_xy ||
+        std::max(gs.sigma_factor * yawSigmaDeg, gs.min_half_width_yaw_deg) > gs.icp_basin_yaw_deg;
+    }
+
+    if (needsGlobalSearch) {
+      if (pos_sigma_max > gs.max_position_sigma) {
+        converged = false;
+        MRPT_LOG_THROTTLE_DEBUG_FMT(
+          5.0, "State estimator converged but too uncertain to search around: pos_sigma=%.3f m",
+          pos_sigma_max);
+      }
+    } else if (
       pos_sigma_max > il.from_state_estimator_max_position_sigma ||
       ori_sigma_max_deg > il.from_state_estimator_max_orientation_sigma_deg) {
       converged = false;
@@ -346,7 +431,15 @@ void LidarOdometry::handleInitialLocalizationStateEstimation()
     << estimatedPose.mean << " (sigmas: " << std::sqrt(estimatedPose.cov(0, 0)) << ", "
     << std::sqrt(estimatedPose.cov(1, 1)) << ", " << std::sqrt(estimatedPose.cov(2, 2)) << " m)");
 
-  handleInitialLocalizationDoInitFromPose(estimatedPose, false);
+  if (needsGlobalSearch) {
+    // The next scan, once filtered, is matched against the map around this
+    // pose (see doGlobalSearchForInitialPose()):
+    state_.global_search_prior = estimatedPose;
+    state_.last_global_search_attempt.reset();
+    MRPT_LOG_INFO("Its uncertainty may exceed ICP's convergence basin: searching around it.");
+  } else {
+    handleInitialLocalizationDoInitFromPose(estimatedPose, false);
+  }
   doRemoveCloudsWithDecay();
 
   state_.initial_localization_done = true;
@@ -360,6 +453,149 @@ void LidarOdometry::handleInitialLocalizationStateEstimation()
       MRPT_LOG_INFO("Auto-transitioning to active mode after state estimator convergence.");
     }
   }
+}
+
+void LidarOdometry::doGlobalSearchForInitialPose(const mp2p_icp::metric_map_t & observation)
+{
+#if defined(MOLA_RELOCALIZATION_HAS_CANDIDATES)
+  const auto & gs = params_.initial_localization.global_search;
+  ASSERT_(state_.global_search_prior);
+  ASSERT_(state_.global_search_icp);
+  ASSERT_(state_.local_map);
+
+  // Rate limit the attempts, in sensor time (also right for offline datasets):
+  ASSERT_(state_.last_obs_timestamp);
+  const auto now = *state_.last_obs_timestamp;
+  if (
+    state_.last_global_search_attempt &&
+    mrpt::system::timeDifference(*state_.last_global_search_attempt, now) < gs.retry_period) {
+    return;
+  }
+  state_.last_global_search_attempt = now;
+
+  // Search around the latest state estimator pose:
+  if (mrpt::poses::CPose3DPDFGaussian latest;
+      state_.navstate_fuse->has_converged_localization(latest)) {
+    state_.global_search_prior = latest;
+  }
+  const auto & prior = *state_.global_search_prior;
+  const auto & cov = prior.cov;
+  const double xySigma = std::sqrt(std::max(cov(0, 0), cov(1, 1)));
+  const double halfXY =
+    std::clamp(gs.sigma_factor * xySigma, gs.min_half_width_xy, gs.max_half_width_xy);
+  const double yawRange =
+    std::max(gs.sigma_factor * std::sqrt(cov(3, 3)), mrpt::DEG2RAD(gs.min_half_width_yaw_deg));
+  const double halfYaw =
+    yawRange > mrpt::DEG2RAD(gs.icp_basin_yaw_deg) ? std::min(yawRange, M_PI) : 0.0;
+
+  mola::RelocalizationICP_SE2::Input in;
+  in.reference_map = *state_.local_map;
+  in.local_map = observation;
+  in.icp_pipeline = {state_.global_search_icp};
+  in.icp_parameters = state_.global_search_icp_params;
+  in.icp_minimum_quality = gs.min_quality;
+
+  // The search ICPs use the same variables as the regular one, but their own
+  // matching thresholds:
+  const auto mainVariables = [this]() {
+    auto lckImu = mrpt::lockHelper(imu_state_mtx_);
+    return state_.parameter_source.getVariableValues();
+  }();
+  for (const auto & [source, threshold] :
+       {std::pair{state_.global_search_param_source.get(), gs.icp_threshold},
+        {state_.global_search_refine_param_source.get(), gs.refine_icp_threshold}}) {
+    for (const auto & [name, value] : mainVariables) {
+      source->updateVariable(name, value);
+    }
+    source->updateVariable("ADAPTIVE_THRESHOLD_SIGMA", threshold);
+  }
+
+  const auto p = prior.mean.asTPose();
+  auto & lat = in.initial_guess_lattice;
+  lat.corner_min = {p.x - halfXY, p.y - halfXY, p.yaw - halfYaw};
+  lat.corner_max = {p.x + halfXY, p.y + halfXY, p.yaw + halfYaw};
+  lat.resolution_xy = gs.resolution_xy;
+  lat.resolution_phi = mrpt::DEG2RAD(gs.resolution_yaw_deg);
+  lat.z = p.z;
+  lat.pitch = p.pitch;
+  lat.roll = p.roll;
+  if (gs.z_from_map_radius > 0) {
+    // The ground of the scan, with the vehicle attitude (any yaw), and that of
+    // the map below the prior:
+    const auto R = mrpt::poses::CPose3D::FromYawPitchRoll(0, p.pitch, p.roll).getRotationMatrix();
+    const auto zScan = ground_height(observation, {0, 0}, gs.z_from_map_radius, R);
+    const auto zMap = ground_height(
+      *state_.local_map, {p.x, p.y}, gs.z_from_map_radius, mrpt::math::CMatrixDouble33::Identity());
+    if (zScan && zMap) {
+      lat.z = *zMap - *zScan;
+      MRPT_LOG_DEBUG_FMT("Global search: z=%.2f from the map (prior z=%.2f)", lat.z, p.z);
+    }
+  }
+
+  const auto out = mola::RelocalizationICP_SE2::run(in);
+
+  mola::CandidateSelectionParameters sp;
+  sp.same_mode_max_distance = gs.same_mode_max_distance;
+  sp.same_mode_max_yaw = mrpt::DEG2RAD(gs.same_mode_max_yaw_deg);
+  sp.min_quality_margin = gs.min_quality_margin;
+  // Tell the hypotheses apart with a stricter ICP:
+  const double t0 = mrpt::Clock::nowDouble();
+  auto refined = mola::refine_relocalization_candidates(
+    out.candidates, observation, *state_.local_map, *state_.global_search_refine_icp,
+    state_.global_search_icp_params, sp);
+  refined.erase(
+    std::remove_if(
+      refined.begin(), refined.end(),
+      [&gs](const mola::RelocalizationICP_SE2::Candidate & c) {
+        return c.quality < gs.min_quality;
+      }),
+    refined.end());
+  const auto sel = mola::select_relocalization_candidate(refined, sp);
+
+  MRPT_LOG_INFO_FMT(
+    "Global search around %s (+-%.2f m, +-%.1f deg): %zu good ICP results in %zu hypotheses "
+    "(%.2f s), refined: best quality %.3f, runner-up %.3f (%.2f s)",
+    prior.mean.asString().c_str(), halfXY, mrpt::RAD2DEG(halfYaw), out.candidates.size(),
+    refined.size(), out.time_cost, sel.best ? sel.best->quality : 0.0,
+    sel.runner_up ? sel.runner_up->quality : 0.0, mrpt::Clock::nowDouble() - t0);
+
+  if (!sel.best) {
+    MRPT_LOG_WARN("Global search: no good match in the map. Will try again.");
+    return;
+  }
+  if (!sel.unambiguous) {
+    MRPT_LOG_WARN_STREAM(
+      "Global search: ambiguous, " << sel.best->pose << " vs " << sel.runner_up->pose
+                                   << ". Will try again.");
+    return;
+  }
+
+  mrpt::poses::CPose3DPDFGaussian found;
+  found.mean = mrpt::poses::CPose3D(sel.best->pose);
+  found.cov.setDiagonal(std::vector<double>(
+    {mrpt::square(0.1), mrpt::square(0.1), mrpt::square(0.1), mrpt::square(mrpt::DEG2RAD(2.0)),
+     mrpt::square(mrpt::DEG2RAD(2.0)), mrpt::square(mrpt::DEG2RAD(2.0))}));
+
+  // The scans that arrived during the search were dropped (drop_stale_scans):
+  // the vehicle is assumed still since this one, and the found pose is given
+  // at the newest sensor time, so the state estimator does not bridge the
+  // search time with a motion model:
+  const double newestStamp = std::max(latest_obs_time_.load(), mrpt::Clock::toDouble(now));
+  MRPT_LOG_INFO_STREAM(
+    "Global search: localized at " << found.mean << " (taken as the pose "
+                                   << newestStamp - mrpt::Clock::toDouble(now)
+                                   << " s after its scan, at the end of the search)");
+
+  handleInitialLocalizationDoInitFromPose(found, true, mrpt::Clock::fromDouble(newestStamp));
+  state_.global_search_prior.reset();
+#else
+  (void)observation;
+  MRPT_LOG_ERROR(
+    "initial_localization.global_search requires a mola_relocalization with "
+    "select_relocalization_candidate(): using the state estimator pose as is.");
+  handleInitialLocalizationDoInitFromPose(*state_.global_search_prior, false);
+  state_.global_search_prior.reset();
+#endif
 }
 
 }  // namespace mola
