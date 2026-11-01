@@ -27,8 +27,10 @@
 #include <mrpt/config/CConfigFile.h>
 #include <mrpt/config/CConfigFileMemory.h>
 #include <mrpt/containers/yaml.h>
+#include <mrpt/core/get_env.h>
 #include <mrpt/core/initializer.h>
 #include <mrpt/io/lazy_load_path.h>
+#include <mrpt/maps/CPointsMap.h>
 #include <mrpt/obs/CObservationPointCloud.h>
 #include <mrpt/obs/CRawlog.h>
 #include <mrpt/poses/CPose3DPDFGaussian.h>
@@ -83,9 +85,9 @@ void LidarOdometry::onQuit() { shutdownCleanup(); }
 //
 // onQuit() is invoked by MolaLauncherApp::executor_thread() for every module,
 // before any module is destroyed (see ExecutableBase::onQuit() docs). This
-// matters because worker_lidar_/worker_others_/worker_viz_/
-// worker_viz_local_map_ may have an in-flight task (e.g. onLidar(), or the
-// local-map render) that calls back into other modules, e.g.
+// matters because worker_lidar_/worker_viz_/worker_viz_local_map_ may have an
+// in-flight task (e.g. onLidar(), or the local-map render) that calls back
+// into other modules, e.g.
 // BridgeROS2's TF broadcaster via VizInterface/LocalizationSourceBase. If
 // that task is still running when another module's destructor runs (which
 // previously only happened from ~LidarOdometry(), after other modules may
@@ -116,9 +118,9 @@ void LidarOdometry::shutdownCleanup()
       std::this_thread::sleep_for(100ms);
     }
     worker_lidar_.clear();
-    worker_others_.clear();
     worker_viz_.clear();
     worker_viz_local_map_.clear();
+    worker_publish_local_map_.clear();
 
     // Run totals, once, in a form a harness can scrape. `no_motion_model` is
     // the number the corpus had no aggregate for: it is the difference between
@@ -134,6 +136,10 @@ void LidarOdometry::shutdownCleanup()
         "Run totals: registrations=%zu no_motion_model=%zu (%.2f%%) icp_rejected=%zu (%.2f%%)",
         state_.registrations_attempted, state_.registration_no_motion_model, pctNoModel,
         state_.registration_icp_rejected, pctRejected);
+    }
+
+    if (const auto nInvalid = invalid_input_count_.load(); nInvalid > 0) {
+      MRPT_LOG_WARN_FMT("Run totals: %zu observations dropped as invalid input", nInvalid);
     }
 
     if (params_.simplemap.generate) {
@@ -227,19 +233,36 @@ void LidarOdometry::reset()
 {
   ASSERTMSG_(!lastInitConfig_.empty(), "initialize() must be called first.");
 
+  // Stop accepting new observations until initialize() is done:
+  {
+    auto lckStateFlags = mrpt::lockHelper(state_flags_mtx_);
+    state_.initialized = false;
+  }
+
   // Reset the state under the lock, then re-initialize without holding it:
   // initialize() (via initialize_frontend()) takes state_mtx_ itself, and
   // state_mtx_ is a plain (non-recursive) mutex.
   {
-    auto lck = mrpt::lockHelper(state_mtx_);
-    // Replacing state_ wholesale also destroys the parameter source, the
-    // gravity estimator and the rest of the IMU-derived state, which the input
-    // thread reaches without state_mtx_:
-    auto lckImu = mrpt::lockHelper(imu_state_mtx_);
+    // Replacing state_ wholesale also replaces the parts guarded by their own
+    // mutexes, which other threads access without state_mtx_ (IMU-derived
+    // state, flags, trajectory, simplemap, busy counters, drop stats).
+    // std::scoped_lock acquires them all without deadlock risk:
+    std::scoped_lock lck(
+      state_mtx_, imu_state_mtx_, state_flags_mtx_, state_trajectory_mtx_, state_simplemap_mtx_,
+      is_busy_mtx_, drop_stats_mtx_);
     state_ = MethodState();
+    session_id_++;
+    // The compiled parameter formulas in params_ reference variables owned by
+    // the parameter source destroyed above: drop them, initialize() declares
+    // them again. The rest of params_ is kept, since the input thread may be
+    // reading it.
+    static_cast<mp2p_icp::Parameterizable &>(params_) = mp2p_icp::Parameterizable();
     pending_imu_.clear();
     latest_imu_time_ = 0;
     latest_obs_time_ = 0;
+
+    auto lckMapContents = mrpt::lockHelper(local_map_content_mtx_);
+    local_map_contents_stamp_ = {};
   }
   {
     // Scans still waiting for IMU belong to the pre-reset session:
@@ -255,40 +278,39 @@ void LidarOdometry::flushPendingLidarScans()
 
   // Infinity: release regardless of IMU coverage. The scans are waiting for
   // data that will never arrive, so the alternative is to discard them.
-  auto fut = releaseLidarScansToWorker(std::numeric_limits<double>::infinity());
+  {
+    auto fut = releaseLidarScansToWorker(std::numeric_limits<double>::infinity());
 
-  // Wait on the scan's own task, not on the busy counters: onLidar() only
-  // raises worker_tasks_lidar once it is already running, so there is a window
-  // in which the task is dequeued but no counter shows it, and the caller could
-  // move on (and shutdownCleanup() set destructor_called_) before it starts.
-  if (fut.valid()) {
-    try {
-      fut.get();
-    } catch (const std::future_error &) {
-      // The pool discarded the task under its "keep freshest" policy, which
-      // breaks the promise. Nothing to wait for then.
+    if (fut.valid()) {
+      try {
+        fut.get();
+      } catch (const std::future_error &) {
+        // The pool discarded the task under its "keep freshest" policy, which
+        // breaks the promise. Nothing to wait for then.
+      }
     }
+    // The future goes out of scope here: a held future keeps the callable of
+    // a discarded task, hence its busy token, alive.
   }
 
-  // Anything else still in flight (e.g. a GNSS task) is covered by the counters:
+  // Anything else still in flight:
   while (isBusy()) {
     std::this_thread::sleep_for(1ms);
   }
 }
 
-bool LidarOdometry::isBusy() const
-{
-  bool b = false;
-  is_busy_mtx_.lock();
-  b = (state_.worker_tasks_lidar != 0) || (state_.worker_tasks_others != 0);
-  is_busy_mtx_.unlock();
-  return b || worker_lidar_.pendingTasks() != 0 || worker_others_.pendingTasks() != 0;
-}
+bool LidarOdometry::isBusy() const { return lidar_tasks_alive_.load() != 0; }
 
 bool LidarOdometry::isActive() const
 {
   auto lckStateFlags = mrpt::lockHelper(state_flags_mtx_);
   return state_.active;
+}
+
+bool LidarOdometry::hasFatalError() const
+{
+  auto lckStateFlags = mrpt::lockHelper(state_flags_mtx_);
+  return state_.fatal_error;
 }
 
 void LidarOdometry::setActive(const bool active)
@@ -319,14 +341,7 @@ LidarOdometry::lastEstimatedState() const
     }
   }
 
-  auto lck = mrpt::lockHelper(state_mtx_);
-
-  if (!state_.last_motion_model_output) {
-    return {};
-  }
-  const auto & tw = state_.last_motion_model_output->twist;
-  const auto & pose = state_.last_lidar_pose;
-  return {{pose, tw}};
+  return statusSnapshot()->estimated_state;
 }
 
 double LidarOdometry::lastIcpQuality() const
@@ -338,20 +353,58 @@ double LidarOdometry::lastIcpQuality() const
     }
   }
 
-  auto lck = mrpt::lockHelper(state_mtx_);
+  return statusSnapshot()->icp_quality;
+}
 
-  return state_.last_icp_quality;
+std::shared_ptr<const LidarOdometry::StatusSnapshot> LidarOdometry::statusSnapshot() const
+{
+  auto lck = mrpt::lockHelper(status_snapshot_mtx_);
+  return status_snapshot_;
+}
+
+void LidarOdometry::updateStatusSnapshot()
+{
+  auto s = std::make_shared<StatusSnapshot>();
+
+  if (state_.last_motion_model_output) {
+    s->estimated_state.emplace(state_.last_lidar_pose, state_.last_motion_model_output->twist);
+  }
+  s->icp_quality = state_.last_icp_quality;
+  s->icp_iterations = state_.last_icp_iterations;
+  s->icp_was_good = state_.last_icp_was_good;
+  s->last_icp_timestamp = state_.last_icp_timestamp;
+  s->last_obs_timestamp = state_.last_obs_timestamp;
+  s->last_obs_reception_time = state_.last_obs_reception_time;
+  s->scan_period_sec = state_.last_observed_scan_period_sec;
+  s->average_process_time = profiler_.getMeanTime("onLidar");
+  if (state_.local_map) {
+    for (const auto & [layerName, layerMap] : state_.local_map->layers) {
+      std::optional<std::size_t> nPoints;
+      if (const auto pts = std::dynamic_pointer_cast<mrpt::maps::CPointsMap>(layerMap); pts) {
+        nPoints = pts->size();
+      }
+      s->local_map_layer_points.emplace_back(layerName, nPoints);
+    }
+  }
+  s->diagnostics_thresholds = params_.diagnostics;
+
+  auto lck = mrpt::lockHelper(status_snapshot_mtx_);
+  status_snapshot_ = std::move(s);
 }
 
 void LidarOdometry::saveEstimatedTrajectoryToFile() const
 {
-  if (params_.estimated_trajectory.output_file.empty()) {
+  // A queued request may change the file name concurrently:
+  std::string fil;
+  {
+    auto lckState = mrpt::lockHelper(state_mtx_);
+    fil = params_.estimated_trajectory.output_file;
+  }
+  if (fil.empty()) {
     return;
   }
 
   auto lck = mrpt::lockHelper(state_trajectory_mtx_);
-
-  const auto fil = params_.estimated_trajectory.output_file;
 
   MRPT_LOG_INFO_STREAM(
     "Saving estimated trajectory with " << state_.estimated_trajectory.size()
@@ -364,7 +417,13 @@ void LidarOdometry::saveEstimatedTrajectoryToFile() const
 
 void LidarOdometry::saveReconstructedMapToFile() const
 {
-  if (params_.simplemap.save_final_map_to_file.empty()) {
+  // A queued request may change the file name concurrently:
+  std::string fil;
+  {
+    auto lckState = mrpt::lockHelper(state_mtx_);
+    fil = params_.simplemap.save_final_map_to_file;
+  }
+  if (fil.empty()) {
     return;
   }
 
@@ -372,18 +431,16 @@ void LidarOdometry::saveReconstructedMapToFile() const
   // so if we have this feature enabled, all SF entries have been
   // "externalized" to make reading them much faster and less RAM
   // intensive:
-  unloadPastSimplemapObservations(0 /* unload until queue is empty */);
+  unloadPastSimplemapObservations(0 /* unload until queue is empty */, fil);
 
   auto lck = mrpt::lockHelper(state_simplemap_mtx_);
-
-  const auto fil = params_.simplemap.save_final_map_to_file;
 
   MRPT_LOG_INFO_STREAM(
     "Saving final simplemap with " << state_.reconstructed_simplemap.size()
                                    << " keyframes to file '" << fil << "'...");
   std::cout.flush();
 
-  state_.reconstructed_simplemap.saveToFile(fil);
+  ASSERTMSG_(state_.reconstructed_simplemap.saveToFile(fil), "Error saving final simplemap file");
 
   MRPT_LOG_INFO("Final simplemap saved.");
 }
@@ -409,7 +466,8 @@ void LidarOdometry::saveLocalMapToFile() const
   }
 }
 
-void LidarOdometry::unloadPastSimplemapObservations(const size_t maxSizeUnloadQueue) const
+void LidarOdometry::unloadPastSimplemapObservations(
+  const size_t maxSizeUnloadQueue, const std::string & simplemapFile) const
 {
   auto lck = mrpt::lockHelper(state_simplemap_mtx_);
 
@@ -417,14 +475,15 @@ void LidarOdometry::unloadPastSimplemapObservations(const size_t maxSizeUnloadQu
 
   while (pso.size() > maxSizeUnloadQueue) {
     for (auto & o : *pso.begin()->second) {
-      handleUnloadSinglePastObservation(o);
+      handleUnloadSinglePastObservation(o, simplemapFile);
     }
 
     pso.erase(pso.begin());
   }
 }
 
-void LidarOdometry::handleUnloadSinglePastObservation(mrpt::obs::CObservation::Ptr & o) const
+void LidarOdometry::handleUnloadSinglePastObservation(
+  mrpt::obs::CObservation::Ptr & o, const std::string & simplemapFile) const
 {
   using mrpt::obs::CObservationPointCloud;
 
@@ -442,7 +501,7 @@ void LidarOdometry::handleUnloadSinglePastObservation(mrpt::obs::CObservation::P
     return;  // already external, do nothing.
   }
 
-  if (params_.simplemap.save_final_map_to_file.empty()) {
+  if (simplemapFile.empty()) {
     return;  // no generation of simplemap requested by the user
   }
 
@@ -457,11 +516,9 @@ void LidarOdometry::handleUnloadSinglePastObservation(mrpt::obs::CObservation::P
     mrpt::Clock::toDouble(oPts->timestamp));
 
   // Create the default "/Images" directory.
-  const auto & smFile = params_.simplemap.save_final_map_to_file;
-
   const std::string out_basedir = mrpt::system::pathJoin(
-    {mrpt::system::extractFileDirectory(smFile),
-     mrpt::system::extractFileName(smFile) + std::string("_Images")});
+    {mrpt::system::extractFileDirectory(simplemapFile),
+     mrpt::system::extractFileName(simplemapFile) + std::string("_Images")});
 
   if (!mrpt::system::directoryExists(out_basedir)) {
     const bool dirCreatedOk = mrpt::system::createDirectory(out_basedir);
@@ -496,6 +553,14 @@ void LidarOdometry::enqueue_request(const std::function<void()> & userRequest)
 {
   auto lck = mrpt::lockHelper(requests_mtx_);
   requests_.push_back(userRequest);
+}
+
+void LidarOdometry::enqueue_locked_request(const std::function<void()> & userRequest)
+{
+  enqueue_request([this, userRequest]() {
+    auto lck = mrpt::lockHelper(state_mtx_);
+    userRequest();
+  });
 }
 
 void LidarOdometry::processPendingUserRequests()
@@ -653,33 +718,32 @@ bool version_greater(const std::string & a, const std::string & b)  // NOLINT
   return false;  // equal or smaller
 }
 
-void check_new_version(mrpt::config::CConfigFile & cfg, mrpt::system::COutputLogger * logger)
+void check_new_version(mrpt::config::CConfigFile & cfg)
 {
+  // Opt-out, e.g. for offline machines or for deterministic test coverage:
+  if (mrpt::get_env<bool>("MOLA_LO_DISABLE_VERSION_CHECK", false)) {
+    return;
+  }
+
   // Do we need to check today?
   const auto lastTim = cfg.read_double("config", "last_version_check", 0);
   const auto now = mrpt::Clock::nowDouble();
   if (now < lastTim + 24 * 60 * 60) {
     return;
   }
-  // Check in a detached thread:
-  std::thread([logger]() {
+  // Check in a detached thread, which may outlive this module: it must not
+  // reference it. Any failure is silently ignored.
+  std::thread([]() {
     try {
       auto response = http_get("docs.mola-slam.org", "/latest/mola_lidar_odometry.version");
       std::string body;
-      if (parse_http_response(response, body)) {
-        if (version_greater(MOLA_LO_VERSION, body)) {
-          logger->logFmt(
-            mrpt::system::LVL_DEBUG,
-            "[mola-lidar-odometry module] There is a newer version of mola_lidar_odometry "
-            "available online: '%s' vs current '%s'",
-            body.c_str(), MOLA_LO_VERSION);
-        }
-
-      } else {
-        std::cout << "[FAIL] Invalid response\n";
+      if (parse_http_response(response, body) && version_greater(body, MOLA_LO_VERSION)) {
+        std::cerr << mrpt::format(
+          "[mola-lidar-odometry] A newer version of mola_lidar_odometry is available: '%s' "
+          "(current: '%s')\n",
+          body.c_str(), MOLA_LO_VERSION);
       }
-    } catch (const std::exception & e) {
-      logger->logFmt(mrpt::system::LVL_DEBUG, "[check_new_version] Error: %s", e.what());
+    } catch (const std::exception &) {
     }
   }).detach();
 
@@ -701,7 +765,7 @@ void LidarOdometry::onInitializePersistentState()
 
     // Handle printing a notice of newer versions available:
 #if defined(MOLA_LO_HAS_ONLINE_VERSION_CHECK)
-    check_new_version(appCfg, this);
+    check_new_version(appCfg);
 #endif
 
   } catch (const std::exception & e) {
@@ -742,16 +806,32 @@ void LidarOdometry::doWriteDebugTracesFile(const mrpt::Clock::time_point & scan_
   vars["timestamp"] = mrpt::Clock::toDouble(scan_ref_time);
   vars["time_onLidar"] = profiler_.getLastTime("onLidar");
 
+  // The columns are fixed by the first row: a variable missing later leaves
+  // its cell empty, and one appearing later is not written.
   if (firstLine) {
+    debug_traces_columns_.clear();
     for (const auto & [name, value] : vars) {
+      debug_traces_columns_.push_back(name);
       of << "\"" << name << "\",";
     }
     of << "\n";
   }
-  for (const auto & [name, value] : vars) {
-    of << mrpt::format("%f,", value);
+  std::size_t written = 0;
+  for (const auto & name : debug_traces_columns_) {
+    if (const auto it = vars.find(name); it != vars.end()) {
+      of << mrpt::format("%f", it->second);
+      written++;
+    }
+    of << ",";
   }
   of << "\n";
+
+  if (!debug_traces_new_vars_warned_ && written < vars.size()) {
+    debug_traces_new_vars_warned_ = true;
+    MRPT_LOG_WARN(
+      "Debug traces: some variables appeared after the first row and are not written to the "
+      "file.");
+  }
 }
 
 void LidarOdometry::addDropStats(bool frame_is_dropped)
