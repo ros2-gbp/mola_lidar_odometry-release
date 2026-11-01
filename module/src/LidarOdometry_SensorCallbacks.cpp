@@ -33,6 +33,7 @@
 
 // Std:
 #include <chrono>
+#include <cmath>
 #include <mutex>
 #include <regex>
 #include <thread>
@@ -48,6 +49,22 @@ namespace
 /// IMU observation is dropped. Only reached when no LiDAR scan is being
 /// processed, since each scan consumes everything up to its own end of sweep.
 constexpr double kPendingImuMaxAge = 2.0;
+
+/// Increments a counter while alive.
+class LiveTaskToken
+{
+public:
+  explicit LiveTaskToken(std::atomic<int> & counter) : counter_(counter) { counter_++; }
+  ~LiveTaskToken() { counter_--; }
+
+  LiveTaskToken(const LiveTaskToken &) = delete;
+  LiveTaskToken & operator=(const LiveTaskToken &) = delete;
+  LiveTaskToken(LiveTaskToken &&) = delete;
+  LiveTaskToken & operator=(LiveTaskToken &&) = delete;
+
+private:
+  std::atomic<int> & counter_;
+};
 }  // namespace
 
 void LidarOdometry::onNewObservation(const CObservation::ConstPtr & o)
@@ -105,6 +122,14 @@ void LidarOdometry::onNewObservation(const CObservation::ConstPtr & o)
     onIMU(o);
   }
 
+  // Is it the IMU whose readings are only stored in simplemap keyframes
+  // (absolute attitude for geo-referencing)? Inline, it only buffers.
+  if (
+    params_.attitude_imu_sensor_label &&
+    std::regex_match(o->sensorLabel, params_.attitude_imu_sensor_label.value())) {
+    onAttitudeIMU(o);
+  }
+
   // Is it the odometry source whose absolute attitude provides the verticality
   // reading? Handled inline for the same reason as the IMU above: it only
   // stores the newest value, so doing it on the caller's thread keeps what a
@@ -123,16 +148,11 @@ void LidarOdometry::onNewObservation(const CObservation::ConstPtr & o)
     onDeskewOdometry(o);
   }
 
-  // Is it GNSS?
+  // Is it GNSS? Inline, for the same reason as the IMU above: it only buffers.
   if (
     params_.gnss_sensor_label &&
     std::regex_match(o->sensorLabel, params_.gnss_sensor_label.value())) {
-    {
-      auto lck = mrpt::lockHelper(is_busy_mtx_);
-      state_.worker_tasks_others++;
-    }
-    auto fut = worker_others_.enqueue(&LidarOdometry::onGPS, this, o);
-    (void)fut;
+    onGPS(o);
   }
 
   // Is it a LIDAR obs?
@@ -275,19 +295,20 @@ void LidarOdometry::sendLidarScanToProcessQueue(const CObservation::ConstPtr & o
   {
     auto lck = mrpt::lockHelper(worker_lidar_wait_for_imu_list_mtx_);
 
-    // Estimate the scan period from consecutive *arrival* timestamps (EMA), so
-    // it reflects the true sensor rate even while scans are being dropped:
-    if (last_lidar_arrival_stamp_ > 0) {
-      const double dt = thisStamp - last_lidar_arrival_stamp_;
+    // Estimate this sensor's scan period from consecutive *arrival* timestamps
+    // (EMA), so it reflects the true sensor rate even while scans are being
+    // dropped:
+    auto & sp = lidar_scan_periods_[o->sensorLabel];
+    if (sp.last_arrival_stamp > 0) {
+      const double dt = thisStamp - sp.last_arrival_stamp;
       if (dt > 0 && dt < 1.0) {
-        const double prev = lidar_scan_period_.load();
-        lidar_scan_period_.store(0.9 * prev + 0.1 * dt);
+        sp.period = 0.9 * sp.period + 0.1 * dt;
       }
     }
-    last_lidar_arrival_stamp_ = thisStamp;
+    sp.last_arrival_stamp = thisStamp;
 
     // The scan's IMU window ends at its estimated end of sweep:
-    worker_lidar_wait_for_imu_list_.add(thisStamp, {o, thisStamp + lidar_scan_period_.load()});
+    worker_lidar_wait_for_imu_list_.add(thisStamp, {o, thisStamp + sp.period});
 
     // Safety cap: if IMU data lags badly, keep the wait list from growing without
     // bound by dropping the oldest still-waiting scans (they would be the most
@@ -405,8 +426,7 @@ std::future<void> LidarOdometry::submitReadyLidarScanToWorker(
       getDropStats() * 100.0);
   }
 
-  return worker_lidar_.enqueue(
-    &LidarOdometry::onLidar, this, o, mrpt::Clock::nowDouble(), imuCoverageEndTime);
+  return enqueueLidarScan(o, imuCoverageEndTime);
 }
 
 std::future<void> LidarOdometry::submitLidarScanLossless_locked(
@@ -426,13 +446,37 @@ std::future<void> LidarOdometry::submitLidarScanLossless_locked(
     std::this_thread::sleep_for(std::chrono::microseconds(500));
   }
 
-  return worker_lidar_.enqueue(
-    &LidarOdometry::onLidar, this, o, mrpt::Clock::nowDouble(), imuCoverageEndTime);
+  return enqueueLidarScan(o, imuCoverageEndTime);
+}
+
+std::future<void> LidarOdometry::enqueueLidarScan(
+  const CObservation::ConstPtr & o, std::optional<double> imuCoverageEndTime)
+{
+  // Sources keep feeding data (e.g. IMU readings, which release waiting scans
+  // inline) after shutdownCleanup() has stopped the worker pool. Checking the
+  // flag and enqueueing under the same lock it is set with means a scan is
+  // either submitted before shutdown (and drained by it) or silently dropped.
+  auto lck = mrpt::lockHelper(is_busy_mtx_);
+  if (destructor_called_) {
+    return {};
+  }
+
+  // The token lives as long as the task: until it has run, or until the pool
+  // drops it unexecuted and destroys its callable.
+  auto token = std::make_shared<LiveTaskToken>(lidar_tasks_alive_);
+
+  return worker_lidar_.enqueue([this, token, o, readyTimestamp = mrpt::Clock::nowDouble(),
+                                imuCoverageEndTime, session = session_id_.load()]() mutable {
+    onLidar(o, readyTimestamp, imuCoverageEndTime, session);
+    // Explicitly, since a caller holding the task's future keeps its
+    // callable alive:
+    token.reset();
+  });
 }
 
 void LidarOdometry::onLidar(
   const CObservation::ConstPtr & o, const double readyTimestamp,
-  const std::optional<double> imuCoverageEndTime)
+  const std::optional<double> imuCoverageEndTime, const uint64_t session)
 {
   const bool abort_running = [this]() {
     auto lck = mrpt::lockHelper(is_busy_mtx_);
@@ -441,6 +485,15 @@ void LidarOdometry::onLidar(
 
   if (abort_running) {
     return;
+  }
+
+  // Scans queued (or held for IMU coverage) before a fatal error must not
+  // modify the trajectory or the map after it: discard them too.
+  {
+    auto lckStateFlags = mrpt::lockHelper(state_flags_mtx_);
+    if (state_.fatal_error) {
+      return;
+    }
   }
 
   {
@@ -455,7 +508,9 @@ void LidarOdometry::onLidar(
   // top-level try-catch:
   try {
     addDropStats(false);
-    processLidarScan(o, imuCoverageEndTime);
+    processLidarScan(o, imuCoverageEndTime, session);
+  } catch (const InvalidInputError & e) {
+    dropInvalidInput(*o, e);
   } catch (const std::exception & e) {
     MRPT_LOG_ERROR_STREAM("Exception:\n" << mrpt::exception_to_str(e));
     auto lckStateFlags = mrpt::lockHelper(state_flags_mtx_);
@@ -473,11 +528,44 @@ void LidarOdometry::onIMU(const CObservation::ConstPtr & o)
   // Keep a top-level try-catch, as for the methods running on a thread pool:
   try {
     onIMUImpl(o);
+  } catch (const InvalidInputError & e) {
+    dropInvalidInput(*o, e);
   } catch (const std::exception & e) {
     MRPT_LOG_ERROR_STREAM("Exception:\n" << mrpt::exception_to_str(e));
     auto lckStateFlags = mrpt::lockHelper(state_flags_mtx_);
     state_.fatal_error = true;
   }
+}
+
+namespace
+{
+/// The observation as an IMU one, or InvalidInputError if it is of another
+/// class or has a non-finite reading.
+mrpt::obs::CObservationIMU::ConstPtr validImuObservation(const CObservation::ConstPtr & o)
+{
+  auto imu = std::dynamic_pointer_cast<const mrpt::obs::CObservationIMU>(o);
+  if (!imu) {
+    throw LidarOdometry::InvalidInputError(mrpt::format(
+      "IMU observation with label '%s' does not have the expected "
+      "type 'mrpt::obs::CObservationIMU', it is '%s' instead",
+      o->sensorLabel.c_str(), o->GetRuntimeClass()->className));
+  }
+  for (size_t i = 0; i < imu->rawMeasurements.size(); i++) {
+    if (imu->dataIsPresent[i] && !std::isfinite(imu->rawMeasurements[i])) {
+      throw LidarOdometry::InvalidInputError(mrpt::format(
+        "IMU observation with label '%s' has a non-finite reading", o->sensorLabel.c_str()));
+    }
+  }
+  return imu;
+}
+}  // namespace
+
+void LidarOdometry::dropInvalidInput(const CObservation & o, const InvalidInputError & e)
+{
+  const auto count = ++invalid_input_count_;
+  MRPT_LOG_THROTTLE_ERROR_FMT(
+    2.0, "Dropping invalid observation '%s' (%zu dropped so far): %s", o.sensorLabel.c_str(), count,
+    e.what());
 }
 
 void LidarOdometry::onIMUImpl(const CObservation::ConstPtr & o)
@@ -486,12 +574,7 @@ void LidarOdometry::onIMUImpl(const CObservation::ConstPtr & o)
 
   const ProfilerEntry tleg(profiler_, "onIMU");
 
-  auto imu = std::dynamic_pointer_cast<const mrpt::obs::CObservationIMU>(o);
-  ASSERTMSG_(
-    imu, mrpt::format(
-           "IMU observation with label '%s' does not have the expected "
-           "type 'mrpt::obs::CObservationIMU', it is '%s' instead",
-           o->sensorLabel.c_str(), o->GetRuntimeClass()->className));
+  const auto imu = validImuObservation(o);
 
   MRPT_LOG_DEBUG_STREAM(
     "onIMU called for timestamp=" << mrpt::system::dateTimeLocalToString(imu->timestamp));
@@ -519,12 +602,9 @@ void LidarOdometry::onIMUImpl(const CObservation::ConstPtr & o)
     // from pending_imu_ above, which is drained as the readings are consumed,
     // and stored even when that one rejects a late arrival: an out-of-order
     // reading is still a valid attitude measurement for a keyframe.
-    if (params_.simplemap.save_imu_max_age > 0) {
-      state_.last_imu_.emplace(imu->timestamp, imu);
-
-      while (state_.last_imu_.size() > params_.imu_queue_max_size) {
-        state_.last_imu_.erase(state_.last_imu_.begin());
-      }
+    // A dedicated attitude IMU, if configured, takes this role instead.
+    if (!params_.attitude_imu_sensor_label) {
+      storeImuForSimplemap(imu);
     }
   }
 
@@ -547,6 +627,32 @@ void LidarOdometry::onIMUImpl(const CObservation::ConstPtr & o)
 
   // Finally, release any waiting LiDAR scan now fully covered by received IMU data:
   releaseReadyLidarScansToWorker();
+}
+
+void LidarOdometry::onAttitudeIMU(const CObservation::ConstPtr & o)
+{
+  ASSERT_(o);
+
+  try {
+    const auto imu = validImuObservation(o);
+    auto lckImu = mrpt::lockHelper(imu_state_mtx_);
+    storeImuForSimplemap(imu);
+  } catch (const InvalidInputError & e) {
+    dropInvalidInput(*o, e);
+  }
+}
+
+void LidarOdometry::storeImuForSimplemap(const mrpt::obs::CObservationIMU::ConstPtr & imu)
+{
+  if (params_.simplemap.save_imu_max_age <= 0) {
+    return;
+  }
+
+  state_.last_imu_.emplace(imu->timestamp, imu);
+
+  while (state_.last_imu_.size() > params_.imu_queue_max_size) {
+    state_.last_imu_.erase(state_.last_imu_.begin());
+  }
 }
 
 void LidarOdometry::consumePendingImu(const double upToTime)
@@ -591,19 +697,15 @@ void LidarOdometry::consumePendingImu(const double upToTime)
 
 void LidarOdometry::onGPS(const CObservation::ConstPtr & o)
 {
-  // All methods that are enqueued into a thread pool should have its own
-  // top-level try-catch:
+  // Keep a top-level try-catch, as for the methods running on a thread pool:
   try {
     onGPSImpl(o);
+  } catch (const InvalidInputError & e) {
+    dropInvalidInput(*o, e);
   } catch (const std::exception & e) {
     MRPT_LOG_ERROR_STREAM("Exception:\n" << mrpt::exception_to_str(e));
     auto lckStateFlags = mrpt::lockHelper(state_flags_mtx_);
     state_.fatal_error = true;
-  }
-
-  {
-    auto lck = mrpt::lockHelper(is_busy_mtx_);
-    state_.worker_tasks_others--;
   }
 }
 
@@ -614,23 +716,31 @@ void LidarOdometry::onGPSImpl(const CObservation::ConstPtr & o)
   const ProfilerEntry tleg(profiler_, "onGPS");
 
   auto gps = std::dynamic_pointer_cast<const mrpt::obs::CObservationGPS>(o);
-  ASSERTMSG_(
-    gps, mrpt::format(
-           "GPS observation with label '%s' does not have the expected "
-           "type 'mrpt::obs::CObservationGPS', it is '%s' instead",
-           o->sensorLabel.c_str(), o->GetRuntimeClass()->className));
+  if (!gps) {
+    throw InvalidInputError(mrpt::format(
+      "GPS observation with label '%s' does not have the expected "
+      "type 'mrpt::obs::CObservationGPS', it is '%s' instead",
+      o->sensorLabel.c_str(), o->GetRuntimeClass()->className));
+  }
 
   MRPT_LOG_DEBUG_FMT("GNSS observation received, t=%.03f", mrpt::Clock::toDouble(gps->timestamp));
 
   // ensure covariance is valid:
   if (gps->covariance_enu) {
-    const auto minCov = gps->covariance_enu->minimumDiagonal();
-    if (minCov < 0 || std::isnan(minCov) || std::isinf(minCov)) {
-      MRPT_LOG_THROTTLE_WARN_STREAM(
-        5.0, "Discarding GPS observation with invalid covariance matrix");
-      return;
+    const auto & cov = *gps->covariance_enu;
+    bool valid = cov.minimumDiagonal() >= 0;
+    for (int r = 0; r < cov.rows(); r++) {
+      for (int c = 0; c < cov.cols(); c++) {
+        valid = valid && std::isfinite(cov(r, c));
+      }
+    }
+    if (!valid) {
+      throw InvalidInputError("GPS observation with an invalid covariance matrix");
     }
   }
+
+  // The GNSS buffers are read by the LiDAR worker (simplemap) and the GUI:
+  auto lckImu = mrpt::lockHelper(imu_state_mtx_);
 
   // for rate stats:
   state_.append_gnss_stamp(gps->timestamp, *this);
@@ -678,17 +788,23 @@ double rate_from_stamps_buffer(
   const mrpt::containers::circular_buffer<double> & stamps, double ref_time = 0,
   double staleness_timeout = 5.0)
 {
-  if (stamps.size() < 2) return .0;
+  if (stamps.size() < 2) {
+    return .0;
+  }
 
   const double t_first = stamps.peek(0);
   const double t_last = stamps.peek(stamps.size() - 1);
 
   // Staleness check: if ref_time is provided and the newest stamp
   // is too old, report 0 (sensor stopped):
-  if (ref_time > 0 && (ref_time - t_last) > staleness_timeout) return .0;
+  if (ref_time > 0 && (ref_time - t_last) > staleness_timeout) {
+    return .0;
+  }
 
   const double dt = t_last - t_first;
-  if (dt <= 0) return .0;
+  if (dt <= 0) {
+    return .0;
+  }
 
   return static_cast<double>(stamps.size() - 1) / dt;
 }
@@ -731,7 +847,9 @@ bool append_stamp_to_buffer(
       return false;
     }
   }
-  if (stamps.available() == 0) stamps.pop();
+  if (stamps.available() == 0) {
+    stamps.pop();
+  }
   stamps.push(t);
   return true;
 }
