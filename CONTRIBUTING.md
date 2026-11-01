@@ -24,14 +24,14 @@ MOLA is a modular SLAM and localization framework written in C++ with ROS 2 supp
 
 ## 1. Contributor License Agreement
 
-All contributions to MOLA require acceptance of the [Contributor License Agreement (CLA)](./individual-cla.md) prior to being merged.
+All contributions to MOLA require acceptance of the [Contributor License Agreement (CLA)](./cla/individual-cla.md) prior to being merged.
 
 MOLA is distributed under a dual licensing model:
 
 - **Open source:** GNU General Public License v3 (GPL v3)
 - **Commercial:** A separate commercial license is available for industry users who cannot comply with the terms of the GPL v3
 
-The CLA ensures that the project maintainers hold the necessary rights to distribute your contribution under both licensing models. It does not transfer copyright ownership — you retain full ownership of your work.
+The CLA ensures that the Project Owners (José Luis Blanco-Claraco and the University of Almería) hold the necessary rights to distribute your contribution under both licensing models. It does not transfer copyright ownership: you retain full ownership of your work.
 
 When you open a Pull Request, an automated CLA assistant will verify whether you have previously accepted the agreement. If you have not, you will be prompted to do so before the PR can be reviewed or merged. Contributions submitted without CLA acceptance will not be considered.
 
@@ -47,13 +47,13 @@ All contributors are expected to adhere to the project's [Code of Conduct](./COD
 
 We welcome the following types of contributions:
 
-- **Bug fixes** — corrections to incorrect or unexpected behavior
-- **Performance improvements** — optimizations with measurable, documented impact
-- **New modules or algorithms** — extensions to MOLA's modular architecture
-- **Documentation improvements** — corrections, clarifications, and additions to existing documentation
-- **Dataset integrations** — support for additional SLAM benchmark or real-world datasets
-- **ROS 2 integrations** — improvements to the ROS 2 interface, launch files, or message definitions
-- **Tests** — new or improved unit, integration, or regression tests
+- **Bug fixes**: corrections to incorrect or unexpected behavior
+- **Performance improvements**: optimizations with measurable, documented impact
+- **New modules or algorithms**: extensions to MOLA's modular architecture
+- **Documentation improvements**: corrections, clarifications, and additions to existing documentation
+- **Dataset integrations**: support for additional SLAM benchmark or real-world datasets
+- **ROS 2 integrations**: improvements to the ROS 2 interface, launch files, or message definitions
+- **Tests**: new or improved unit, integration, or regression tests
 
 If you are considering a large or architectural contribution, please open an issue for discussion before beginning work. This avoids duplication of effort and ensures alignment with the project roadmap.
 

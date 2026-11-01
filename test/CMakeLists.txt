@@ -1,10 +1,7 @@
 # Unit tests:
 
-# -----------------------------------------------------------------------
-# Standalone unit test for GravityMapAligner — no external datasets needed.
-# -----------------------------------------------------------------------
-ament_add_gtest(test_gravity_map_aligner test_gravity_map_aligner.cpp)
-target_link_libraries(test_gravity_map_aligner mola::mola_lidar_odometry)
+ament_add_gtest(test_icp_prior test_icp_prior.cpp)
+target_link_libraries(test_icp_prior mola::mola_lidar_odometry)
 
 ament_add_gtest(test_keyframe_decider test_keyframe_decider.cpp)
 target_link_libraries(test_keyframe_decider mola::mola_lidar_odometry)
@@ -42,6 +39,73 @@ if(mola_metric_maps_FOUND AND mola_state_estimation_simple_FOUND)
   target_link_libraries(test_relocalization_request
     mola::mola_state_estimation_simple
     mola::mola_lidar_odometry
+  )
+endif()
+
+# Test: no reference cycle between LO and a module that is both its /tf source
+# and a subscriber of it (as BridgeROS2 is), so both are freed with the system.
+# ------------------------------------------------------------------------------
+if(mola_metric_maps_FOUND AND mola_state_estimation_simple_FOUND)
+  ament_add_gtest(test_module_lifetime test_module_lifetime.cpp
+    ENV LO_PIPELINE_YAML=${mola_lidar_odometry_SOURCE_DIR}/pipelines/lidar3d-default.yaml
+    ENV LO_STATE_ESTIM_YAML=${mola_lidar_odometry_SOURCE_DIR}/state-estimator-params/state-estimation-simple.yaml
+    ENV MOLA_PROFILER=false
+  )
+  target_link_libraries(test_module_lifetime
+    mola::mola_state_estimation_simple
+    mola::mola_lidar_odometry
+  )
+endif()
+
+# Test: error and concurrency paths (empty scans, reset, optimize_twist, GNSS,
+# map saving) on synthetic data generated on the fly: no dataset needed.
+# ------------------------------------------------------------------------------
+if(mola_metric_maps_FOUND AND mola_state_estimation_simple_FOUND)
+  ament_add_gtest(test_robustness test_robustness.cpp
+    TIMEOUT 600
+    ENV LO_PIPELINE_YAML=${mola_lidar_odometry_SOURCE_DIR}/pipelines/lidar3d-default.yaml
+    ENV LO_STATE_ESTIM_YAML=${mola_lidar_odometry_SOURCE_DIR}/state-estimator-params/state-estimation-simple.yaml
+    ENV MOLA_PROFILER=false
+  )
+  target_link_libraries(test_robustness
+    mrpt::mrpt_obs
+    mola::mola_state_estimation_simple
+    mola::mola_lidar_odometry
+  )
+endif()
+
+# Test: initial localization from a poor GNSS (with or without IMU), with the
+# real smoother and a global search. Synthetic world and sensor data are
+# generated on the fly: no dataset needed.
+# ------------------------------------------------------------------------------
+find_package(mola_state_estimation_smoother QUIET)
+if(mola_metric_maps_FOUND AND mola_state_estimation_simple_FOUND AND
+   mola_state_estimation_smoother_FOUND)
+  # The smoother's exported target names GTSAM by bare name:
+  find_package(GTSAM QUIET)
+  find_package(GTSAM_UNSTABLE QUIET)
+  # Its config may be under lib/<arch>/, so locate its share/ via the ament index:
+  ament_index_has_resource(SMOOTHER_PREFIX packages mola_state_estimation_smoother)
+  find_file(SMOOTHER_PARAMS_YAML state-estimation-smoother.yaml
+    PATHS ${SMOOTHER_PREFIX}/share/mola_state_estimation_smoother/params
+          ${mola_state_estimation_smoother_DIR}/../params
+    NO_DEFAULT_PATH)
+  ament_add_gtest(test_initial_global_search test_initial_global_search.cpp
+    TIMEOUT 900
+    ENV LO_PIPELINE_YAML=${mola_lidar_odometry_SOURCE_DIR}/pipelines/lidar3d-default.yaml
+    ENV LO_STATE_ESTIM_SIMPLE_YAML=${mola_lidar_odometry_SOURCE_DIR}/state-estimator-params/state-estimation-simple.yaml
+    ENV LO_STATE_ESTIM_SMOOTHER_YAML=${SMOOTHER_PARAMS_YAML}
+    ENV MOLA_PROFILER=false
+  )
+  # The smoother is only created by class name: keep it linked.
+  target_link_libraries(test_initial_global_search
+    mrpt::mrpt_obs
+    mola::mola_state_estimation_simple
+    mola::mola_lidar_odometry
+    mola::mola_relocalization
+    "-Wl,--no-as-needed"
+    mola::mola_state_estimation_smoother
+    "-Wl,--as-needed"
   )
 endif()
 
@@ -144,4 +208,101 @@ if(EXISTS "${RSLIDAR_DATASET_FILE}")
   )
 else()
   message(STATUS "Skipping test for missing dataset: ${RSLIDAR_DATASET_FILE}")
+endif()
+
+# -----------------------------------------------------------------------------
+# Integration tests: complete, headless mola-cli runs of the shipped launch
+# files on the datasets above, as a user would launch them. Unlike the tests
+# above, these also cover module loading, YAML launch files and their variable
+# expansion, the dataset source modules, threading and shutdown.
+# -----------------------------------------------------------------------------
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+ament_index_has_resource(MOLA_LAUNCHER_PREFIX packages mola_launcher)
+find_program(MOLA_CLI_EXECUTABLE mola-cli
+  PATHS ${MOLA_LAUNCHER_PREFIX}/bin
+  NO_DEFAULT_PATH)
+
+# mola_lo_add_cli_test(<name> <launch yaml> <reference tum> [ENV VAR=value ...])
+function(mola_lo_add_cli_test NAME LAUNCH REFERENCE)
+  cmake_parse_arguments(ARG "" "" "ENV" ${ARGN})
+  ament_add_test(${NAME}
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/run_mola_cli_dataset.py
+      --mola-cli ${MOLA_CLI_EXECUTABLE}
+      --launch ${mola_lidar_odometry_SOURCE_DIR}/mola-cli-launchs/${LAUNCH}
+      --reference ${REFERENCE}
+    TIMEOUT 300
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO
+    # The module under test, found before any other installed copy of it:
+    ENV MOLA_MODULES_LIB_PATH=$<TARGET_FILE_DIR:mola_lidar_odometry>
+      ${ARG_ENV}
+  )
+endfunction()
+
+if(NOT MOLA_CLI_EXECUTABLE)
+  message(STATUS "Skipping mola-cli integration tests: mola-cli not found")
+else()
+  mola_lo_add_cli_test(test_mola_cli_kitti lidar_odometry_from_rawlog.yaml ${KITTI00_GT_TUM}
+    ENV MOLA_INPUT_RAWLOG=${KITTI00_DATASET_FILE}
+  )
+  if(EXISTS ${MULRAN_KAIST01_DATASET_FILE})
+    mola_lo_add_cli_test(test_mola_cli_mulran lidar_odometry_from_rawlog.yaml
+      ${MULRAN_KAIST01_GT_TUM}
+      ENV MOLA_INPUT_RAWLOG=${MULRAN_KAIST01_DATASET_FILE}
+          MOLA_DESKEW_METHOD=MotionCompensationMethod::IMU
+    )
+  endif()
+  if(EXISTS ${RSLIDAR_DATASET_FILE})
+    mola_lo_add_cli_test(test_mola_cli_rslidar_mcap lidar_odometry_from_rosbag2.yaml
+      ${RSLIDAR_GT_TUM}
+      ENV MOLA_INPUT_ROSBAG2=${RSLIDAR_DATASET_FILE}
+          MOLA_LIDAR_TOPIC=${RSLIDAR_TOPIC}
+          MOLA_USE_FIXED_LIDAR_POSE=true
+          MOLA_IGNORE_NO_POINT_STAMPS=${IGNORE_POINT_STAMPS}
+    )
+  endif()
+endif()
+
+# Test: real ROS 2 launch with a rosbag2, local map published (or not) as a point cloud
+# -----------------------------------------------------------------------------------
+# With MRPT 3, the default local map class (a keyframe map, not a points map)
+# only reaches ROS through CMetricMap::asPointsMapView(), overridden in
+# mola_metric_maps. Check both in the headers we build against:
+set(LOCALMAP_REACHES_ROS FALSE)
+get_target_property(_mrpt_obs_incs mrpt::mrpt_obs INTERFACE_INCLUDE_DIRECTORIES)
+get_target_property(_mola_maps_incs mola::mola_metric_maps INTERFACE_INCLUDE_DIRECTORIES)
+find_file(_CMETRICMAP_H mrpt/maps/CMetricMap.h PATHS ${_mrpt_obs_incs} NO_DEFAULT_PATH)
+find_file(_KFM_H mola_metric_maps/KeyframePointCloudMap.h PATHS ${_mola_maps_incs} NO_DEFAULT_PATH)
+if(_CMETRICMAP_H AND _KFM_H)
+  file(STRINGS ${_CMETRICMAP_H} _mrpt_has_view REGEX "define MRPT_HAS_METRIC_MAP_POINTS_VIEW")
+  file(STRINGS ${_KFM_H} _kfm_has_view REGEX "asPointsMapView")
+  if(_mrpt_has_view AND _kfm_has_view)
+    set(LOCALMAP_REACHES_ROS TRUE)
+  endif()
+endif()
+
+find_package(launch_testing_ament_cmake QUIET)
+if(NOT LOCALMAP_REACHES_ROS)
+  message(STATUS "Skipping test_ros2_local_map_publishing: MRPT or mola_metric_maps lack CMetricMap::asPointsMapView()")
+elseif(launch_testing_ament_cmake_FOUND AND EXISTS ${RSLIDAR_DATASET_FILE})
+  add_launch_test(test_ros2_local_map_publishing.py
+    TARGET test_ros2_local_map_publishing
+    TIMEOUT 400
+    ARGS "rosbag:=${RSLIDAR_DATASET_FILE}"
+  )
+endif()
+
+# Test: real ROS 2 launch with the smoother, initial localization on a prebuilt
+# map (manual pose, or state estimator pose with and without the global search)
+# -----------------------------------------------------------------------------------
+set(INITIAL_LOCALIZATION_DATASET_DIR "${mola_test_datasets_DIR}/../datasets/ual/husky_benches")
+if(launch_testing_ament_cmake_FOUND AND mola_state_estimation_smoother_FOUND AND
+   EXISTS ${INITIAL_LOCALIZATION_DATASET_DIR}/dataset.yaml)
+  add_launch_test(test_ros2_initial_localization.py
+    TARGET test_ros2_initial_localization
+    TIMEOUT 1200
+    ENV LO_TEST_INITIAL_LOCALIZATION_DIR=${INITIAL_LOCALIZATION_DATASET_DIR}
+  )
+else()
+  message(STATUS "Skipping test_ros2_initial_localization: needs launch_testing, "
+    "mola_state_estimation_smoother and ${INITIAL_LOCALIZATION_DATASET_DIR}")
 endif()
