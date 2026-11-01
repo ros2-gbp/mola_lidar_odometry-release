@@ -5,7 +5,7 @@
 -->
 <package format="3">
   <name>mola_lidar_odometry</name>
-  <version>3.3.0</version>
+  <version>3.4.0</version>
   <description>LIDAR odometry system based on MOLA and MRPT components</description>
 
   <maintainer email="joseluisblancoc@gmail.com">Jose-Luis Blanco-Claraco</maintainer>
@@ -17,11 +17,13 @@
   <!-- core dependencies -->
   <depend>mola_common</depend>
   <depend>mola_kernel</depend>
-  <depend version_gte="3.1.0">mola_yaml</depend>
+  <depend version_gte="3.3.3">mola_yaml</depend>
   <depend>mp2p_icp</depend>
   <depend>mola_pose_list</depend>
+  <depend>mola_relocalization</depend>
 
   <depend>cli11</depend>
+  <depend>tbb</depend>
   <depend>mrpt_maps</depend>
   <build_depend>eigen</build_depend>
 
@@ -34,13 +36,9 @@
   <depend>mola_input_rosbag2</depend>
   <depend>mola_input_paris_luco_dataset</depend>
 
-  <!-- mola_input_rosbag1 is genuinely optional (unlike the ones above, not yet
-       released as a binary package on every ROS distro/channel combination),
-       so it is deliberately NOT declared as a dependency here: rosdep would
-       fail to resolve it on channels where it is absent, breaking CI/install
-       for everyone else. CMake still picks it up automatically if present in
-       the workspace or underlay (see CMakeLists.txt: find_package(mola_input_rosbag1)
-       is optional). Install it manually to enable the CLI's rosbag1 input. -->
+  <!-- mola_input_rosbag1 is declared so binary packages include the CLI's
+       rosbag1 input; CMake still treats it as optional
+       (find_package(mola_input_rosbag1) in CMakeLists.txt). -->
 
   <doc_depend>doxygen</doc_depend>
 
@@ -72,11 +70,20 @@
   <exec_depend>mola_viz</exec_depend>
   <exec_depend>mola_viz_imgui</exec_depend>
   <exec_depend>mola_bridge_ros2</exec_depend>
+  <exec_depend>mola_metric_maps</exec_depend> <!-- the 3D pipelines load its map classes at runtime -->
 
   <!-- Test datasets to run on them: -->
   <test_depend>mola_test_datasets</test_depend>
+  <test_depend>mola_launcher</test_depend> <!-- mola-cli, for the integration tests -->
   <test_depend>mola_metric_maps</test_depend>
   <test_depend>rosbag2_storage_mcap</test_depend> <!-- Needed to be able to open mcap test files -->
+  <!-- For the ROS 2 launch integration test: -->
+  <test_depend>launch_testing_ament_cmake</test_depend>
+  <test_depend>launch_testing_ros</test_depend>
+  <test_depend>ros2bag</test_depend>
+  <test_depend>rclpy</test_depend>
+  <test_depend>sensor_msgs</test_depend>
+  <test_depend>nav_msgs</test_depend>
 
   <export>
     <build_type>ament_cmake</build_type>
