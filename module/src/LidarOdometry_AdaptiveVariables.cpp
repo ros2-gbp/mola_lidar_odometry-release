@@ -45,9 +45,11 @@
 
 namespace
 {
-[[nodiscard]] bool isNormalPoint(const mrpt::math::TPoint3Df & pt)
+// Not std::isnormal(), which also rejects exact zeros (e.g. the z extent of
+// a planar 2D scan):
+[[nodiscard]] bool isFinitePoint(const mrpt::math::TPoint3Df & pt)
 {
-  return std::isnormal(pt.x) && std::isnormal(pt.y) && std::isnormal(pt.z);
+  return std::isfinite(pt.x) && std::isfinite(pt.y) && std::isfinite(pt.z);
 }
 }  // namespace
 
@@ -138,7 +140,11 @@ void LidarOdometry::updatePipelineDynamicVariables(const mrpt::Clock::time_point
   state_.parameter_source.updateVariable("ICP_ITERATION", 0);
 
   const auto ensureVarIsDefined = [&](const std::string & varName) {
+#if defined(MP2P_ICP_HAS_PARAMETER_SOURCE_HAS_VARIABLE)
+    if (!state_.parameter_source.hasVariable(varName)) {
+#else
     if (!state_.parameter_source.getVariableValues().count(varName)) {
+#endif
       state_.parameter_source.updateVariable(varName, 0);
     }
   };
@@ -312,7 +318,9 @@ bool LidarOdometry::doUpdateEstimatedObservationRadius(const mp2p_icp::metric_ma
   const double ALPHA = params_.observation_radius_filter_coefficient;
 
   auto & maxRange = state_.estimated_observation_radius;
-  ASSERT_(maxRange.has_value());  // this method is for subsequent calls only
+  if (!maxRange.has_value()) {
+    return false;  // doInitializeEstimatedObservationRadius() has not succeeded yet
+  }
 
   for (const auto & [layerName, layer] : m.layers) {
     auto pts = std::dynamic_pointer_cast<mrpt::maps::CPointsMap>(layer);
@@ -321,7 +329,7 @@ bool LidarOdometry::doUpdateEstimatedObservationRadius(const mp2p_icp::metric_ma
     }
 
     const auto bb = pts->boundingBox();
-    if (!isNormalPoint(bb.min) || !isNormalPoint(bb.max)) {
+    if (!isFinitePoint(bb.min) || !isFinitePoint(bb.max)) {
       continue;  // skip NaN, INF, etc.
     }
 
