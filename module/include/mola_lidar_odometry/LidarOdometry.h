@@ -113,6 +113,7 @@
 #include <memory>
 #include <mutex>
 #include <regex>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -224,6 +225,16 @@ public:
          *  to be used as GNSS (GPS) observations.
          */
     std::optional<std::regex> gnss_sensor_label;
+
+    /** Sensor labels or regex of an IMU whose readings are ONLY stored into
+     *  simplemap keyframes (see `simplemap.save_imu_max_age`), typically an
+     *  external AHRS providing absolute attitude (azimuth) for offline
+     *  geo-referencing. They are never used for de-skew nor gravity alignment,
+     *  which keep using `imu_sensor_label`. If set, the keyframes store
+     *  readings from this IMU instead of from `imu_sensor_label`.
+     *  Empty (default) = disabled.
+     */
+    std::optional<std::regex> attitude_imu_sensor_label;
 
     /** If set (non-empty), the linear velocity written to the pipelines'
      *  dynamic variables (vx,vy,vz), which FilterDeskew uses to de-skew scans,
@@ -472,6 +483,14 @@ public:
       bool show_localmap = false;
       float local_map_point_size = 3.0f;
       bool local_map_render_voxelmap_free_space = false;
+      /// Hide points seen from behind (local map, current and deskewed
+      /// observations), using their normal_{x,y,z} or, otherwise,
+      /// view_{x,y,z} point fields.
+      bool hide_back_facing_points = false;
+      /// Max angle (deg) between a point direction and the direction towards
+      /// the camera for it to be visible, for normals and view vectors.
+      float back_facing_max_angle_normals_deg = 90.0f;
+      float back_facing_max_angle_view_deg = 100.0f;
 
       mrpt::img::TColormap local_map_colormap = mrpt::img::TColormap::cmJET;
       /// Can be any pointcloud field name. Will change to "z" for simple XYZ clouds.
@@ -762,6 +781,75 @@ public:
       /// If <=0, wait indefinitely
       double from_state_estimator_timeout = 60.0;  // [s]
 
+      /// Used when method == FromStateEstimator. A state estimator pose may be
+      /// too uncertain for ICP to converge from it (e.g. plain GNSS, or no
+      /// heading at all). Then, search for the pose in the map around it, and
+      /// only accept an unambiguous match.
+      /// Intended for starting with the vehicle still: a search may take
+      /// seconds, the scans arriving meanwhile are dropped, and the found pose
+      /// is taken as the pose at the end of the search.
+      struct GlobalSearch
+      {
+        bool enabled = false;
+
+        /// The state estimator pose is used directly if its uncertainty
+        /// region (sigma_factor sigmas) fits inside ICP's convergence basin:
+        double icp_basin_xy = 0.5;        //!< half-width [m]
+        double icp_basin_yaw_deg = 10.0;  //!< half-width [deg]
+        double sigma_factor = 3.0;
+
+        /// Half-width of the searched XY region: sigma_factor sigmas, within
+        /// these limits. The minimum covers biases the estimator doesn't
+        /// model (e.g. GNSS multipath).
+        double min_half_width_xy = 0.0;   // [m]
+        double max_half_width_xy = 20.0;  // [m]
+
+        /// Minimum half-width of the searched yaw range. It covers the bias of
+        /// a heading source that the estimator takes as independent readings
+        /// (e.g. a magnetometer), whose sigma shrinks over time. 0: none.
+        double min_half_width_yaw_deg = 0.0;  // [deg]
+
+        /// While searching, accept state estimator poses up to this position
+        /// sigma, instead of from_state_estimator_max_position_sigma. Its
+        /// orientation sigma is not checked: yaw is searched if needed.
+        double max_position_sigma = 5.0;  // [m]
+
+        /// Spacing of the initial guesses
+        double resolution_xy = 1.0;        // [m]
+        double resolution_yaw_deg = 30.0;  // [deg]
+
+        /// The z of the prior (e.g. a GNSS altitude, often meters off) is
+        /// replaced by the one that puts the ground of the scan, below the
+        /// vehicle, on the ground of the map, below the prior (x,y): the
+        /// lowest points within this horizontal radius. 0: keep the prior z.
+        double z_from_map_radius = 5.0;  // [m]
+
+        /// Value of ADAPTIVE_THRESHOLD_SIGMA for the ICP runs of the search
+        /// (which use the "icp_settings_without_vel" pipeline)
+        double icp_threshold = 1.0;  // [m]
+
+        /// The best result of each pose hypothesis is refined with a
+        /// stricter ICP (this ADAPTIVE_THRESHOLD_SIGMA), whose quality tells
+        /// nearby hypotheses apart
+        double refine_icp_threshold = 0.2;  // [m]
+
+        /// ICP results below this quality are discarded
+        double min_quality = 0.5;
+
+        /// Results closer than this are the same pose hypothesis (mode)
+        double same_mode_max_distance = 1.0;  // [m]
+        double same_mode_max_yaw_deg = 15.0;  // [deg]
+
+        /// The best mode must beat any other one by this quality margin
+        double min_quality_margin = 0.1;
+
+        /// After an ambiguous or failed search, wait this long (sensor time) to try again
+        double retry_period = 2.0;  // [s]
+
+        void initialize(const Yaml & c);
+      };
+      GlobalSearch global_search;
+
       void initialize(const Yaml & c);
     };
 
@@ -1026,6 +1114,20 @@ public:
 
   bool isBusy() const;
 
+  /** Thrown by input checks. The offending observation is dropped with a
+   *  throttled error, instead of being a fatal error that stops the odometry.
+   *  Only for checks done before any state has been modified.
+   */
+  class InvalidInputError : public std::runtime_error
+  {
+  public:
+    using std::runtime_error::runtime_error;
+  };
+
+  /** Number of observations dropped as invalid input since construction.
+   *  Multi-thread safe to call. */
+  std::size_t invalidInputCount() const { return invalid_input_count_.load(); }
+
   /** Drains the worker thread pools and saves the simplemap/trajectory/local
    *  map to disk, if so configured. Idempotent: safe to call from onQuit()
    *  and then again from the destructor.
@@ -1042,6 +1144,10 @@ public:
   bool isActive() const;
   void setActive(bool active);
 
+  /** True once an unexpected exception has stopped the processing of new
+   *  observations (they are discarded from then on). Multi-thread safe. */
+  bool hasFatalError() const;
+
   /** Returns a copy of the estimated trajectory, with timestamps for each
      * lidar observation.
      * Multi-thread safe to call.
@@ -1050,7 +1156,7 @@ public:
 
   /** Returns the last estimated kinematic state: pose of the vehicle in the LiDAR odometry
    *  frame, and its estimated local (body-frame) twist vector.
-   *  This method will block if LO is running in another thread, until it is safe to get the data.
+   *  It does not wait for a scan being processed: it returns the state as of the last processed one.
    *  It will return std::nullopt if pose information is not available yet, e.g. still initializing.
    */
   std::optional<std::tuple<mrpt::poses::CPose3DPDFGaussian, mrpt::math::TTwist3D>>
@@ -1068,19 +1174,27 @@ public:
   void saveReconstructedMapToFile() const;
   void saveLocalMapToFile() const;
 
-  /** Enqueue a custom user request to be executed on the main LidarOdometry
-     *  thread on the next iteration.
+  /** Enqueue a custom user request, to be executed by the next spinOnce() or
+     *  by the LiDAR worker before its next scan, whichever comes first.
      *
-     *  So, this method is safe to be called from any other thread.
-     *
+     *  This method is safe to be called from any other thread. The request
+     *  itself runs without any lock held, possibly while the other of those two
+     *  threads is processing a scan.
      */
   void enqueue_request(const std::function<void()> & userRequest);
+
+  /** Like enqueue_request(), but the request runs with the internal state
+     *  mutex held. Any request that writes params_ must use this one.
+     *  The request must not call reset(), relocalize_*() or any other method
+     *  that takes the state mutex itself.
+     */
+  void enqueue_locked_request(const std::function<void()> & userRequest);
 
   /** @} */
 
   /** @name Runtime visualization coloring overrides
-     *  All setters are thread-safe: the change is applied on the internal
-     *  LidarOdometry worker thread via enqueue_request(), so they may be
+     *  All setters are thread-safe: the change is applied under the state
+     *  lock via a queued request (see enqueue_request()), so they may be
      *  called from any thread (e.g. a host GUI) at any time.
      *{ */
 
@@ -1211,7 +1325,6 @@ private:
     // otherwise (queued-but-not-yet-running scans are tracked separately, by
     // worker_lidar_.pendingTasks()).
     int worker_tasks_lidar = 0;
-    int worker_tasks_others = 0;
     // ------ ^^^ end of these flags are protected ^^^^      ---------
 
     // ------ these vars are protected by drop_stats_mtx_  ---------
@@ -1379,11 +1492,15 @@ private:
     /// the quasi-static gate rejects most of those on a moving platform. It is
     /// therefore retried on later scans, and the reading has to be transported
     /// through the pose it was taken at to still refer to the map frame.
-    /// Equals `fixed_initial_pose` when the first attempt succeeds, which is
-    /// what makes the retry a strict extension of the original behavior.
+    /// Equals `initial_pose` when the first attempt succeeds, which is what
+    /// makes the retry a strict extension of the original behavior.
     std::optional<mrpt::poses::CPose3D> gravity_calib_pose;
 
     mrpt::poses::CPose3DPDFGaussian last_lidar_pose;  //!< in local map
+
+    /// Pose set by the last initial localization, whatever its method. The
+    /// first keyframe of an empty local map is placed here.
+    std::optional<mrpt::poses::CPose3D> initial_pose;
 
     std::map<std::string, mrpt::Clock::time_point> last_obs_tim_by_label;
     std::map<std::string, mrpt::poses::CPose3D> last_lidar_sensor_poses;  //!< sensor pose per label
@@ -1425,7 +1542,10 @@ private:
     // Data source exposing a /tf tree (dataset reader or live ROS bridge), if
     // any is present in the running MOLA system. Optional: nullptr if none is
     // found, in which case the /tf tree visualization stays empty.
-    std::shared_ptr<mola::TransformTreeSource> transform_tree_source;
+    // Not owned: that module usually also holds this one (e.g. BridgeROS2
+    // subscribes to its localization and map), and owning it back would form a
+    // reference cycle keeping both alive, and running, after the system ends.
+    std::weak_ptr<mola::TransformTreeSource> transform_tree_source;
 #endif
 
     std::optional<NavState> last_motion_model_output;
@@ -1457,7 +1577,7 @@ private:
     size_t registration_gate_rejected = 0;
 
     // Automatic estimation of the observation bounding-radius (measured from
-    // base_link, not from the sensor — see ESTIMATED_OBSERVATION_RADIUS docs):
+    // base_link, not from the sensor; see ESTIMATED_OBSERVATION_RADIUS docs):
     std::optional<double> estimated_observation_radius;
     std::optional<double> instantaneous_observation_radius;
 
@@ -1521,8 +1641,19 @@ private:
     /// To handle post-re-localization. >0 means we are "recovering" from a request to re-localize:
     uint32_t step_counter_post_relocalization = 0;
 
+    /// State estimator pose to search around, while a global search for the
+    /// initial pose is pending (see InitialLocalizationOptions::GlobalSearch)
+    std::optional<mrpt::poses::CPose3DPDFGaussian> global_search_prior;
+    std::optional<mrpt::Clock::time_point> last_global_search_attempt;
+    mp2p_icp::ICP::Ptr global_search_icp;
+    mp2p_icp::Parameters global_search_icp_params;
+    /// Own variables for global_search_icp (ICP writes into its source)
+    std::shared_ptr<mp2p_icp::ParameterSource> global_search_param_source;
+    mp2p_icp::ICP::Ptr global_search_refine_icp;
+    std::shared_ptr<mp2p_icp::ParameterSource> global_search_refine_param_source;
+
     // GNSS: keep a list of recent observations to later on search the one
-    // closest to each LIDAR observation:
+    // closest to each LIDAR observation. Guarded by imu_state_mtx_.
     std::map<mrpt::Clock::time_point, std::shared_ptr<const mrpt::obs::CObservationGPS>> last_gnss_;
 
     // IMU: same as last_gnss_ above, but for the simplemap only. Independent
@@ -1538,10 +1669,26 @@ private:
     // glVehicleCachedBuilt tracks whether loading has already happened.
     std::vector<mrpt::viz::CVisualObject::Ptr> glVehicleModels;
     bool glVehicleModelsLoaded = false;
-    // Worker-private growing buffer for the estimated path. Never handed
-    // to the GUI thread directly: each update clones it into a fresh
-    // CSetOfObjects wrapper before dispatch.
-    mrpt::viz::CSetOfLines::Ptr glEstimatedPath;
+    /// GUI path of the estimated trajectory, in chunks of lines. Full chunks
+    /// never change again, so they are handed to the GUI thread as they are;
+    /// only the last one grows, and it is cloned for each update.
+    std::vector<mrpt::viz::CSetOfLines::Ptr> glEstimatedPathChunks;
+    /// Trajectory poses already in glEstimatedPathChunks, the last one, and
+    /// the color they were drawn with.
+    std::size_t glEstimatedPathPoses = 0;
+    mrpt::math::TPoint3D glEstimatedPathLastPoint;
+    std::vector<float> glEstimatedPathRgba;
+    /// Whether the path / local map were last sent to the GUI as hidden, so
+    /// hiding them is only sent once.
+    bool glPathHidden = false;
+    bool glLocalMapHidden = false;
+
+    /// Call whenever estimated_trajectory is cleared or transformed.
+    void resetGuiPath()
+    {
+      glEstimatedPathChunks.clear();
+      glEstimatedPathPoses = 0;
+    }
     /// Decimation counter for the local map visualization. Saturating (never
     /// wraps around), so its maximum value means "refresh at the next chance".
     unsigned int mapUpdateCnt = std::numeric_limits<unsigned int>::max();
@@ -1575,6 +1722,16 @@ private:
       const mrpt::Clock::time_point & stamp, const mrpt::system::COutputLogger & logger);
 
   };  // end of MethodState
+
+  /// Number of scans enqueued on worker_lidar_ that have neither finished
+  /// nor been dropped by the pool. Unlike pendingTasks() plus the running
+  /// flag, it has no gap between a task being dequeued and starting to run.
+  /// Declared before worker_lidar_, whose queued tasks reference it.
+  std::atomic<int> lidar_tasks_alive_{0};
+
+  /// Incremented by reset() under state_mtx_: scans enqueued before a reset
+  /// carry an older value and are discarded.
+  std::atomic<uint64_t> session_id_{0};
 
   /** The worker thread pool with 1 thread for processing incoming observations.
    *  Uses POLICY_DROP_OLD: when a new scan is enqueued while one is already
@@ -1620,16 +1777,20 @@ private:
   /// Protected by imu_state_mtx_.
   PendingImuBuffer pending_imu_;
 
-  /// Cached estimate of the LiDAR scan period [s], read lock-free by
-  /// releaseReadyLidarScansToWorker(). Estimated from consecutive scan *arrival*
+  /// Estimate of a LiDAR's scan period [s], from consecutive scan *arrival*
   /// (sensor) timestamps rather than the processed-scan rate: under heavy
   /// dropping the processed rate collapses, which would otherwise inflate this
   /// period and make scans wait for far more IMU than they actually need,
   /// needlessly deepening the wait list.
-  std::atomic<double> lidar_scan_period_{0.1};
-  /// Sensor timestamp [s] of the previous LiDAR scan seen at input, for the
-  /// arrival-based period estimate above. Guarded by the wait-list mutex.
-  double last_lidar_arrival_stamp_ = 0;
+  struct ScanPeriodEstimate
+  {
+    double period = 0.1;            //!< [s]
+    double last_arrival_stamp = 0;  //!< [s], 0 = none yet
+  };
+  /// One estimate per LiDAR sensor label: with several LiDARs, consecutive
+  /// arrivals of different sensors would underestimate each sensor's period.
+  /// Guarded by the wait-list mutex.
+  std::map<std::string, ScanPeriodEstimate> lidar_scan_periods_;
 
 #if defined(MOLA_LO_HAS_MP2P_GRAVITY_PRIOR)
   /// Builds the yaw-free rank-2 gravity observation for the current scan from
@@ -1694,10 +1855,6 @@ private:
 
 #endif
 
-  /** The worker thread pool with 1 thread for processing incoming observations*/
-  mrpt::WorkerThreadsPool worker_others_{
-    1 /*num threads*/, mrpt::WorkerThreadsPool::POLICY_FIFO, "worker_imu"};
-
   /** The worker thread pool with 1 thread for processing saving lazy-load observations to disk */
   mutable mrpt::WorkerThreadsPool worker_disk_io_{
     1 /*num threads*/, mrpt::WorkerThreadsPool::POLICY_FIFO, "worker_disk"};
@@ -1723,6 +1880,13 @@ private:
    *  delay shutdown by a full render to draw a frame nobody will see. */
   mrpt::WorkerThreadsPool worker_viz_local_map_{
     1, mrpt::WorkerThreadsPool::POLICY_DROP_OLD, "worker_viz_map"};
+
+  /** Copies the local map out for advertiseUpdatedMap(): an O(map size) job
+   *  kept off the LiDAR worker and out of state_mtx_. Drop-old, since only the
+   *  newest pending copy matters. Its tasks use `*this`, under the same
+   *  lifetime rules as worker_viz_local_map_ above. */
+  mrpt::WorkerThreadsPool worker_publish_local_map_{
+    1, mrpt::WorkerThreadsPool::POLICY_DROP_OLD, "worker_pub_map"};
 
   MethodState state_;
   const MethodState & state() const { return state_; }
@@ -1763,6 +1927,17 @@ private:
   /// The configuration used in the last call to initialize()
   Yaml lastInitConfig_;
 
+  /// Set once the state estimator callbacks are registered, so a reset()
+  /// does not register them again.
+  bool estimator_subscriptions_done_ = false;
+
+  /// Latest geo-referencing received from the state estimator. The estimator
+  /// may deliver it from inside a call LO makes with state_mtx_ held, so the
+  /// callback takes only this leaf mutex. Kept outside state_ so it survives
+  /// reset(): the estimator does not necessarily publish it again.
+  std::optional<mola::Georeferencing> received_external_georef_;
+  std::mutex received_external_georef_mtx_;
+
   bool destructor_called_ = false;
   mutable std::mutex is_busy_mtx_;
   /// Guards MethodState::drop_frames_stats_* (see addDropStats()/getDropStats()).
@@ -1780,10 +1955,10 @@ private:
   /// straight back into scan submission latency.
   ///
   /// Covers pending_imu_ and, in MethodState: imu_initializer,
-  /// gravity_estimator, map_gravity, recent_imu_stamps, parameter_source (its
-  /// variable map, the realize() "evaluated" flags, and localVelocityBuffer),
-  /// and any *invocation* of obs_generators (which writes the velocity buffer
-  /// and reads those flags).
+  /// gravity_estimator, map_gravity, recent_imu_stamps, last_imu_, last_gnss_,
+  /// recent_gnss_stamps, parameter_source (its variable map, the realize()
+  /// "evaluated" flags, and localVelocityBuffer), and any *invocation* of
+  /// obs_generators (which writes the velocity buffer and reads those flags).
   ///
   /// Lock order: state_mtx_ -> local_map_content_mtx_ -> imu_state_mtx_; never
   /// the reverse. The sensor-input thread takes only this one (and never the
@@ -1803,6 +1978,9 @@ private:
   /// Lock order: a thread that needs both must take state_mtx_ first; it must
   /// never be held while acquiring state_mtx_.
   mutable std::mutex local_map_content_mtx_;
+  /// Stamp of the scan last inserted into the local map. Guarded by
+  /// local_map_content_mtx_, so a copy of the map can carry its own stamp.
+  mrpt::Clock::time_point local_map_contents_stamp_{};
 
   mutable std::mutex state_trajectory_mtx_;
   mutable std::recursive_mutex state_simplemap_mtx_;
@@ -1821,6 +1999,11 @@ private:
   // never touch these mutexes directly.
   void relocalize_near_pose_pdf_impl(const mrpt::poses::CPose3DPDFGaussian & p);
   void relocalize_from_gnss_impl();
+
+  /// Runs the pending global search for the initial pose with this
+  /// (filtered) observation. Once localized, the found pose is taken as the
+  /// pose at the newest sensor time (the vehicle is assumed still meanwhile).
+  void doGlobalSearchForInitialPose(const mp2p_icp::metric_map_t & observation);
   MapServer::ReturnStatus map_load_impl(const std::string & path);
   MapServer::ReturnStatus map_save_impl(const std::string & path);
 
@@ -1839,12 +2022,69 @@ private:
   /// POLICY_DROP_OLD may discard a queued scan before it ever runs onLidar().
   void onLidar(
     const CObservation::ConstPtr & o, double readyTimestamp,
-    std::optional<double> imuCoverageEndTime);
+    std::optional<double> imuCoverageEndTime, uint64_t session);
   void processLidarScan(
-    const CObservation::ConstPtr & obs, std::optional<double> imuCoverageEndTime);
+    const CObservation::ConstPtr & obs, std::optional<double> imuCoverageEndTime, uint64_t session);
+
+  /** The output of preprocessScan(), the first stage of processLidarScan().
+   *
+   * processLidarScan() runs these stages in order, with state_mtx_ held:
+   *  1. preprocessScan(): points from the raw observation(s), de-skew, filters;
+   *  2. the first-scan map initialization, or ICP against the local map and
+   *     the keyframe decision;
+   *  3. insertScanIntoLocalMap(), for a new keyframe;
+   *  4. the simplemap and shared keyframe-map updates;
+   *  5. publishScanResults().
+   */
+  struct PreprocessedScan
+  {
+    /// The filtered observation layers: the ICP and local-map input.
+    mp2p_icp::metric_map_t::Ptr observation;
+    /// Only the "raw" layer, for the GUI.
+    mp2p_icp::metric_map_t observationRawForViz;
+    /// The whole de-skewed cloud (or the raw one, without de-skew), for the GUI
+    /// and for publishing.
+    mrpt::maps::CPointsMap::Ptr fullCloudForVizAndPublish;
+    /// Whether the early de-skew ran.
+    bool usedEarlyDeskew = false;
+  };
+
+  /// Returns nothing if the scan must be discarded. Caller must hold state_mtx_.
+  std::optional<PreprocessedScan> preprocessScan(
+    const CObservation & obs, const mrpt::obs::CSensoryFrame & sf);
+
+  /// Puts the first keyframe at the initial pose: trajectory, state estimator,
+  /// map-origin verticality, and the simplemap keyframe decider. The caller
+  /// marks the scan for the map updates. Caller must hold state_mtx_.
+  void startMapAtFirstScan(const CObservation & obs, const mrpt::Clock::time_point & scan_ref_time);
+
+  /// Clears the local map and trajectory after a bad ICP right after an
+  /// empty-map start. Caller must hold state_mtx_.
+  void restartLocalMapFromScratch();
+
+  /// Merges the observation layers into the local map, creating it from the
+  /// raw observations if empty. Caller must hold state_mtx_.
+  void insertScanIntoLocalMap(
+    const mrpt::obs::CSensoryFrame & sf, const mp2p_icp::metric_map_t & observation,
+    const mrpt::Clock::time_point & scan_ref_time);
+
+  /// Publishes the pose, the de-skewed scan and the local map, writes the
+  /// debug traces, and updates the GUI. Caller must hold state_mtx_ via
+  /// lckState.
+  void publishScanResults(
+    PreprocessedScan & scan, const mrpt::Clock::time_point & scan_ref_time,
+    std::unique_lock<std::mutex> & lckState);
 
   void onIMU(const CObservation::ConstPtr & o);
   void onIMUImpl(const CObservation::ConstPtr & o);
+
+  /** Handles an observation from `attitude_imu_sensor_label`: only keeps it
+   *  for simplemap keyframes. Inline on the caller's thread, like onIMU(). */
+  void onAttitudeIMU(const CObservation::ConstPtr & o);
+
+  /** Keeps `imu` in last_imu_ for simplemap keyframes, if enabled.
+   *  Caller must hold imu_state_mtx_. */
+  void storeImuForSimplemap(const mrpt::obs::CObservationIMU::ConstPtr & imu);
 
   /** Stores the "up" direction implied by an odometry observation's absolute
    *  attitude, for use as the verticality reading. Like onIMU(), it only
@@ -1862,11 +2102,16 @@ private:
   void onGPS(const CObservation::ConstPtr & o);
   void onGPSImpl(const CObservation::ConstPtr & o);
 
+  /// Counts and reports (throttled) an observation dropped as invalid input.
+  void dropInvalidInput(const CObservation & o, const InvalidInputError & e);
+  std::atomic<std::size_t> invalid_input_count_{0};
+
   // Adaptive threshold method:
   void doUpdateAdaptiveThreshold();
 
   void doInitializeEstimatedObservationRadius(const mrpt::obs::CObservation & o);
-  /// Returns false if no layer of `m` had usable points, so nothing was updated.
+  /// Returns false if there is no initial radius yet, or no layer of `m` had
+  /// usable points, so nothing was updated.
   bool doUpdateEstimatedObservationRadius(const mp2p_icp::metric_map_t & m);
 
   /// Returns false if the scan/observation is not valid:
@@ -1914,20 +2159,71 @@ private:
   [[nodiscard]] std::string vizParentFrame() const;
 
   void onExternalMapUpdate(const MapSourceBase::MapUpdate & mu);
+
+  /// Applies the latest geo-referencing received by onExternalMapUpdate() to
+  /// state_ and, if it has none yet, to the local map. Call with state_mtx_ held.
+  void applyReceivedExternalGeoref();
   void onExternalLocalizationUpdate(const LocalizationSourceBase::LocalizationUpdate & lu);
 
   void doPublishUpdatedLocalization(const mrpt::Clock::time_point & scan_ref_time);
 
   void doPublishUpdatedLocalMap(const mrpt::Clock::time_point & scan_ref_time);
 
+  /// Runs on worker_publish_local_map_: snapshots `localMap` under
+  /// local_map_content_mtx_ and advertises its layers and metadata.
+  void publishLocalMapLayers(
+    const mp2p_icp::metric_map_t::Ptr & localMap, const std::string & referenceFrame,
+    const mrpt::Clock::time_point & stamp);
+
+  /** A deep copy of the map layers, cheap enough to make while holding
+   *  local_map_content_mtx_, so that O(map size) work on it (render, publish)
+   *  can run outside that mutex. */
+  static mp2p_icp::metric_map_t cheapLayerSnapshot(const mp2p_icp::metric_map_t & m);
+
+  /** What the getters and diagnostics report, refreshed at the end of each
+   *  scan, so they never wait for state_mtx_, which is held for a whole scan
+   *  (seconds during a global search or a map load). */
+  struct StatusSnapshot
+  {
+    std::optional<std::tuple<mrpt::poses::CPose3DPDFGaussian, mrpt::math::TTwist3D>>
+      estimated_state;
+    double icp_quality = .0;
+    std::size_t icp_iterations = 0;
+    bool icp_was_good = true;
+    std::optional<mrpt::Clock::time_point> last_icp_timestamp;
+    std::optional<mrpt::Clock::time_point> last_obs_timestamp;
+    std::optional<mrpt::Clock::time_point> last_obs_reception_time;
+    double scan_period_sec = .0;
+    double average_process_time = .0;
+    /// Points per local map layer, or nullopt for layers that are not points
+    /// maps (e.g. keyframe maps), whose size has no cheap generic query.
+    std::vector<std::pair<std::string, std::optional<std::size_t>>> local_map_layer_points;
+    Parameters::Diagnostics diagnostics_thresholds;
+  };
+
+  /// Caller must hold state_mtx_.
+  void updateStatusSnapshot();
+  [[nodiscard]] std::shared_ptr<const StatusSnapshot> statusSnapshot() const;
+
+  std::shared_ptr<const StatusSnapshot> status_snapshot_ = std::make_shared<StatusSnapshot>();
+  /// Guards status_snapshot_ (the pointer only: snapshots are immutable).
+  mutable std::mutex status_snapshot_mtx_;
+
   void doPublishDeskewedScan(const mrpt::Clock::time_point & scan_ref_time);
 
   void doWriteDebugTracesFile(const mrpt::Clock::time_point & scan_ref_time);
   std::optional<std::ofstream> debug_traces_of_;
+  /// Columns of debug_traces_of_, fixed by its first row.
+  std::vector<std::string> debug_traces_columns_;
+  bool debug_traces_new_vars_warned_ = false;
 
-  void unloadPastSimplemapObservations(size_t maxSizeUnloadQueue) const;
+  /// \param simplemapFile Copy of simplemap.save_final_map_to_file, read by
+  ///        the caller under state_mtx_.
+  void unloadPastSimplemapObservations(
+    size_t maxSizeUnloadQueue, const std::string & simplemapFile) const;
 
-  void handleUnloadSinglePastObservation(CObservation::Ptr & o) const;
+  void handleUnloadSinglePastObservation(
+    CObservation::Ptr & o, const std::string & simplemapFile) const;
 
   void onPublishDiagnostics();
 
@@ -1937,8 +2233,11 @@ private:
 #endif
   void handleInitialLocalization();
   void handleInitialLocalizationStateEstimation();
+  /// `stamp`: the time of initPose, if resetting the state estimator
+  /// (default: the latest scan).
   void handleInitialLocalizationDoInitFromPose(
-    const mrpt::poses::CPose3DPDFGaussian & initPose, bool resetStateEstimator);
+    const mrpt::poses::CPose3DPDFGaussian & initPose, bool resetStateEstimator,
+    const std::optional<mrpt::Clock::time_point> & stamp = std::nullopt);
 
   bool isPipelineUsingIMU() const;
   /// Same as isPipelineUsingIMU(), but assumes state_mtx_ is already held by the caller.
@@ -1962,6 +2261,10 @@ private:
    *  worker queue to drain, then enqueues, so nothing is ever evicted.
    *  \note The caller must already hold lossless_submit_mtx_. */
   std::future<void> submitLidarScanLossless_locked(
+    const CObservation::ConstPtr & o, std::optional<double> imuCoverageEndTime);
+
+  /// Enqueues a scan on worker_lidar_, tracked by lidar_tasks_alive_.
+  std::future<void> enqueueLidarScan(
     const CObservation::ConstPtr & o, std::optional<double> imuCoverageEndTime);
 
   /// Number of LiDAR scans currently running or queued on worker_lidar_ (0, 1, or 2).
@@ -1997,7 +2300,7 @@ private:
   void doPreloadLocalMap();
 
   /// True when map loading has been deferred to spinOnce() via load_map_after_gui_init.
-  bool pending_preload_map_ = false;
+  std::atomic_bool pending_preload_map_{false};
 
   void doUpdateSimpleMap(
     const mrpt::obs::CSensoryFrame & sf, bool distance_enough_sm,
