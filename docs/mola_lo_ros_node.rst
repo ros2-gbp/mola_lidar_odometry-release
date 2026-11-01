@@ -156,6 +156,11 @@ runs **MOLA-LO** live on point clouds received from a ROS 2 topic, **demonstrati
 
     Arguments (pass as ``<name>:=<value>``):
 
+    * ``attitude_imu_topic_name`` (default ``""``, disabled):
+      Optional second ``sensor_msgs/Imu`` topic with absolute attitude (e.g. an AHRS).
+      Its readings are only stored into simplemap keyframes, for later
+      geo-referencing, instead of those of ``imu_topic_name``.
+
     * ``enforce_planar_motion`` (default ``False``):
       Whether to enforce z, pitch, and roll to be zero.
 
@@ -290,8 +295,15 @@ runs **MOLA-LO** live on point clouds received from a ROS 2 topic, **demonstrati
 
     * ``odom_topic_name`` (default ``""``):
       If non-empty, BridgeROS2 subscribes directly to this ``nav_msgs/Odometry`` topic
-      and forwards each message as a 3D ``CObservationRobotPose`` (6×6 covariance) —
+      and forwards each message as a 3D ``CObservationRobotPose`` (6×6 covariance),
       preferred for smoother fusion. Mutually exclusive with ``forward_ros_tf_odom_to_mola``.
+
+    * ``publish_local_map`` (default ``True``):
+      Whether to publish the local map as a point cloud on ``/lidar_odometry/localmap_points``.
+      Copying a large map out costs CPU and bandwidth; disable it if nothing consumes it.
+      As for all map topics (REP-2003), it is published as reliable and transient-local, and
+      only when the map changes: subscribe with the same QoS. A best-effort subscriber gets
+      no retransmission of lost fragments, so it may silently miss large clouds.
 
     * ``publish_localization_following_rep105`` (default ``True``):
       Whether the bridge publishes localization TFs as ``map → odom`` (REP-105, true)
@@ -351,17 +363,24 @@ runs **MOLA-LO** live on point clouds received from a ROS 2 topic, **demonstrati
 
     **Smoother-only arguments** (applied only when ``use_state_estimator:=True``):
 
-    * ``navstate_kinematic_model`` (default ``KinematicModel::ConstantVelocity``):
+    * ``navstate_imu_gravity_alignment_sigma`` (default empty):
+      Sigma [deg] of the IMU accelerometer gravity factor (``0`` disables it).
+      Empty means ``0`` in localization-only mode (``start_mapping_enabled:=False``),
+      since the loaded map is already gravity-aligned, and the smoother default
+      when mapping. A ``MOLA_IMU_GRAVITY_ALIGNMENT_SIGMA`` environment variable is
+      respected.
+
+    * ``navstate_kinematic_model`` (default empty, ``KinematicModel::ConstantVelocity`` in the smoother):
       Kinematic model for internal motion-model factors. Options:
       ``KinematicModel::ConstantVelocity``, ``KinematicModel::Tricycle``.
 
-    * ``navstate_sigma_random_walk_angacc`` (default ``10.0``):
+    * ``navstate_sigma_random_walk_angacc`` (default empty, ``10.0`` in the smoother):
       Random-walk angular acceleration uncertainty [rad/s²].
 
-    * ``navstate_sigma_random_walk_linacc`` (default ``1.0``):
+    * ``navstate_sigma_random_walk_linacc`` (default empty, ``0.5`` in the smoother):
       Random-walk linear acceleration uncertainty [m/s²].
 
-    * ``navstate_sliding_window_sec`` (default ``2.5``):
+    * ``navstate_sliding_window_sec`` (default empty, ``6.0`` in the smoother):
       Time window [seconds] to keep past observations in the filter.
 
 .. _mola_lo_ros_mola-cli-env-vars:
@@ -393,17 +412,23 @@ runs **MOLA-LO** live on point clouds received from a ROS 2 topic, **demonstrati
 
     - ``MOLA_GNSS_TOPIC`` (Default: ``'/gps'``): The ``sensor_msgs/NavSatFix`` topic with GNSS data (optional).
     
-    - ``MOLA_USE_FIXED_GNSS_POSE`` (Default: ``true``): If false, sensor pose will be retrieved from ``/tf``. You can also set it to true and then the sensor pose will be given by these env. variables:
+    - ``MOLA_USE_FIXED_GNSS_POSE`` (Default: ``false``): If false, sensor pose will be retrieved from ``/tf``. You can also set it to true and then the sensor pose will be given by these env. variables:
 
         - ``GNSS_POSE_X``, ``GNSS_POSE_Y``, ``GNSS_POSE_Z`` (in meters).
         - ``GNSS_POSE_YAW``, ``GNSS_POSE_PITCH``, ``GNSS_POSE_ROLL`` (in degrees).
 
     - ``MOLA_IMU_TOPIC`` (Default: ``'/imu'``): The ``sensor_msgs/Imu`` topic with IMU data (optional).
     
-    - ``MOLA_USE_FIXED_IMU_POSE`` (Default: ``true``): If false, sensor pose will be retrieved from ``/tf``. You can also set it to true and then the sensor pose will be given by these env. variables:
+    - ``MOLA_USE_FIXED_IMU_POSE`` (Default: ``false``): If false, sensor pose will be retrieved from ``/tf``. You can also set it to true and then the sensor pose will be given by these env. variables:
 
         - ``IMU_POSE_X``, ``IMU_POSE_Y``, ``IMU_POSE_Z`` (in meters).
         - ``IMU_POSE_YAW``, ``IMU_POSE_PITCH``, ``IMU_POSE_ROLL`` (in degrees).
+
+    - ``MOLA_ATTITUDE_IMU_TOPIC`` (Default: empty, disabled): A second ``sensor_msgs/Imu`` topic with absolute
+      attitude (e.g. an AHRS), stored into simple-map keyframes for geo-referencing instead of ``MOLA_IMU_TOPIC``.
+      Setting the topic is enough with ``mola-lo-gui-rosbag2``, ``mola-lo-cli-rosbag2`` and the ROS 2 launch file
+      (``attitude_imu_topic_name:=``). Running ``lidar_odometry_from_rosbag2.yaml`` directly with ``mola-cli`` also
+      needs ``MOLA_ATTITUDE_IMU_NAME=imu_attitude`` (see :ref:`pipeline sensor inputs <mola_lo_pipeline_sensor_inputs>`).
 
 
 .. dropdown:: More LO parameters
@@ -413,3 +438,64 @@ runs **MOLA-LO** live on point clouds received from a ROS 2 topic, **demonstrati
     of :ref:`additional parameters and options <mola_3d_gicp_pipeline>` that you can explore.
 
     See also the docs for the :ref:`ROS 2 API <mola_ros2api>` and :ref:`this tutorial <tutorial-mola-lo-map-and-localize>` on how to save and load a map using ROS 2 MOLA-LO nodes.
+
+.. _mola_lo_ros_fastdds_large_clouds:
+
+.. dropdown:: Large point clouds and Fast DDS: late ``/tf``
+    :icon: alert
+
+    With the default Fast DDS settings (the default ROS 2 middleware, e.g. in Jazzy), nodes that
+    subscribe to large point clouds may receive small messages such as ``/tf`` late. Messages
+    larger than the default shared memory segments (512 KB) go through fragmented UDP, and in a
+    simulation publishing ~1 MB clouds at 10 Hz this delayed ``/tf`` by up to ~1 s in the nodes
+    subscribed to them.
+
+    Symptoms: transform lookups at the scan stamp fail ("extrapolation into the future",
+    "no transform at the scan's stamp"), ``map -> odom`` seems to lag the LiDAR by about a
+    second, or obstacles end up misplaced, or a local map goes stale. This can affect any node
+    that needs timely ``/tf`` and also receives the clouds, including MOLA when sensor poses are
+    read from ``/tf`` (``MOLA_USE_FIXED_LIDAR_POSE=false``).
+
+    Fix: use shared memory segments large enough for the clouds, with a Fast DDS profile:
+
+    .. code-block:: xml
+
+        <?xml version="1.0" encoding="UTF-8"?>
+        <profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+          <transport_descriptors>
+            <transport_descriptor>
+              <transport_id>shm_large</transport_id>
+              <type>SHM</type>
+              <segment_size>16777216</segment_size>
+            </transport_descriptor>
+            <transport_descriptor>
+              <transport_id>udp_buffers</transport_id>
+              <type>UDPv4</type>
+              <sendBufferSize>4194304</sendBufferSize>
+              <receiveBufferSize>4194304</receiveBufferSize>
+            </transport_descriptor>
+          </transport_descriptors>
+          <participant profile_name="large_msgs_participant" is_default_profile="true">
+            <rtps>
+              <userTransports>
+                <transport_id>shm_large</transport_id>
+                <transport_id>udp_buffers</transport_id>
+              </userTransports>
+              <useBuiltinTransports>false</useBuiltinTransports>
+            </rtps>
+          </participant>
+        </profiles>
+
+    Enable it for **all** nodes, before launching them:
+
+    .. code-block:: bash
+
+        export FASTRTPS_DEFAULT_PROFILES_FILE=/path/to/fastdds_large_msgs.xml
+
+    In that simulation, the ``/tf`` delay dropped to below 0.3 s. Each DDS participant (one per
+    process in ROS 2, by default) reserves one segment in ``/dev/shm``: in Docker, whose
+    default ``/dev/shm`` is 64 MB, raise it
+    (``shm_size: "1gb"`` in compose, or ``docker run --shm-size=1g``), or Fast DDS falls back to
+    UDP. The UDP buffer sizes above are capped by the kernel limits
+    (``net.core.rmem_max``, ``net.core.wmem_max``). Another ROS 2 middleware (e.g. Cyclone DDS)
+    may also avoid the issue, but was not tested here.
