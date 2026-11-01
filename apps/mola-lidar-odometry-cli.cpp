@@ -29,6 +29,7 @@
 #include <mola_yaml/yaml_helpers.h>
 #include <mrpt/core/Clock.h>
 #include <mrpt/core/exceptions.h>
+#include <mrpt/core/get_env.h>
 #include <mrpt/obs/CObservation2DRangeScan.h>
 #include <mrpt/obs/CObservation3DRangeScan.h>
 #include <mrpt/obs/CObservationGPS.h>
@@ -81,15 +82,112 @@
 #include <mola_input_paris_luco_dataset/ParisLucoDataset.h>
 #endif
 
+// Older mola_kernel versions lack parallelism.h: no thread cap then.
+#if defined(MOLA_LO_CLI_HAS_TBB) && __has_include(<mola_kernel/utils/parallelism.h>)
+#include <mola_kernel/utils/parallelism.h>
+#include <tbb/global_control.h>
+#define MOLA_LO_CLI_CAP_THREADS
+#endif
+
 #include <CLI/CLI.hpp>
+#include <algorithm>
+#include <condition_variable>
 #include <csignal>  // sigaction
 #include <cstdlib>
+#include <deque>
+#include <exception>
+#include <functional>
 #include <iostream>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 namespace
 {
+
+/** Reads dataset entries [first, last) in order on a background thread, up to
+ *  `depth` entries ahead of the consumer, so reading and decoding overlap with
+ *  the odometry. Reads stay sequential and in order, so what each entry
+ *  contains does not change. */
+class DatasetReadAhead
+{
+public:
+  using Entry = mrpt::obs::CSensoryFrame::Ptr;
+
+  DatasetReadAhead(std::function<Entry(size_t)> read, size_t first, size_t last, size_t depth)
+  : read_(std::move(read)), depth_(depth), thread_([this, first, last]() { run(first, last); })
+  {
+  }
+
+  ~DatasetReadAhead()
+  {
+    {
+      std::lock_guard<std::mutex> lck(mtx_);
+      stop_ = true;
+    }
+    cv_.notify_all();
+    thread_.join();
+  }
+
+  DatasetReadAhead(const DatasetReadAhead &) = delete;
+  DatasetReadAhead & operator=(const DatasetReadAhead &) = delete;
+  DatasetReadAhead(DatasetReadAhead &&) = delete;
+  DatasetReadAhead & operator=(DatasetReadAhead &&) = delete;
+
+  /// The next entry, in order. Rethrows what reading it threw.
+  Entry next()
+  {
+    std::unique_lock<std::mutex> lck(mtx_);
+    cv_.wait(lck, [this]() { return !queue_.empty(); });
+    auto [entry, error] = std::move(queue_.front());
+    queue_.pop_front();
+    lck.unlock();
+    cv_.notify_all();
+    if (error) {
+      std::rethrow_exception(error);
+    }
+    return entry;
+  }
+
+private:
+  void run(size_t first, size_t last)
+  {
+    for (size_t i = first; i < last; i++) {
+      {
+        std::unique_lock<std::mutex> lck(mtx_);
+        cv_.wait(lck, [this]() { return stop_ || queue_.size() < depth_; });
+        if (stop_) {
+          return;
+        }
+      }
+      Entry entry;
+      std::exception_ptr error;
+      try {
+        entry = read_(i);
+      } catch (...) {
+        error = std::current_exception();
+      }
+      {
+        std::lock_guard<std::mutex> lck(mtx_);
+        queue_.emplace_back(std::move(entry), error);
+      }
+      cv_.notify_all();
+      if (error) {
+        return;
+      }
+    }
+  }
+
+  std::function<Entry(size_t)> read_;
+  const size_t depth_;
+  std::mutex mtx_;
+  std::condition_variable cv_;
+  std::deque<std::pair<Entry, std::exception_ptr>> queue_;
+  bool stop_ = false;
+  std::thread thread_;  // last: starts after the rest
+};
 
 // Thin wrapper mimicking TCLAP::ValueArg's isSet()/getValue() so the rest of
 // this file (option consumption below) stays a straightforward read.
@@ -258,7 +356,9 @@ struct Cli
     arg_outSimpleMap.opt = cmd
                              .add_option(
                                "--output-simplemap", arg_outSimpleMap.value,
-                               "Enables building and saving the simplemap for the mapping session")
+                               "Enables building and saving the simplemap for the mapping "
+                               "session. Note: incompatible with lazy-load simplemaps; for those, "
+                               "use MOLA_GENERATE_SIMPLEMAP=true and MOLA_SIMPLEMAP_OUTPUT instead")
                              ->option_text("output-map.simplemap");
 
     arg_firstN.opt = cmd
@@ -544,6 +644,13 @@ std::shared_ptr<mola::OfflineDatasetSource> dataset_from_rosbag2(
           # If present, this will override whatever /tf tells about the sensor pose:
           fixed_sensor_pose: "${IMU_POSE_X|0} ${IMU_POSE_Y|0} ${IMU_POSE_Z|0} ${IMU_POSE_YAW|0} ${IMU_POSE_PITCH|0} ${IMU_POSE_ROLL|0}" # 'x y z yaw_deg pitch_deg roll_deg''
           use_fixed_sensor_pose: ${MOLA_USE_FIXED_IMU_POSE|false}
+        # Optional second IMU, only stored into simplemap keyframes (absolute
+        # attitude for geo-referencing), see attitude_imu_sensor_label in the
+        # pipeline. Disabled unless MOLA_ATTITUDE_IMU_TOPIC is set.
+        - topic: ${MOLA_ATTITUDE_IMU_TOPIC|''}
+          sensorLabel: ${MOLA_ATTITUDE_IMU_NAME|imu_attitude}
+          type: CObservationIMU
+          is_optional: true
         # Wheel odometry, disabled unless MOLA_ODOMETRY_TOPIC is set: same
         # name and empty-by-default convention as dataset_from_rosbag1()
         # below and as lidar_odometry_from_rosbag2.yaml, rather than opting
@@ -868,12 +975,25 @@ int main_odometry(Cli & cli)
   // every scan must be processed and two runs over the same data must agree.
   setenv("MOLA_DROP_STALE_SCANS", "false", 0 /* do not overwrite */);
 
+  // mola::IncrementalPointCloud rebalances its k-d tree on a background thread
+  // that nearest-neighbor queries never wait for, so the tree a query sees, and
+  // how ties between equidistant neighbors resolve, depend on the scheduler.
+  // Fine for real time, but it makes two offline runs disagree. No effect on
+  // pipelines using other local map classes.
+  setenv("MOLA_INCREMENTAL_MAP_ASYNC_REBUILD", "false", 0 /* do not overwrite */);
+
   // Publishing the local map deep-copies it and deliberately does not check
   // whether anyone is subscribed, so that a late subscriber still gets a map.
   // Offline that subscriber never arrives, and the copy lands on the critical
   // path: measured at 7% of the run on a large scene. Off by default here,
   // overridable for the case of a --module that does consume the map.
   setenv("MOLA_PUBLISH_LOCAL_MAP", "false", 0 /* do not overwrite */);
+
+  // Naming an attitude-only IMU topic is enough to enable it: give the
+  // odometry the same label the rosbag2 input assigns to it.
+  if (!mrpt::get_env<std::string>("MOLA_ATTITUDE_IMU_TOPIC", "").empty()) {
+    setenv("MOLA_ATTITUDE_IMU_NAME", "imu_attitude", 0 /* do not overwrite */);
+  }
 
   // Declare any additional modules (e.g. a second front-end):
   // ------------------------------------------
@@ -1029,6 +1149,16 @@ int main_odometry(Cli & cli)
     // don't save within the LidarOdometry object, we will do it here in
     // this cli app:
     liodom->params_.simplemap.save_final_map_to_file.clear();
+
+    // Lazy-load scan files are written next to save_final_map_to_file, which
+    // was just cleared, so the module silently keeps every scan in RAM:
+    if (liodom->params_.simplemap.generate_lazy_load_scan_files) {
+      std::cerr << "[mola-lidar-odometry-cli] Warning: lazy-load simplemap generation "
+                   "(MOLA_SIMPLEMAP_GENERATE_LAZY_LOAD) is ignored with --output-simplemap: all "
+                   "scans are kept in RAM and saved inside the .simplemap. Use "
+                   "MOLA_GENERATE_SIMPLEMAP=true and MOLA_SIMPLEMAP_OUTPUT=<file> instead."
+                << std::endl;  // NOLINT(performance-avoid-endl)
+    }
   }
 
   if (cli.arg_lidarLabel.isSet()) {
@@ -1153,6 +1283,23 @@ int main_odometry(Cli & cli)
     std::cout << "\n";  // Needed for the VT100 codes below.
   }
 
+  // Dataset entries are read, and lazy-loaded, ahead of the odometry:
+  constexpr size_t READ_AHEAD_DEPTH = 16;
+  const auto readDatasetEntry = [&dataset](size_t idx) {
+    auto sf = dataset->datasetGetObservations(idx);
+    if (sf) {
+      for (const auto & o : *sf) {
+        if (o) {
+          o->load();
+        }
+      }
+    }
+    return sf;
+  };
+  DatasetReadAhead readAhead(
+    readDatasetEntry, firstDatasetEntry, std::max(firstDatasetEntry, lastDatasetEntry),
+    READ_AHEAD_DEPTH);
+
   // Run:
   for (size_t i = firstDatasetEntry; i < lastDatasetEntry; i++) {
     // Get observations from the dataset:
@@ -1166,7 +1313,7 @@ int main_odometry(Cli & cli)
     using mrpt::obs::CObservationRotatingScan;
     using mrpt::obs::CObservationVelodyneScan;
 
-    const auto sf = dataset->datasetGetObservations(i);
+    const auto sf = readAhead.next();
     ASSERT_(sf);
 
     // Additional modules get EVERY observation in the frame, not just the one
@@ -1279,6 +1426,11 @@ int main_odometry(Cli & cli)
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
+    // All further scans would be discarded: stop here, and report it.
+    if (liodom->hasFatalError()) {
+      break;
+    }
+
     // Sample the fused estimate for this scan, now that the worker is done and
     // whatever the other front-ends contributed is already in the graph:
     if (outFusedPath && obsIsLidarScan) {
@@ -1369,7 +1521,7 @@ int main_odometry(Cli & cli)
     std::cout << "\nSaving reconstructed map with " << sm.size() << " keyframes to: " << fil
               << std::endl;  // NOLINT(performance-avoid-endl)
 
-    sm.saveToFile(fil);
+    ASSERTMSG_(sm.saveToFile(fil), "Error saving reconstructed simplemap file");
   }
 
   if (outTwist) {
@@ -1377,6 +1529,12 @@ int main_odometry(Cli & cli)
     std::cout << "\nSaving estimated twist to: " << fil
               << std::endl;  // NOLINT(performance-avoid-endl)
     outTwist->saveToTextFile(fil);
+  }
+
+  if (liodom->hasFatalError()) {
+    std::cerr << "\nERROR: the LiDAR odometry stopped after a fatal error (see the log above); "
+                 "the outputs only cover the dataset up to that point.\n";
+    return 1;
   }
 
   return 0;
@@ -1417,6 +1575,15 @@ void report_options_taken_from_env(const CLI::App & cmd, int argc, char ** argv)
 
 int main(int argc, char ** argv)
 {
+#if defined(MOLA_LO_CLI_CAP_THREADS)
+  // Process-wide cap of the TBB threads (see mola::max_parallel_threads()),
+  // alive until main() returns.
+  const unsigned int nThreads = mola::max_parallel_threads();
+  const tbb::global_control tbbThreads(tbb::global_control::max_allowed_parallelism, nThreads);
+  std::cout << "Parallel algorithms use up to " << nThreads
+            << " threads (MOLA_MAX_THREADS to change it)\n";
+#endif
+
   try {
     Cli cli;
 
@@ -1446,9 +1613,7 @@ int main(int argc, char ** argv)
 
     mola_install_signal_handler();
 
-    main_odometry(cli);
-
-    return 0;
+    return main_odometry(cli);
   } catch (std::exception & e) {
     mola::pretty_print_exception(e, "Exit due to exception:");
     return 1;

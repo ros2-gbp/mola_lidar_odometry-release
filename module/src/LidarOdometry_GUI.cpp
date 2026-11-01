@@ -195,10 +195,11 @@ mola::gui::Tab LidarOdometry::buildTabControl()
                                       });
                                     }});
 
-  tab.widgets.emplace_back(CheckBox{
-    "Mapping enabled", params_.local_map_updates.enabled, [this](bool checked) {
-      this->enqueue_request([this, checked]() { params_.local_map_updates.enabled = checked; });
-    }});
+  tab.widgets.emplace_back(
+    CheckBox{"Mapping enabled", params_.local_map_updates.enabled, [this](bool checked) {
+               this->enqueue_locked_request(
+                 [this, checked]() { params_.local_map_updates.enabled = checked; });
+             }});
 
   {
     Label lbl;
@@ -212,12 +213,12 @@ mola::gui::Tab LidarOdometry::buildTabControl()
     Row row;
     row.widgets.emplace_back(
       CheckBox{"Save trajectory", params_.estimated_trajectory.save_to_file, [this](bool checked) {
-                 this->enqueue_request(
+                 this->enqueue_locked_request(
                    [this, checked]() { params_.estimated_trajectory.save_to_file = checked; });
                }});
     row.widgets.emplace_back(TextBox{
       "", params_.estimated_trajectory.output_file, 13, [this](std::string f) {  // NOLINT
-        this->enqueue_request([this, f]() { params_.estimated_trajectory.output_file = f; });
+        this->enqueue_locked_request([this, f]() { params_.estimated_trajectory.output_file = f; });
         return true;
       }});
     tab.widgets.emplace_back(std::move(row));
@@ -225,13 +226,13 @@ mola::gui::Tab LidarOdometry::buildTabControl()
 
   {
     Row row;
-    row.widgets.emplace_back(
-      CheckBox{"Generate simplemap", params_.simplemap.generate, [this](bool checked) {
-                 this->enqueue_request([this, checked]() { params_.simplemap.generate = checked; });
-               }});
+    row.widgets.emplace_back(CheckBox{
+      "Generate simplemap", params_.simplemap.generate, [this](bool checked) {
+        this->enqueue_locked_request([this, checked]() { params_.simplemap.generate = checked; });
+      }});
     row.widgets.emplace_back(TextBox{
       "", params_.simplemap.save_final_map_to_file, 13, [this](std::string f) {  // NOLINT
-        this->enqueue_request([this, f]() { params_.simplemap.save_final_map_to_file = f; });
+        this->enqueue_locked_request([this, f]() { params_.simplemap.save_final_map_to_file = f; });
         return true;
       }});
     tab.widgets.emplace_back(std::move(row));
@@ -266,62 +267,77 @@ mola::gui::Tab LidarOdometry::buildTabView()
 
   tab.widgets.emplace_back(CheckBox{
     "Orthographic camera", params_.visualization.camera_orthographic, [this](bool checked) {
-      this->enqueue_request([this, checked]() {
+      this->enqueue_locked_request([this, checked]() {
         params_.visualization.camera_orthographic = checked;
         visualizer_->update_viewport_camera_orthographic(checked);
       });
     }});
 
-  tab.widgets.emplace_back(CheckBox{
-    "Show trajectory", params_.visualization.show_trajectory, [this](bool checked) {
-      this->enqueue_request([this, checked]() { params_.visualization.show_trajectory = checked; });
-    }});
+  tab.widgets.emplace_back(
+    CheckBox{"Show trajectory", params_.visualization.show_trajectory, [this](bool checked) {
+               this->enqueue_locked_request(
+                 [this, checked]() { params_.visualization.show_trajectory = checked; });
+             }});
 
   tab.widgets.emplace_back(CheckBox{
     "Show raw observation", params_.visualization.show_current_observation, [this](bool checked) {
-      this->enqueue_request(
+      this->enqueue_locked_request(
         [this, checked]() { params_.visualization.show_current_observation = checked; });
     }});
 
   tab.widgets.emplace_back(CheckBox{
     "Show dense local map (decaying)", params_.visualization.show_last_deskewed_observations_decay,
     [this](bool checked) {
-      this->enqueue_request([this, checked]() {
+      this->enqueue_locked_request([this, checked]() {
         params_.visualization.show_last_deskewed_observations_decay = checked;
       });
     }});
 
+  tab.widgets.emplace_back(
+    CheckBox{"Show local map", params_.visualization.show_localmap, [this](bool checked) {
+               this->enqueue_locked_request(
+                 [this, checked]() { params_.visualization.show_localmap = checked; });
+             }});
+
+#if defined(MP2P_ICP_HAS_RENDER_HIDE_BACK_FACING)
   tab.widgets.emplace_back(CheckBox{
-    "Show local map", params_.visualization.show_localmap, [this](bool checked) {
-      this->enqueue_request([this, checked]() { params_.visualization.show_localmap = checked; });
+    "Hide back-facing points", params_.visualization.hide_back_facing_points, [this](bool checked) {
+      this->enqueue_locked_request([this, checked]() {
+        params_.visualization.hide_back_facing_points = checked;
+        // Force a redraw, since the map may not change on its own:
+        state_.local_map_needs_viz_update = true;
+        state_.mapUpdateCnt = std::numeric_limits<unsigned int>::max();
+      });
     }});
+#endif
 
   tab.widgets.emplace_back(CheckBox{
     "Camera follows vehicle", params_.visualization.camera_follows_vehicle, [this](bool checked) {
-      this->enqueue_request(
+      this->enqueue_locked_request(
         [this, checked]() { params_.visualization.camera_follows_vehicle = checked; });
     }});
 
   tab.widgets.emplace_back(CheckBox{
     "Camera rotates with vehicle", params_.visualization.camera_rotates_with_vehicle,
     [this](bool checked) {
-      this->enqueue_request(
+      this->enqueue_locked_request(
         [this, checked]() { params_.visualization.camera_rotates_with_vehicle = checked; });
     }});
 
   tab.widgets.emplace_back(CheckBox{
     "Show gravity-alignment vector", params_.visualization.show_gravity_align_vector,
     [this](bool checked) {
-      this->enqueue_request(
+      this->enqueue_locked_request(
         [this, checked]() { params_.visualization.show_gravity_align_vector = checked; });
     }});
 
   {
     Row row;
-    row.widgets.emplace_back(CheckBox{
-      "Show /tf tree", params_.visualization.show_tf_tree, [this](bool checked) {
-        this->enqueue_request([this, checked]() { params_.visualization.show_tf_tree = checked; });
-      }});
+    row.widgets.emplace_back(
+      CheckBox{"Show /tf tree", params_.visualization.show_tf_tree, [this](bool checked) {
+                 this->enqueue_locked_request(
+                   [this, checked]() { params_.visualization.show_tf_tree = checked; });
+               }});
     row.widgets.emplace_back(TextBox{
       "size", std::to_string(params_.visualization.tf_tree_corner_size), 5,
       [this](std::string s) {  // NOLINT
@@ -334,7 +350,8 @@ mola::gui::Tab LidarOdometry::buildTabView()
         if (v < 0) {
           return false;
         }
-        this->enqueue_request([this, v]() { params_.visualization.tf_tree_corner_size = v; });
+        this->enqueue_locked_request(
+          [this, v]() { params_.visualization.tf_tree_corner_size = v; });
         return true;
       }});
     tab.widgets.emplace_back(std::move(row));
@@ -344,12 +361,12 @@ mola::gui::Tab LidarOdometry::buildTabView()
     Row row;
     row.widgets.emplace_back(
       CheckBox{"tf links", params_.visualization.tf_tree_show_links, [this](bool checked) {
-                 this->enqueue_request(
+                 this->enqueue_locked_request(
                    [this, checked]() { params_.visualization.tf_tree_show_links = checked; });
                }});
     row.widgets.emplace_back(
       CheckBox{"tf names", params_.visualization.tf_tree_show_names, [this](bool checked) {
-                 this->enqueue_request(
+                 this->enqueue_locked_request(
                    [this, checked]() { params_.visualization.tf_tree_show_names = checked; });
                }});
     row.widgets.emplace_back(TextBox{
@@ -364,7 +381,8 @@ mola::gui::Tab LidarOdometry::buildTabView()
         if (v < 0) {
           return false;
         }
-        this->enqueue_request([this, v]() { params_.visualization.tf_tree_link_radius = v; });
+        this->enqueue_locked_request(
+          [this, v]() { params_.visualization.tf_tree_link_radius = v; });
         return true;
       }});
     tab.widgets.emplace_back(std::move(row));
@@ -374,13 +392,14 @@ mola::gui::Tab LidarOdometry::buildTabView()
     Row row;
     row.widgets.emplace_back(TextBox{
       "tf root", params_.visualization.tf_tree_root_frame, 13, [this](std::string f) {  // NOLINT
-        this->enqueue_request([this, f]() { params_.visualization.tf_tree_root_frame = f; });
+        this->enqueue_locked_request([this, f]() { params_.visualization.tf_tree_root_frame = f; });
         return true;
       }});
     row.widgets.emplace_back(TextBox{
       "exclude", params_.visualization.tf_tree_exclude_frames, 13,
       [this](std::string f) {  // NOLINT
-        this->enqueue_request([this, f]() { params_.visualization.tf_tree_exclude_frames = f; });
+        this->enqueue_locked_request(
+          [this, f]() { params_.visualization.tf_tree_exclude_frames = f; });
         return true;
       }});
     tab.widgets.emplace_back(std::move(row));
@@ -391,7 +410,7 @@ mola::gui::Tab LidarOdometry::buildTabView()
                                   : 0.5f;
   tab.widgets.emplace_back(
     CheckBox{"Show sensor poses", sensorPosesSize > 0.0f, [this, sensorPosesSize](bool checked) {
-               this->enqueue_request([this, checked, sensorPosesSize]() {
+               this->enqueue_locked_request([this, checked, sensorPosesSize]() {
                  params_.visualization.sensor_poses_corner_size = checked ? sensorPosesSize : 0.0f;
                });
              }});
@@ -514,6 +533,38 @@ void doRecolorize(
   mrpt::obs::recolorize3Dpc(cloud, org_cloud, rp);
 };
 
+// Upserts a 3D object, optionally as a child of a movable scene frame node
+// (parentFrame). Falls back to a root insert when built against an older
+// mola_kernel that lacks the movable-frame API.
+void vizUpsert3D(
+  const mola::VizInterface::Ptr & viz, const std::string & name,
+  const mrpt::viz::CSetOfObjects::Ptr & obj, const std::string & parentFrame)
+{
+#if defined(MOLA_KERNEL_VIZ_HAS_MOVABLE_FRAMES)
+  viz->update_3d_object(name, obj, "main", "main", parentFrame);
+#else
+  (void)parentFrame;
+  viz->update_3d_object(name, obj);
+#endif
+}
+
+void setBackFacing(
+  mp2p_icp::render_params_t & rp, bool hide, float maxAngleNormals_deg, float maxAngleView_deg)
+{
+#if defined(MP2P_ICP_HAS_RENDER_HIDE_BACK_FACING)
+  rp.points.allLayers.hideBackFacing = hide;
+  rp.points.allLayers.backFacingMaxAngleNormals_deg = maxAngleNormals_deg;
+  rp.points.allLayers.backFacingMaxAngleView_deg = maxAngleView_deg;
+#else
+  (void)rp;
+  (void)hide;
+  (void)maxAngleNormals_deg;
+  (void)maxAngleView_deg;
+#endif
+}
+
+}  // namespace
+
 // A deep copy of `m`, cheap enough to make while holding
 // local_map_content_mtx_. It exists to keep that mutex OUT of the render:
 // get_visualization() costs ~6x this copy (167.9 ms vs 28.1 ms mean on an
@@ -529,9 +580,8 @@ void doRecolorize(
 // The copy sees, in addition to the live points, the storage slots that are
 // tombstoned but not reclaimed yet; that population measured <2% of storage
 // on Oxford Spires (live/storage 0.999 mean, 0.982 worst), i.e. visually
-// irrelevant, and it is the same trade-off doPublishUpdatedLocalMap() already
-// makes when copying layers out for ROS.
-mp2p_icp::metric_map_t cheapLayerSnapshot(const mp2p_icp::metric_map_t & m)
+// irrelevant. The local map publishing uses the same copy.
+mp2p_icp::metric_map_t LidarOdometry::cheapLayerSnapshot(const mp2p_icp::metric_map_t & m)
 {
   // Shallow copy first, so any metadata this struct grows (id, label, lines,
   // planes, georeferencing, ...) is carried over without enumerating it here:
@@ -558,27 +608,10 @@ mp2p_icp::metric_map_t cheapLayerSnapshot(const mp2p_icp::metric_map_t & m)
   return out;
 }
 
-// Upserts a 3D object, optionally as a child of a movable scene frame node
-// (parentFrame). Falls back to a root insert when built against an older
-// mola_kernel that lacks the movable-frame API.
-void vizUpsert3D(
-  const mola::VizInterface::Ptr & viz, const std::string & name,
-  const mrpt::viz::CSetOfObjects::Ptr & obj, const std::string & parentFrame)
-{
-#if defined(MOLA_KERNEL_VIZ_HAS_MOVABLE_FRAMES)
-  viz->update_3d_object(name, obj, "main", "main", parentFrame);
-#else
-  (void)parentFrame;
-  viz->update_3d_object(name, obj);
-#endif
-}
-
-}  // namespace
-
 void LidarOdometry::setDeskewedColoring(
   mrpt::img::TColormap colormap, const std::string & colorByField)
 {
-  enqueue_request([this, colormap, colorByField]() {
+  enqueue_locked_request([this, colormap, colorByField]() {
     params_.visualization.current_observation_colormap = colormap;
     params_.visualization.current_observation_color_by_field = colorByField;
     params_.visualization.last_deskewed_observations_colormap = colormap;
@@ -589,7 +622,7 @@ void LidarOdometry::setDeskewedColoring(
 void LidarOdometry::setLocalMapColoring(
   mrpt::img::TColormap colormap, const std::string & colorByField)
 {
-  enqueue_request([this, colormap, colorByField]() {
+  enqueue_locked_request([this, colormap, colorByField]() {
     params_.visualization.local_map_colormap = colormap;
     params_.visualization.local_map_colormap_color_by_field = colorByField;
   });
@@ -597,7 +630,7 @@ void LidarOdometry::setLocalMapColoring(
 
 void LidarOdometry::setTrajectoryVisualization(bool show, const std::vector<float> & rgba)
 {
-  enqueue_request([this, show, rgba]() {
+  enqueue_locked_request([this, show, rgba]() {
     params_.visualization.show_trajectory = show;
     if (rgba.size() == 4) {
       params_.visualization.trajectory_rgba = rgba;
@@ -607,7 +640,7 @@ void LidarOdometry::setTrajectoryVisualization(bool show, const std::vector<floa
 
 void LidarOdometry::setCurrentPoseCornerVisualization(bool show)
 {
-  enqueue_request([this, show]() { params_.visualization.show_current_pose_corner = show; });
+  enqueue_locked_request([this, show]() { params_.visualization.show_current_pose_corner = show; });
 }
 
 std::string LidarOdometry::vizParentFrame() const
@@ -873,6 +906,10 @@ void LidarOdometry::updateVisualizationCurrentObservation(
   const float decayAlpha = params_.visualization.observations_initial_alpha;
   const double decaySeconds = params_.visualization.observations_decay_seconds;
 
+  const bool hideBackFacing = params_.visualization.hide_back_facing_points;
+  const float backFacingNormals_deg = params_.visualization.back_facing_max_angle_normals_deg;
+  const float backFacingView_deg = params_.visualization.back_facing_max_angle_view_deg;
+
   // Shared pointer to the deskewed cloud (may be null):
   // Make a copy intentionally so we capture by value in the lambda
   auto deskewed = deskewedCloud;  // NOLINT(performance-unnecessary-copy-initialization)
@@ -894,6 +931,7 @@ void LidarOdometry::updateVisualizationCurrentObservation(
       rp.points.allLayers.force_alpha_channel = true;
       rp.points.allLayers.pointSize = curObsPointSize;
       rp.points.allLayers.color.A = mrpt::f2u8(curObsAlpha);
+      setBackFacing(rp, hideBackFacing, backFacingNormals_deg, backFacingView_deg);
 
       auto & cm = rp.points.allLayers.colorMode.emplace();
       cm.colorMap = curObsColormap;
@@ -925,6 +963,7 @@ void LidarOdometry::updateVisualizationCurrentObservation(
       cm.recolorizeByField = decayColorField;
       rp.points.allLayers.pointSize = decayPointSize;
       rp.points.allLayers.color.A = mrpt::f2u8(decayAlpha);
+      setBackFacing(rp, hideBackFacing, backFacingNormals_deg, backFacingView_deg);
 
       auto glDecayObs = mm.get_visualization(rp);
 
@@ -978,6 +1017,10 @@ void LidarOdometry::updateVisualizationLocalMap()
 
     rp.points.allLayers.render_voxelmaps_free_space =
       params_.visualization.local_map_render_voxelmap_free_space;
+    setBackFacing(
+      rp, params_.visualization.hide_back_facing_points,
+      params_.visualization.back_facing_max_angle_normals_deg,
+      params_.visualization.back_facing_max_angle_view_deg);
 
     // local map: this recolors/renders every point currently in the map, an
     // O(map size) cost that keeps growing with it (e.g. under
@@ -1013,8 +1056,12 @@ void LidarOdometry::updateVisualizationLocalMap()
     });
   }
 
-  // Clear the local map if the user clicks on "hide it" at runtime:
-  if (!params_.visualization.show_localmap) {
+  // Clear the local map once, when the user hides it at runtime:
+  if (params_.visualization.show_localmap) {
+    state_.glLocalMapHidden = false;
+  } else if (!state_.glLocalMapHidden) {
+    state_.glLocalMapHidden = true;
+
     // Routed through the same worker so it is ordered after any render already
     // enqueued above and cannot be overwritten by it.
     auto viz = visualizer_;
@@ -1038,22 +1085,21 @@ void LidarOdometry::updateVisualizationTfTree(
 
   auto glTree = mrpt::viz::CSetOfObjects::Create();
 
-  if (vp.show_tf_tree && state_.transform_tree_source) {
+  const auto tfSource = state_.transform_tree_source.lock();
+  if (vp.show_tf_tree && tfSource) {
     // ALWAYS query from the robot body frame, whatever subtree is to be shown:
     // the returned poses are relative to the queried root, and the result is
     // drawn at the vehicle pose below, so querying from any other frame would
     // offset the whole tree by the (unknown here) body -> root transform.
     // tf_tree_root_frame then only selects which subtree of it to draw.
-    std::string queryRoot = state_.transform_tree_source->transform_tree_default_root();
+    std::string queryRoot = tfSource->transform_tree_default_root();
     if (queryRoot.empty()) {
       queryRoot = vp.tf_tree_root_frame;
     }
 
     // Query at the scan time, so the joints match the rendered cloud rather
     // than the wall clock (the source falls back to its latest data itself).
-    if (const auto tree =
-          state_.transform_tree_source->transform_tree(queryRoot, state_.last_obs_timestamp);
-        tree) {
+    if (const auto tree = tfSource->transform_tree(queryRoot, state_.last_obs_timestamp); tree) {
       const size_t n = renderTfTree(
         *tree, vp.tf_tree_root_frame, splitCommaSeparated(vp.tf_tree_exclude_frames),
         vp.tf_tree_corner_size, vp.tf_tree_show_links, vp.tf_tree_link_radius,
@@ -1083,39 +1129,63 @@ void LidarOdometry::updateVisualizationTfTree(
 void LidarOdometry::updateVisualizationPath(std::vector<std::function<void()>> & updateTasks)
 {
   if (!params_.visualization.show_trajectory) {
-    auto empty = mrpt::viz::CSetOfObjects::Create();
-    updateTasks.emplace_back([visualizer = visualizer_, empty, vizFrame = vizParentFrame()]() {
-      vizUpsert3D(visualizer, "liodom/path", empty, vizFrame);
-    });
+    if (!state_.glPathHidden) {
+      state_.glPathHidden = true;
+      auto empty = mrpt::viz::CSetOfObjects::Create();
+      updateTasks.emplace_back([visualizer = visualizer_, empty, vizFrame = vizParentFrame()]() {
+        vizUpsert3D(visualizer, "liodom/path", empty, vizFrame);
+      });
+    }
     return;
   }
+  state_.glPathHidden = false;
 
   const ProfilerEntry tle2(profiler_, "updateVisualization.update_traject");
 
-  if (!state_.glEstimatedPath) {
-    state_.glEstimatedPath = mrpt::viz::CSetOfLines::Create();
-    const auto & rgba = params_.visualization.trajectory_rgba;
-    state_.glEstimatedPath->setColor(rgba.at(0), rgba.at(1), rgba.at(2), rgba.at(3));
+  // Lines per path chunk: bounds the per-update clone of the growing chunk.
+  constexpr std::size_t PATH_CHUNK_LINES = 1000;
+
+  const auto & traj = state_.estimated_trajectory;
+  const auto & rgba = params_.visualization.trajectory_rgba;
+  if (state_.glEstimatedPathPoses > traj.size() || state_.glEstimatedPathRgba != rgba) {
+    // The trajectory was cleared, or the path color changed at runtime:
+    state_.resetGuiPath();
+    state_.glEstimatedPathRgba = rgba;
   }
-  // Update path viz:
-  for (size_t i = state_.glEstimatedPath->size(); i < state_.estimated_trajectory.size(); i++) {
-    auto it = state_.estimated_trajectory.begin();
-    std::advance(it, i);
 
+  // Only the new poses, at the end of the time-ordered trajectory:
+  auto it = traj.end();
+  std::advance(it, -static_cast<std::ptrdiff_t>(traj.size() - state_.glEstimatedPathPoses));
+
+  for (; it != traj.end(); ++it) {
     const auto t = it->second.translation();
+    auto & chunks = state_.glEstimatedPathChunks;
 
-    if (state_.glEstimatedPath->empty()) {
-      state_.glEstimatedPath->appendLine(t, t);
+    if (chunks.empty() || chunks.back()->size() >= PATH_CHUNK_LINES) {
+      auto chunk = mrpt::viz::CSetOfLines::Create();
+      chunk->setColor(rgba.at(0), rgba.at(1), rgba.at(2), rgba.at(3));
+      // Continue the strip from the end of the previous chunk:
+      const auto from = chunks.empty() ? t : state_.glEstimatedPathLastPoint;
+      chunk->appendLine(from, t);
+      chunks.push_back(chunk);
     } else {
-      state_.glEstimatedPath->appendLineStrip(t);
+      chunks.back()->appendLineStrip(t);
+    }
+    state_.glEstimatedPathLastPoint = t;
+    state_.glEstimatedPathPoses++;
+  }
+
+  // The GUI thread reads the objects it is given while this thread keeps
+  // appending to the last chunk, so that one goes as a clone:
+  auto pathGrp = mrpt::viz::CSetOfObjects::Create();
+  const auto & chunks = state_.glEstimatedPathChunks;
+  for (std::size_t i = 0; i < chunks.size(); i++) {
+    if (i + 1 < chunks.size()) {
+      pathGrp->insert(chunks[i]);
+    } else {
+      pathGrp->insert(mrpt::viz::CSetOfLines::Create(*chunks[i]));
     }
   }
-  // Hand a *fresh* wrapper containing a deep clone of the lines to the
-  // GUI thread, so the worker-private glEstimatedPath buffer can keep
-  // growing on subsequent ticks without racing with MolaViz's deep
-  // read on the GUI thread.
-  auto pathGrp = mrpt::viz::CSetOfObjects::Create();
-  pathGrp->insert(mrpt::viz::CSetOfLines::Create(*state_.glEstimatedPath));
 
   updateTasks.emplace_back([visualizer = visualizer_, pathGrp, vizFrame = vizParentFrame()]() {
     vizUpsert3D(visualizer, "liodom/path", pathGrp, vizFrame);
