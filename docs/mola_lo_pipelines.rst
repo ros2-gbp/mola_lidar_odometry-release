@@ -75,12 +75,12 @@ To use a prepared ``.mm`` map for localization, ensure it contains a layer named
 +-----------------------+---------------------------------------------------------+---------------------------------------------+
 | Pipeline config file  | Local map type and layer name                           | ICP algorithm                               |
 +=======================+=========================================================+=============================================+
-| ``lidar3d-gicp.yaml`` | Keyframe-based 3D point clouds (layer: ``localmap``)    | Generalized ICP (“cov-to-cov”)              |
-|    (Default)          | (:ref:`doxid-classmola_1_1_keyframe_point_cloud_map`)   |                                             |
+| ``lidar3d-gicp.yaml`` | Incremental 3D point cloud with a voxel-hash index      | Generalized ICP (“cov-to-cov”)              |
+|    (Default)          | (``mola::IncrementalPointCloud``, layer: ``localmap``)  |                                             |
 |                       |                                                         |                                             |
-|                       | Optionally, an incremental k-d tree point cloud         |                                             |
-|                       | (``mola::IncrementalPointCloud``), selected via         |                                             |
-|                       | ``MOLA_LOCALMAP_CLASS``: see                            |                                             |
+|                       | Alternatively, keyframe-based 3D point clouds           |                                             |
+|                       | (:ref:`doxid-classmola_1_1_keyframe_point_cloud_map`),  |                                             |
+|                       | selected via ``MOLA_LOCALMAP_CLASS``: see               |                                             |
 |                       | :ref:`gicp_localmap_class`.                             |                                             |
 +-----------------------+---------------------------------------------------------+---------------------------------------------+
 | ``lidar3d-icp.yaml``  | Voxel-based 3D point clouds (layer: ``localmap``)       | Standard ICP (point-to-point)               |
@@ -147,22 +147,24 @@ layer and the per-scan ``observation`` layer, since ICP pairs the two:
 
    * - ``MOLA_LOCALMAP_CLASS``
      - Description
-   * - ``mola::KeyframePointCloudMap``
-     - **Default.** Keyframe-based: points are stored in per-keyframe local
-       frames, so the map survives a loop-closure re-map. Required for SLAM
-       (``mola_sm_loop_closure``) and for any mapping session where the
-       trajectory may be corrected after the fact.
    * - ``mola::IncrementalPointCloud``
-     - Single global frame, holding one incremental, self-balancing k-d tree
-       that is updated in place instead of being rebuilt on every scan.
+     - **Default.** Single global frame, holding one incremental spatial index
+       that is updated in place instead of being rebuilt on every scan. The
+       index is selectable: a hashed voxel grid (``VoxelHash``, the default) or
+       an incremental, self-balancing k-d tree (``KDTree``).
        **Odometry only:** a global SE(3) re-map would force a full rebuild, so
        it must not be used together with loop closure.
+   * - ``mola::KeyframePointCloudMap``
+     - Keyframe-based: points are stored in per-keyframe local frames, so the
+       map survives a loop-closure re-map. Select it for SLAM
+       (``mola_sm_loop_closure``) and for any mapping session where the
+       trajectory may be corrected after the fact.
 
-To try the incremental map from the CLI:
+To select the keyframe map from the CLI:
 
 .. code-block:: bash
 
-   MOLA_LOCALMAP_CLASS=mola::IncrementalPointCloud \
+   MOLA_LOCALMAP_CLASS=mola::KeyframePointCloudMap \
    MOLA_ODOMETRY_PIPELINE_YAML=$(ros2 pkg prefix mola_lidar_odometry)/share/mola_lidar_odometry/pipelines/lidar3d-gicp.yaml \
    mola-lo-gui-rosbag2 /path/to/dataset.mcap
 
@@ -170,7 +172,7 @@ or from a ROS 2 launch file:
 
 .. code-block:: bash
 
-   MOLA_LOCALMAP_CLASS=mola::IncrementalPointCloud \
+   MOLA_LOCALMAP_CLASS=mola::KeyframePointCloudMap \
    ros2 launch mola_lidar_odometry ros2-lidar-odometry.launch.py [...]
 
 Note that ``lidar3d-gicp.yaml`` is already the default pipeline, so
@@ -179,12 +181,11 @@ that default to another one (e.g. ``mola-lo-gui-oxford-spires``).
 
 .. note::
 
-   ``mola::IncrementalPointCloud`` requires ``mola_metric_maps`` to have been
-   built against **nanoflann >= 1.10.0**, the release that introduced the
+   The default ``VoxelHash`` index of ``mola::IncrementalPointCloud`` has no
+   extra requirements. The ``KDTree`` index needs ``mola_metric_maps`` to have
+   been built against **nanoflann >= 1.10.0**, the release that introduced the
    incremental k-d tree index. On ROS distributions shipping an older nanoflann
-   the class still exists and is registered, but instantiating it throws an
-   explanatory error, so selecting it fails with a clear message rather than
-   silently falling back.
+   selecting it throws an explanatory error rather than silently falling back.
 
 Tuning is done through the ``MOLA_INCREMENTAL_MAP_*`` variables, see
 :ref:`pipelines_env_vars`.
@@ -673,6 +674,13 @@ Sensor inputs: GPS (GNSS) (optional)
      by ``MOLA_GNSS_TOPIC`` (see :ref:`the sensor-input environment variables <mola_lo_ros_mola-cli-env-vars>`). These are two different variables:
      ``MOLA_GPS_NAME`` is the internal sensor label; ``MOLA_GNSS_TOPIC`` is the ROS topic.
 
+- ``MOLA_ATTITUDE_IMU_NAME`` (Default: empty, disabled): **Sensor label** (or regex) of a second IMU whose
+  readings are only stored into simple-map keyframes, instead of those of ``MOLA_IMU_NAME``. Use it for an external
+  AHRS providing absolute attitude (azimuth), which ``mola-sm-georeferencing`` uses to observe the map yaw, while
+  the LiDAR's own IMU keeps doing de-skew and gravity alignment.
+  With ``mola-lidar-odometry-cli`` and rosbag2 input, setting the topic in ``MOLA_ATTITUDE_IMU_TOPIC`` is enough
+  (the label ``imu_attitude`` is assigned automatically).
+
 
 Scan de-skew options
 ^^^^^^^^^^^^^^^^^^^^^^
@@ -718,6 +726,9 @@ General options
 
 - ``MOLA_PROFILER`` (Default: ``true``): Enable pipeline and ICP step-level timing profiler. Disable to reduce overhead
   in production deployments.
+
+- ``MOLA_LO_DISABLE_VERSION_CHECK`` (Default: ``false``): If set to ``true``, skips the daily online check for a newer
+  release.
 
 - ``MOLA_LO_PUBLISH_REF_FRAME`` (Default: ``odom``): Reference frame name used when publishing pose updates.
 
@@ -813,35 +824,12 @@ ICP settings
 - ``MOLA_LOCALMAP_LAYER_NAME`` (Default: ``localmap``; GICP and ICP pipelines): Name of the metric map layer used
   as the local map for ICP matching and map insertion.
 
-- ``MOLA_LOCALMAP_CLASS`` (Default: ``mola::KeyframePointCloudMap``; GICP pipeline only): C++ class used for
-  both the local map and the per-scan observation layer. The alternative is ``mola::IncrementalPointCloud``
-  (odometry only, no loop closure). See :ref:`gicp_localmap_class`.
+- ``MOLA_LOCALMAP_CLASS`` (Default: ``mola::IncrementalPointCloud``; GICP pipeline only): C++ class used for
+  both the local map and the per-scan observation layer. The alternative is ``mola::KeyframePointCloudMap``
+  (survives a loop-closure re-map). See :ref:`gicp_localmap_class`.
 
-The following only apply when ``MOLA_LOCALMAP_CLASS=mola::IncrementalPointCloud``:
-
-- ``MOLA_INCREMENTAL_MAP_MAX_SIZE`` (Default: ``max(25.0, 0.5*ESTIMATED_OBSERVATION_RADIUS)`` [m]): **Half side**
-  of the axis-aligned cube of points kept around the robot; everything outside it is evicted on each map update.
-  Note this is a much tighter budget than the keyframe map's ``MOLA_LOCAL_MAP_MAX_SIZE``, which is a radius over
-  keyframe *centers*: here every point inside the cube is kept in a single tree and rendered, so setting it too
-  large makes the local map accumulate scans instead of sliding.
-
-- ``MOLA_INCREMENTAL_MAP_ASYNC_REBUILD`` (Default: ``true``): Run the k-d tree balancing rebuilds on a background
-  thread, so the mapping thread never pays for them. Measured on the Oxford Spires dataset, this takes local map
-  insertion from mean 28 ms / max 371 ms down to mean 10 ms / max 38 ms, removing all latency spikes. Costs
-  roughly twice the index memory plus one worker thread; set to ``false`` on core-constrained targets.
-
-- ``MOLA_INCREMENTAL_MAP_RESERVE_POINTS`` (Default: ``2000000``): Point storage reserved up front. With
-  ``ASYNC_REBUILD`` enabled this also prevents the mapping thread from ever having to wait for the background
-  worker, which it must do before the point buffers can be reallocated.
-
-- ``MOLA_INCREMENTAL_MAP_ALPHA_BALANCE`` (Default: ``0.75``): A subtree is rebuilt when its larger child holds
-  more than this fraction of its points. Lower values keep queries faster at the price of more frequent rebuilds.
-
-- ``MOLA_INCREMENTAL_MAP_ALPHA_DELETED`` (Default: ``0.5``): A subtree is rebuilt, physically dropping evicted
-  points, once this fraction of it is dead. Lower values reclaim memory more aggressively.
-
-- ``MOLA_LO_ROBUST_KERNEL`` (Default: ``RobustKernel::GemanMcClure``): Robust kernel type used in the ICP
-  Gauss-Newton solver.
+- ``MOLA_LO_ROBUST_KERNEL`` (Default: ``RobustKernel::GemanMcClure``; GICP pipeline only): Robust kernel type
+  used in the ICP Gauss-Newton solver.
 
 - ``MOLA_LO_ROBUST_KERNEL_SCALE`` (Default: ``2.449489742783178``): Scale of the robust kernel: the residual
   size at which down-weighting sets in, in sigmas of the whitened residual (normalized covariance units for
@@ -871,28 +859,84 @@ The following only apply when ``MOLA_LOCALMAP_CLASS=mola::IncrementalPointCloud`
   of the output covariance.
 
 
+The following only apply when ``MOLA_LOCALMAP_CLASS=mola::IncrementalPointCloud``:
+
+- ``MOLA_INCREMENTAL_MAP_MAX_SIZE`` (Default: ``max(100.0, 1.0*ESTIMATED_OBSERVATION_RADIUS)`` [m]): **Half side**
+  of the axis-aligned cube of points kept around the robot; everything outside it is evicted on each map update.
+  Unlike the keyframe map's ``MOLA_LOCAL_MAP_MAX_SIZE``, which is a radius over keyframe *centers*, here every
+  point inside the cube is kept in a single tree and rendered, so memory and matching cost grow with this size.
+
+- ``MOLA_INCREMENTAL_MAP_INDEX_TYPE`` (Default: empty, i.e. the class default, ``PointIndexType::VoxelHash``):
+  The spatial index answering the map's nearest-neighbor queries, ``PointIndexType::VoxelHash`` or
+  ``PointIndexType::KDTree``. Both return the same neighbors. The voxel index has O(1) insertion and removal and no
+  rebuilds, hence no latency spikes, no background thread and deterministic runs. On KITTI-07 it took the mean time
+  per scan from 75 to 56 ms and the worst local map update from 131 to 30 ms, against the k-d tree with background
+  rebuilds, at the same accuracy. The ``ASYNC_REBUILD`` and ``ALPHA_*`` variables below only apply to ``KDTree``.
+
+- ``MOLA_INCREMENTAL_MAP_INDEX_VOXEL_SIZE`` (Default: ``1.0`` [m]): Voxel side of the ``VoxelHash`` index. Results
+  are exact for any value; it only trades the number of voxels a query visits against the points it scans in each.
+  On KITTI, 1.0 m was faster than 0.5 m and 1.5 m.
+
+- ``MOLA_INCREMENTAL_MAP_ASYNC_REBUILD`` (Default: ``true``, ``KDTree`` index only): Run the k-d tree balancing rebuilds on a background
+  thread, so the mapping thread never pays for them. Measured on the Oxford Spires dataset, this takes local map
+  insertion from mean 28 ms / max 371 ms down to mean 10 ms / max 38 ms, removing all latency spikes. Costs
+  roughly twice the index memory plus one worker thread; set to ``false`` on core-constrained targets. Makes runs
+  depend on thread scheduling, so ``mola-lidar-odometry-cli`` defaults it to ``false`` (an explicit setting still
+  wins).
+
+- ``MOLA_INCREMENTAL_MAP_RESERVE_POINTS`` (Default: ``2000000``): Point storage reserved up front. With
+  ``ASYNC_REBUILD`` enabled this also prevents the mapping thread from ever having to wait for the background
+  worker, which it must do before the point buffers can be reallocated.
+
+- ``MOLA_INCREMENTAL_MAP_ALPHA_BALANCE`` (Default: ``0.75``, ``KDTree`` index only): A subtree is rebuilt when its larger child holds
+  more than this fraction of its points. Lower values keep queries faster at the price of more frequent rebuilds.
+
+- ``MOLA_INCREMENTAL_MAP_ALPHA_DELETED`` (Default: ``0.5``, ``KDTree`` index only): A subtree is rebuilt, physically dropping evicted
+  points, once this fraction of it is dead. Lower values reclaim memory more aggressively.
+
+- ``MOLA_INCREMENTAL_MAP_MIN_POINT_DISTANCE`` (Default: ``0.05`` [m]): Inserted points closer than this to a point
+  already in the map are dropped; ``0`` keeps every point. Otherwise, wherever consecutive scans overlap the map
+  grows much denser than the scan decimation, and matching, rebuild and memory costs grow with revisits rather than
+  with the area covered. The default was accuracy-neutral on average over 36 sequences of 6 datasets, with ~20%
+  less CPU and about half the memory; larger values save more but start to hurt accuracy on some sequences.
+
+
 GICP local map parameters
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-The following variables tune the ``mola::KeyframePointCloudMap`` used as local map in the GICP pipeline.
+The following variables tune the local map of the GICP pipeline, whichever class
+``MOLA_LOCALMAP_CLASS`` selects (``mola::IncrementalPointCloud`` by default, or ``mola::KeyframePointCloudMap``).
+Those marked *KeyframePointCloudMap only* have no effect with the other class.
 They have no effect on the ICP or NDT pipelines.
 
-- ``MOLA_LOCALMAP_MAX_SEARCH_KEYFRAMES`` (Default: ``3``): Maximum number of keyframes searched for correspondences
+- ``MOLA_LOCALMAP_MAX_SEARCH_KEYFRAMES`` (Default: ``3``; *KeyframePointCloudMap only*): Maximum number of keyframes searched for correspondences
   per ICP step.
 
 - ``MOLA_LOCALMAP_K_CORRESPONDENCES_FOR_COV`` (Default: ``20``): Number of nearest neighbors used to estimate
   per-point covariance in the local map.
 
-- ``MOLA_LOCALMAP_USE_VIEW_DIRECTION_FILTER`` (Default: ``true``): Enable filtering of candidate keyframes by
-  view direction, to avoid matching from very different angles.
+- ``MOLA_LOCALMAP_USE_VIEW_DIRECTION_FILTER`` (Default: ``true``): Master switch of the view-direction filter,
+  which rejects cov-to-cov pairs of points seen from opposite sides of a thin surface (e.g. the two faces of a
+  wall). It uses the per-point ``view_x/y/z`` fields added by the observation generator. Applies to both local map
+  classes; ``false`` disables it whatever ``MOLA_LOCALMAP_VIEW_DIRECTION_FILTER`` says.
 
-- ``MOLA_LOCALMAP_VIEW_DIRECTION_FILTER_ANGLE_DEG`` (Default: ``120`` [deg]): Maximum angular difference allowed
-  between the current view direction and a candidate keyframe to be considered for matching.
+- ``MOLA_LOCALMAP_VIEW_DIRECTION_FILTER`` (Default: empty, i.e. each class's own default): How pairs are judged,
+  one of ``ViewDirectionFilter::None``, ``ViewDirectionFilter::MaxAngle`` (reject pairs whose view directions are
+  more than ``MOLA_LOCALMAP_VIEW_DIRECTION_FILTER_ANGLE_DEG`` apart) or ``ViewDirectionFilter::SurfaceSide``
+  (reject pairs seen from opposite sides of the matched point's surface, as given by its covariance normal). The
+  class defaults are ``MaxAngle`` for ``mola::KeyframePointCloudMap`` and ``SurfaceSide`` for
+  ``mola::IncrementalPointCloud``: that map keeps the whole area around the robot, where ``MaxAngle`` also rejects
+  the same surface seen from very different azimuths (e.g. ground), and it measured consistently worse there on
+  hand-held sequences. ``SurfaceSide`` only rejects a pair when the matched point's neighborhood is actually flat
+  and both views are clearly (more than ~14.5 deg) off its plane.
 
-- ``MOLA_LOCALMAP_DIVERSE_KEYFRAMES`` (Default: ``1``): Number of diverse keyframes to force into the candidate set
+- ``MOLA_LOCALMAP_VIEW_DIRECTION_FILTER_ANGLE_DEG`` (Default: ``120`` [deg]): Maximum angle between the view
+  directions of a pair, for ``ViewDirectionFilter::MaxAngle`` only.
+
+- ``MOLA_LOCALMAP_DIVERSE_KEYFRAMES`` (Default: ``1``; *KeyframePointCloudMap only*): Number of diverse keyframes to force into the candidate set
   regardless of proximity. Must be less than ``MOLA_LOCALMAP_MAX_SEARCH_KEYFRAMES``.
 
-- ``MOLA_LOCALMAP_VIZ_MAX_POINTS_PER_KF`` (Default: ``10000``): Maximum points rendered per keyframe in the GUI.
+- ``MOLA_LOCALMAP_VIZ_MAX_POINTS_PER_KF`` (Default: ``10000``; *KeyframePointCloudMap only*): Maximum points rendered per keyframe in the GUI.
 
 - ``MOLA_LOCALMAP_VIZ_MAX_POINTS_OVERALL`` (Default: ``500000``): Maximum total points rendered for the local map
   in the GUI (e.g. to avoid FoxGlove WebSocket overflow).
@@ -917,6 +961,9 @@ Simple-map generation
 
 - ``MOLA_SIMPLEMAP_GENERATE_LAZY_LOAD`` (Default: ``false``): If enabled, generated simple-map files will be much
   smaller since all heavy observations will be stored in external files, making those maps faster to process later.
+  The external files go to ``<map>_Images/`` next to ``MOLA_SIMPLEMAP_OUTPUT``. With ``mola-lidar-odometry-cli``,
+  this is ignored if ``--output-simplemap`` is used: set ``MOLA_GENERATE_SIMPLEMAP=true`` and
+  ``MOLA_SIMPLEMAP_OUTPUT`` instead.
 
 - ``MOLA_SIMPLEMAP_ALSO_NON_KEYFRAMES`` (Default: ``false``): If enabled, all LiDAR observations will generate a
   KeyFrame in the simple-map, but without raw sensory data if the keyframe does not fulfill the minimum distance
@@ -974,7 +1021,36 @@ Initial localization
   state estimator for ``InitLocalization::FromStateEstimator``.
 
 - ``MOLA_LO_INIT_SE_TIMEOUT`` (Default: ``60.0`` [s]): Timeout for ``InitLocalization::FromStateEstimator``.
-  If the state estimator does not converge within this time, initialization falls back to ``FixedPose``.
+  Each time it expires, an error reports what is missing (geo-referencing, or the state estimator convergence),
+  and the wait continues, so a map can still be loaded at runtime (e.g. via the ``map_load`` service).
+
+- ``MOLA_LO_INIT_GLOBAL_SEARCH`` (Default: ``false``): For ``InitLocalization::FromStateEstimator``, if the state
+  estimator pose may be too uncertain for ICP to converge from it (e.g. plain GNSS, or no heading at all), search
+  for the pose in the map around it (with ``mola_relocalization``), and only accept an unambiguous match. Yaw is
+  searched too if uncertain. While searching, the state estimator pose is accepted up to
+  ``MOLA_LO_INIT_GLOBAL_SEARCH_MAX_POS_SIGMA`` (Default: ``5.0`` [m]) of position uncertainty, and its
+  orientation uncertainty is not checked. Intended for starting with the vehicle still: a search may take
+  seconds, the scans arriving meanwhile are dropped, and the found pose is taken as the pose at the end of
+  the search.
+
+- ``MOLA_LO_INIT_GLOBAL_SEARCH_Z_FROM_MAP_RADIUS`` (Default: ``5.0`` [m]): The z of the searched poses is the one
+  that puts the ground of the scan on the ground of the map below the prior (the lowest points within this
+  horizontal radius), instead of the prior z (e.g. a GNSS altitude, often meters off). ``0``: use the prior z.
+
+- ``MOLA_LO_INIT_GLOBAL_SEARCH_MIN_XY`` / ``MOLA_LO_INIT_GLOBAL_SEARCH_MAX_XY`` (Default: ``0.0`` / ``20.0`` [m]):
+  Limits of the half-width of the searched region (3 sigmas otherwise). The minimum covers biases the state
+  estimator doesn't model, e.g. GNSS multipath.
+
+- ``MOLA_LO_INIT_GLOBAL_SEARCH_MIN_YAW`` (Default: ``0.0`` [deg]): Minimum half-width of the searched yaw range
+  (3 sigmas otherwise). For a heading source with a bias that the estimator takes as independent readings (e.g. a
+  magnetometer-based IMU attitude), whose fused sigma shrinks while the vehicle stands still.
+
+- ``MOLA_LO_INIT_GLOBAL_SEARCH_RES_XY``, ``MOLA_LO_INIT_GLOBAL_SEARCH_RES_YAW`` (Default: ``1.0`` [m],
+  ``30.0`` [deg]): Spacing of the initial guesses of the search.
+
+- ``MOLA_LO_INIT_GLOBAL_SEARCH_MIN_QUALITY``, ``MOLA_LO_INIT_GLOBAL_SEARCH_MIN_MARGIN`` (Default: ``0.5``, ``0.1``):
+  Minimum ICP quality of a match, and by how much the best match must beat any other distinct pose. Otherwise
+  (e.g. identical crop rows), the search is retried later and no pose is reported.
 
 
 Visualization
