@@ -63,6 +63,11 @@ modules:
       #- raw_sensor_label: '/ouster/range_image'
       #  decimation: 1
       #  win_pos: 5 420 400 400
+      # Optional camera preview, shown only when MOLA_CAMERA_PREVIEW=true:
+      - raw_sensor_label: "${MOLA_CAMERA_SENSOR_NAME|camera}"
+        decimation: 1
+        enabled: ${MOLA_CAMERA_PREVIEW|false}
+        win_pos: 5 420 600 380
 
     params:
       # We use an environment variable to force the user to specify a bag file:
@@ -113,6 +118,22 @@ modules:
           # otherwise trips the "mis-timestamped sensors" time reference
           # reset. Default false.
           use_bag_recv_time_as_timestamp: ${MOLA_IMU_USE_BAG_RECV_TIME|false}
+
+        # Optional second IMU, only stored into simplemap keyframes (absolute
+        # attitude for geo-referencing). Disabled unless MOLA_ATTITUDE_IMU_TOPIC
+        # is set. When running this file directly with mola-cli, also set
+        # MOLA_ATTITUDE_IMU_NAME=imu_attitude so the odometry uses it
+        # (mola-lo-gui-rosbag2 and mola-lidar-odometry-cli do this by themselves).
+        - topic: ${MOLA_ATTITUDE_IMU_TOPIC|''}
+          sensorLabel: ${MOLA_ATTITUDE_IMU_NAME|imu_attitude}
+          type: CObservationIMU
+          is_optional: true
+
+        # Optional camera, for visualization only (disabled by default):
+        - topic: ${MOLA_CAMERA_TOPIC|''}
+          is_optional: true
+          sensorLabel: ${MOLA_CAMERA_SENSOR_NAME|camera}
+          type: CObservationImage
 
         # Wheel/robot odometry (disabled by default). CObservationOdometry is
         # planar: (x, y, yaw) plus a 2D twist. For a 3D odometry source
