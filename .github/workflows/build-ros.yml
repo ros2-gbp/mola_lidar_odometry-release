@@ -174,10 +174,13 @@ jobs:
           # Inject coverage instrumentation flags
           if [ "${{ matrix.coverage_run }}" = "true" ]; then
             echo "Enabling coverage instrumentation..."
+            # Atomic counters: multithreaded tests otherwise corrupt them.
             EXTRA_CMAKE_ARGS="$EXTRA_CMAKE_ARGS \
               -DCMAKE_BUILD_TYPE=Debug \
               -DCMAKE_CXX_FLAGS=--coverage \
               -DCMAKE_C_FLAGS=--coverage \
+              -DCMAKE_CXX_FLAGS_DEBUG=-fprofile-update=atomic \
+              -DCMAKE_C_FLAGS_DEBUG=-fprofile-update=atomic \
               -DCMAKE_EXE_LINKER_FLAGS=--coverage \
               -DCMAKE_SHARED_LINKER_FLAGS=--coverage"
           fi
@@ -190,6 +193,9 @@ jobs:
             --cmake-args $EXTRA_CMAKE_ARGS
 
       - name: Run unit tests
+        env:
+          # Network-dependent, so coverage would change from run to run:
+          MOLA_LO_DISABLE_VERSION_CHECK: "true"
         run: |
           . /opt/ros/*/setup.sh
           colcon test --event-handlers console_direct+
@@ -217,7 +223,7 @@ jobs:
 
   # -----------------------------------------------------------------------
   # Job 2: Self-hosted runner (arm64). Only runs for pushes or PRs from
-  # the same repository — never for fork PRs — to protect the runner from
+  # the same repository (never for fork PRs) to protect the runner from
   # untrusted code.
   # -----------------------------------------------------------------------
   build_self_hosted:
@@ -306,6 +312,9 @@ jobs:
           apt-get install -y ros-${{ matrix.ros_distribution }}-mola-test-datasets
 
       - name: Run unit tests
+        env:
+          # Network-dependent, so coverage would change from run to run:
+          MOLA_LO_DISABLE_VERSION_CHECK: "true"
         run: |
           . /opt/ros/*/setup.sh
           colcon test --event-handlers console_direct+
