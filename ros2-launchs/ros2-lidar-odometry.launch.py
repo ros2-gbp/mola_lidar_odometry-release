@@ -89,7 +89,7 @@ def validate_odometry_sources(context, *args, **kwargs):
        `odom -> base_link` to /tf (which is exactly what Variant A needs
        to be there in order to be read), `base_link` ends up with two
        parents and tf2 rejects the tree. Use `odom_topic_name:=...`
-       instead — nav_msgs/Odometry is consumed as an observation and does
+       instead: nav_msgs/Odometry is consumed as an observation and does
        not collide with the bridge's /tf broadcast.
     """
     tf_path = LaunchConfiguration(
@@ -112,7 +112,7 @@ def validate_odometry_sources(context, *args, **kwargs):
             "external driver is also publishing `odom -> base_link` to "
             "/tf, the tf2 tree becomes invalid (two parents for "
             "base_link).\n"
-            "Use `odom_topic_name:=<your /odom topic>` instead — "
+            "Use `odom_topic_name:=<your /odom topic>` instead: "
             "nav_msgs/Odometry observations do not participate in /tf.\n"
         )
     return []
@@ -169,23 +169,31 @@ def generate_launch_description():
     # ~~~~~~~~~~~~
     navstate_kinematic_model_arg = DeclareLaunchArgument(
         "navstate_kinematic_model",
-        default_value="KinematicModel::ConstantVelocity",
-        description="[Smoother only] Kinematic model for internal motion model factors. Options: KinematicModel::ConstantVelocity, KinematicModel::Tricycle.")
+        default_value="",
+        description="[Smoother only] (Empty: the smoother parameters file default) Kinematic model for internal motion model factors. Options: KinematicModel::ConstantVelocity, KinematicModel::Tricycle.")
 
     navstate_sliding_window_sec_arg = DeclareLaunchArgument(
         "navstate_sliding_window_sec",
-        default_value="2.5",
-        description="[Smoother only] Time window to keep past observations in the filter [seconds].")
+        default_value="",
+        description="[Smoother only] (Empty: the smoother parameters file default) Time window to keep past observations in the filter [seconds].")
 
     navstate_sigma_random_walk_linacc_arg = DeclareLaunchArgument(
         "navstate_sigma_random_walk_linacc",
-        default_value="1.0",
-        description="[Smoother only] Random walk model for linear acceleration uncertainty [m/s²].")
+        default_value="",
+        description="[Smoother only] (Empty: the smoother parameters file default) Random walk model for linear acceleration uncertainty [m/s²].")
 
     navstate_sigma_random_walk_angacc_arg = DeclareLaunchArgument(
         "navstate_sigma_random_walk_angacc",
-        default_value="10.0",
-        description="[Smoother only] Random walk angular acceleration uncertainty [rad/s²].")
+        default_value="",
+        description="[Smoother only] (Empty: the smoother parameters file default) Random walk angular acceleration uncertainty [rad/s²].")
+
+    navstate_imu_gravity_alignment_sigma_arg = DeclareLaunchArgument(
+        "navstate_imu_gravity_alignment_sigma",
+        default_value="",
+        description="[Smoother only] Sigma [deg] of the IMU accelerometer gravity factor (0 disables it). "
+                    "Empty (default): 0 in localization-only mode (start_mapping_enabled:=False), where the "
+                    "loaded map is already gravity-aligned and the accelerometer only adds vibration and "
+                    "vehicle acceleration noise to roll/pitch; the smoother default when mapping.")
 
     estimate_geo_reference_arg = DeclareLaunchArgument(
         "estimate_geo_reference",
@@ -225,6 +233,23 @@ def generate_launch_description():
         "imu_topic_name", default_value="imu", description="Topic name to listen for Imu input (for example '/imu')")
     imu_topic_name_env_var = SetEnvironmentVariable(
         name='MOLA_IMU_TOPIC', value=LaunchConfiguration('imu_topic_name'))
+    # ~~~~~~~~~~~~
+    attitude_imu_topic_name_arg = DeclareLaunchArgument(
+        "attitude_imu_topic_name", default_value="",
+        description="Optional second Imu topic with absolute attitude (e.g. an AHRS). Its readings are only "
+                    "stored into simplemap keyframes (for later geo-referencing), instead of those of "
+                    "imu_topic_name. Empty (default) disables it.")
+
+    # The odometry only routes readings by label once the label is set, so
+    # set it only when the topic is given (an unset topic must leave the main
+    # IMU feeding the keyframes).
+    def _apply_attitude_imu_topic(context, *args, **kwargs):
+        v = LaunchConfiguration('attitude_imu_topic_name').perform(context).strip()
+        if not v:
+            return []
+        return [SetEnvironmentVariable(name='MOLA_ATTITUDE_IMU_TOPIC', value=v),
+                SetEnvironmentVariable(name='MOLA_ATTITUDE_IMU_NAME', value='imu_attitude')]
+    attitude_imu_topic_env_var = OpaqueFunction(function=_apply_attitude_imu_topic)
 
     # ~~~~~~~~~~~~
     # Subscription QoS overrides (per REP-2003 the defaults are best-effort
@@ -293,6 +318,11 @@ def generate_launch_description():
         "use_mola_gui", default_value="True", description="Whether to open MolaViz GUI interface for watching live mapping and control UI")
     use_mola_gui_env_var = SetEnvironmentVariable(
         name='MOLA_WITH_GUI', value=LaunchConfiguration('use_mola_gui'))
+
+    publish_local_map_arg = DeclareLaunchArgument(
+        "publish_local_map", default_value="True", description="Whether to publish the local map as a ROS 2 point cloud (topic /lidar_odometry/localmap_points)")
+    publish_local_map_env_var = SetEnvironmentVariable(
+        name='MOLA_PUBLISH_LOCAL_MAP', value=LaunchConfiguration('publish_local_map'))
 
     publish_localization_following_rep105_arg = DeclareLaunchArgument(
         "publish_localization_following_rep105", default_value="True", description="Whether to publish localization TFs in between map->odom (true) or directly map->base_link (false)")
@@ -383,7 +413,7 @@ def generate_launch_description():
 
     odom_topic_name_arg = DeclareLaunchArgument(
         "odom_topic_name", default_value="",
-        description="If non-empty, BridgeROS2 subscribes directly to this nav_msgs/Odometry topic and forwards each message as a 3D CObservationRobotPose (6x6 covariance) — preferred for smoother fusion. Mutually exclusive with `forward_ros_tf_odom_to_mola`.")
+        description="If non-empty, BridgeROS2 subscribes directly to this nav_msgs/Odometry topic and forwards each message as a 3D CObservationRobotPose (6x6 covariance), preferred for smoother fusion. Mutually exclusive with `forward_ros_tf_odom_to_mola`.")
     odom_topic_name_env_var = SetEnvironmentVariable(
         name='MOLA_ODOM_TOPIC', value=LaunchConfiguration('odom_topic_name'))
 
@@ -450,19 +480,39 @@ def generate_launch_description():
             'estimate_geo_reference').perform(context).strip()
         return [SetEnvironmentVariable(name='MOLA_ESTIMATE_GEO_REF', value=v)] if v else []
 
-    # Environment variables that only apply if the smoother is active
+    # Smoother arguments only override its parameters file when given:
+    def _apply_navstate_args(context, *args, **kwargs):
+        ret = []
+        for arg, var in [('navstate_kinematic_model', 'MOLA_NAVSTATE_KINEMATIC_MODEL'),
+                         ('navstate_sliding_window_sec', 'MOLA_NAVSTATE_SLIDING_WINDOW_SEC'),
+                         ('navstate_sigma_random_walk_linacc', 'MOLA_NAVSTATE_SIGMA_RANDOM_WALK_LINACC'),
+                         ('navstate_sigma_random_walk_angacc', 'MOLA_NAVSTATE_SIGMA_RANDOM_WALK_ANGACC')]:
+            v = LaunchConfiguration(arg).perform(context).strip()
+            if v:
+                ret.append(SetEnvironmentVariable(name=var, value=v))
+        return ret
+
+    # The gravity factor is disabled in localization-only mode unless set explicitly
+    # (launch argument or MOLA_IMU_GRAVITY_ALIGNMENT_SIGMA in the environment):
+    def _apply_imu_gravity_alignment_sigma(context, *args, **kwargs):
+        v = LaunchConfiguration('navstate_imu_gravity_alignment_sigma').perform(context).strip()
+        if not v:
+            mapping = LaunchConfiguration('start_mapping_enabled').perform(context).lower()
+            if mapping == 'true' or 'MOLA_IMU_GRAVITY_ALIGNMENT_SIGMA' in os.environ:
+                return []
+            v = '0'
+        return [SetEnvironmentVariable(name='MOLA_IMU_GRAVITY_ALIGNMENT_SIGMA', value=v)]
+
+    # Environment variables that only apply if the smoother is active.
+    # Not scoped: a scoped group restores the environment when it ends, so these
+    # variables would never reach the mola-cli process.
     smoother_env_vars = GroupAction(
         condition=IfCondition(LaunchConfiguration('use_state_estimator')),
+        scoped=False,
         actions=[
-            SetEnvironmentVariable('MOLA_NAVSTATE_KINEMATIC_MODEL', LaunchConfiguration(
-                'navstate_kinematic_model')),
-            SetEnvironmentVariable('MOLA_NAVSTATE_SLIDING_WINDOW_SEC', LaunchConfiguration(
-                'navstate_sliding_window_sec')),
-            SetEnvironmentVariable('MOLA_NAVSTATE_SIGMA_RANDOM_WALK_LINACC', LaunchConfiguration(
-                'navstate_sigma_random_walk_linacc')),
-            SetEnvironmentVariable('MOLA_NAVSTATE_SIGMA_RANDOM_WALK_ANGACC', LaunchConfiguration(
-                'navstate_sigma_random_walk_angacc')),
+            OpaqueFunction(function=_apply_navstate_args),
             OpaqueFunction(function=_apply_estimate_geo_ref),
+            OpaqueFunction(function=_apply_imu_gravity_alignment_sigma),
         ]
     )
 
@@ -705,6 +755,8 @@ def generate_launch_description():
         ignore_lidar_pose_from_tf_env_var,
         imu_topic_name_arg,
         imu_topic_name_env_var,
+        attitude_imu_topic_name_arg,
+        attitude_imu_topic_env_var,
         imu_qos_reliability_arg,
         imu_qos_reliability_env_var,
         imu_qos_depth_arg,
@@ -764,6 +816,8 @@ def generate_launch_description():
         simplemap_min_nearby_poses_env_var,
         use_mola_gui_arg,
         use_mola_gui_env_var,
+        publish_local_map_arg,
+        publish_local_map_env_var,
         use_rviz_arg,
         use_diagnostic_aggregator_arg,
         use_state_estimator_arg,
@@ -779,6 +833,7 @@ def generate_launch_description():
         navstate_sliding_window_sec_arg,
         navstate_sigma_random_walk_linacc_arg,
         navstate_sigma_random_walk_angacc_arg,
+        navstate_imu_gravity_alignment_sigma_arg,
         estimate_geo_reference_arg,
         smoother_env_vars,
 

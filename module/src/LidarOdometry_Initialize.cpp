@@ -110,20 +110,26 @@ void LidarOdometry::initialize_frontend(const Yaml & c)
     }
 
     ENSURE_YAML_ENTRY_EXISTS(cfg, "lidar_sensor_labels");
+    std::vector<std::regex> lidarLabels;
     if (cfg["lidar_sensor_labels"].isSequence()) {
       const auto lsl = cfg["lidar_sensor_labels"].asSequenceRange();
       for (const auto & sl : lsl) {
         const auto s = sl.as<std::string>();
         MRPT_LOG_DEBUG_STREAM("Adding as input lidar sensor label: " << s);
-        params_.lidar_sensor_labels.emplace_back(s);
+        lidarLabels.emplace_back(s);
       }
     } else {
       ASSERT_(cfg["lidar_sensor_labels"].isScalar());
       const auto s = cfg["lidar_sensor_labels"].as<std::string>();
       MRPT_LOG_DEBUG_STREAM("Adding as input lidar sensor label: " << s);
-      params_.lidar_sensor_labels.emplace_back(s);
+      lidarLabels.emplace_back(s);
     }
-    ASSERT_(!params_.lidar_sensor_labels.empty());
+    ASSERT_(!lidarLabels.empty());
+    // reset() runs this again with the same configuration: keep the list
+    // then, since the input thread may be iterating over it.
+    if (params_.lidar_sensor_labels.empty()) {
+      params_.lidar_sensor_labels = std::move(lidarLabels);
+    }
 
     // Obs2map merge pipeline:
     ASSERT_(c["insert_observation_into_local_map"].isSequence());
@@ -157,6 +163,13 @@ void LidarOdometry::initialize_frontend(const Yaml & c)
 
     if (cfg.has("gnss_sensor_label")) {
       params_.gnss_sensor_label = cfg["gnss_sensor_label"].as<std::string>();
+    }
+
+    if (cfg.has("attitude_imu_sensor_label")) {
+      const auto label = cfg["attitude_imu_sensor_label"].as<std::string>();
+      if (!label.empty()) {
+        params_.attitude_imu_sensor_label = label;
+      }
     }
 
     if (cfg.has("deskew_odometry_sensor_label")) {
@@ -330,6 +343,23 @@ void LidarOdometry::initialize_frontend(const Yaml & c)
       params_.icp[AlignKind::NoMotionModel] = params_.icp[AlignKind::RegularOdometry];
     }
 
+    // Own ICP pipeline instance for the initial pose global search:
+    if (params_.initial_localization.global_search.enabled) {
+      const auto & icpCfg = c.has("icp_settings_without_vel") ? c["icp_settings_without_vel"]
+                                                              : c["icp_settings_with_vel"];
+      const auto [icp, icpParams] = mp2p_icp::icp_pipeline_from_yaml(icpCfg);
+      state_.global_search_icp = icp;
+      state_.global_search_icp_params = icpParams;
+      state_.global_search_param_source = std::make_shared<mp2p_icp::ParameterSource>();
+      icp->attachToParameterSource(*state_.global_search_param_source);
+
+      const auto [refineIcp, refineIcpParams] = mp2p_icp::icp_pipeline_from_yaml(icpCfg);
+      (void)refineIcpParams;
+      state_.global_search_refine_icp = refineIcp;
+      state_.global_search_refine_param_source = std::make_shared<mp2p_icp::ParameterSource>();
+      refineIcp->attachToParameterSource(*state_.global_search_refine_param_source);
+    }
+
     for (auto & [kind, icpCase] : params_.icp) {
       icpCase.icp->profiler().enable(params_.icp_profiler_enabled);
       icpCase.icp->profiler().enableKeepWholeHistory(params_.icp_profiler_full_history);
@@ -497,6 +527,10 @@ void LidarOdometry::initialize_frontend(const Yaml & c)
       "crash on the first LiDAR scan. Either provide a map to load, or enable mapping.");
   }
 
+  // Services found in other modules. Under state_mtx_, since a scan queued
+  // before a reset() may be processed concurrently:
+  auto lckServices = mrpt::lockHelper(state_mtx_);
+
   // Attach to the state estimation module, which since MOLA-LO v0.5.0,
   // must run as a separate MOLA module:
   {
@@ -539,25 +573,37 @@ void LidarOdometry::initialize_frontend(const Yaml & c)
   }
 #endif
 
+  const auto navStateFuse = state_.navstate_fuse;
+  lckServices.unlock();
+
   // If using FromStateEstimator initialization, also subscribe to map updates
-  // from the state estimator to receive geo-referencing information:
-  if (params_.initial_localization.method == InitLocalization::FromStateEstimator) {
+  // from the state estimator to receive geo-referencing information.
+  // Only once: the callbacks outlive a reset(), which calls initialize() again.
+  if (
+    params_.initial_localization.method == InitLocalization::FromStateEstimator &&
+    !estimator_subscriptions_done_) {
+    estimator_subscriptions_done_ = true;
+
     // The state estimator may also be a MapSourceBase (for geo-ref publishing)
-    if (auto mapSrc = std::dynamic_pointer_cast<MapSourceBase>(state_.navstate_fuse); mapSrc) {
+    if (auto mapSrc = std::dynamic_pointer_cast<MapSourceBase>(navStateFuse); mapSrc) {
       mapSrc->subscribeToMapUpdates(
         [this](const MapSourceBase::MapUpdate & mu) { onExternalMapUpdate(mu); });
       MRPT_LOG_DEBUG("Subscribed to state estimator's map updates for geo-referencing");
     }
 
     // Also subscribe to localization updates for pose convergence checking
-    if (auto locSrc = std::dynamic_pointer_cast<LocalizationSourceBase>(state_.navstate_fuse);
-        locSrc) {
+    if (auto locSrc = std::dynamic_pointer_cast<LocalizationSourceBase>(navStateFuse); locSrc) {
       locSrc->subscribeToLocalizationUpdates(
         [this](const LocalizationSourceBase::LocalizationUpdate & lu) {
           onExternalLocalizationUpdate(lu);
         });
       MRPT_LOG_DEBUG("Subscribed to state estimator's localization updates");
     }
+  }
+
+  {
+    auto lckState = mrpt::lockHelper(state_mtx_);
+    updateStatusSnapshot();
   }
 
   // end of initialization:
@@ -579,11 +625,13 @@ void LidarOdometry::initialize_frontend(const Yaml & c)
 
 void LidarOdometry::doPreloadLocalMap()
 {
+  // May run deferred from spinOnce(), while the LiDAR worker is running:
+  auto lckState = mrpt::lockHelper(state_mtx_);
+
   if (!params_.local_map_updates.load_existing_local_map.empty()) {
     MRPT_LOG_INFO_STREAM(
       "Loading map from file: '" << params_.local_map_updates.load_existing_local_map << "'...");
 
-    auto lckState = mrpt::lockHelper(state_mtx_);
     // Guards the map contents against a concurrent visualization render,
     // which runs without state_mtx_ (see local_map_content_mtx_ docs):
     auto lckMapContents = mrpt::lockHelper(local_map_content_mtx_);
@@ -661,6 +709,9 @@ void LidarOdometry::doPreloadLocalMap()
       "or crash on the first LiDAR scan. Check that "
       "'local_map_updates.load_existing_local_map' points to a valid, non-empty map.");
   }
+
+  // It may run deferred, with no scan afterwards to refresh the status:
+  updateStatusSnapshot();
 }
 
 }  // namespace mola
