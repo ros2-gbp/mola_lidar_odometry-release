@@ -30,11 +30,12 @@ find_package(mp2p_icp REQUIRED)
 find_package(mp2p_icp_filters REQUIRED)
 find_package(mola_pose_list REQUIRED)
 find_package(mola_imu_preintegration REQUIRED)
+find_package(mola_relocalization REQUIRED)
 
 # -----------------------
 # define lib:
 set(LIB_SRCS
-  module/src/GravityMapAligner.cpp
+  module/src/IcpPrior.cpp
   module/src/KeyframeDecider.cpp
   module/src/LidarOdometry_Main.cpp
   module/src/MapFrameRelevel.cpp
@@ -53,8 +54,8 @@ set(LIB_SRCS
 )
 
 set(LIB_PUBLIC_HDRS
+  module/include/mola_lidar_odometry/IcpPrior.h
   module/include/mola_lidar_odometry/LidarOdometry.h
-  module/include/mola_lidar_odometry/GravityMapAligner.h
   module/include/mola_lidar_odometry/MapFrameRelevel.h
 )
 
@@ -71,6 +72,7 @@ mola_add_library(
     mola::mola_imu_preintegration
   PRIVATE_LINK_LIBRARIES
     Eigen3::Eigen
+    mola::mola_relocalization
   CMAKE_DEPENDENCIES
     mola_kernel
     mola_yaml
@@ -122,6 +124,12 @@ mola_add_executable(
   CLI11::CLI11
 )
 target_compile_definitions(mola-lidar-odometry-cli PRIVATE MOLA_LO_VERSION=\"${MY_VERSION}\")
+
+find_package(TBB QUIET)  # optional: to cap the threads of parallel algorithms
+if(TBB_FOUND)
+  target_link_libraries(mola-lidar-odometry-cli TBB::tbb)
+  target_compile_definitions(mola-lidar-odometry-cli PRIVATE MOLA_LO_CLI_HAS_TBB)
+endif()
 
 if(mola_state_estimation_simple_FOUND)
   message(STATUS "mola-lidar-odometry-cli: With mola_state_estimation_simple = YES")
@@ -261,6 +269,7 @@ set(MOLA_LO_DATASET_WRAPPERS
     botanicgarden
     citrusfarm
     conslam
+    fomo
     grandtour
     hilti2022
     kitti
@@ -302,6 +311,11 @@ if(DETECTED_ROS2)
   find_package(ament_cmake REQUIRED)
 
   if(BUILD_TESTING)
+    # Humble's python_cmake_module (via launch_testing_ament_cmake) still uses
+    # the FindPythonInterp module removed in CMake >= 3.27.
+    if(POLICY CMP0148)
+      cmake_policy(SET CMP0148 OLD)
+    endif()
     find_package(ament_lint_auto REQUIRED)
     find_package(ament_cmake_gtest REQUIRED)
     ament_lint_auto_find_test_dependencies()
