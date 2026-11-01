@@ -95,6 +95,11 @@ void LidarOdometry::Parameters::AdaptiveThreshold::initialize(const Yaml & cfg)
   YAML_LOAD_OPT(recover_growth_factor, double);
 
   ASSERTMSG_(
+    min_motion <= maximum_sigma,
+    mrpt::format(
+      "adaptive_threshold: min_motion (%f) must not exceed maximum_sigma (%f)", min_motion,
+      maximum_sigma));
+  ASSERTMSG_(
     recover_after_n_bad >= 1,
     mrpt::format("adaptive_threshold: recover_after_n_bad (%d) must be >= 1", recover_after_n_bad));
   ASSERTMSG_(
@@ -133,6 +138,9 @@ void LidarOdometry::Parameters::Visualization::initialize(const Yaml & cfg)
   YAML_LOAD_OPT(tf_tree_show_names, bool);
   YAML_LOAD_OPT(tf_tree_exclude_frames, std::string);
   YAML_LOAD_OPT(local_map_point_size, float);
+  YAML_LOAD_OPT(hide_back_facing_points, bool);
+  YAML_LOAD_OPT(back_facing_max_angle_normals_deg, float);
+  YAML_LOAD_OPT(back_facing_max_angle_view_deg, float);
   YAML_LOAD_OPT(current_observation_point_size, float);
   YAML_LOAD_OPT(last_deskewed_observations_point_size, float);
   YAML_LOAD_OPT(local_map_render_voxelmap_free_space, bool);
@@ -326,6 +334,10 @@ void LidarOdometry::Parameters::InitialLocalizationOptions::initialize(const Yam
   YAML_LOAD_OPT(from_state_estimator_max_orientation_sigma_deg, double);
   YAML_LOAD_OPT(from_state_estimator_timeout, double);
 
+  if (cfg.has("global_search")) {
+    global_search.initialize(cfg["global_search"]);
+  }
+
   if (cfg.has("fixed_initial_pose")) {
     ASSERT_(
       cfg["fixed_initial_pose"].isSequence() && cfg["fixed_initial_pose"].asSequence().size() == 6);
@@ -338,6 +350,35 @@ void LidarOdometry::Parameters::InitialLocalizationOptions::initialize(const Yam
       p[i] = (i < 3) ? v : mrpt::DEG2RAD(v);
     }
   }
+}
+
+void LidarOdometry::Parameters::InitialLocalizationOptions::GlobalSearch::initialize(
+  const Yaml & cfg)
+{
+  YAML_LOAD_OPT(enabled, bool);
+  YAML_LOAD_OPT(icp_basin_xy, double);
+  YAML_LOAD_OPT(icp_basin_yaw_deg, double);
+  YAML_LOAD_OPT(sigma_factor, double);
+  YAML_LOAD_OPT(min_half_width_xy, double);
+  YAML_LOAD_OPT(max_half_width_xy, double);
+  YAML_LOAD_OPT(min_half_width_yaw_deg, double);
+  YAML_LOAD_OPT(max_position_sigma, double);
+  YAML_LOAD_OPT(resolution_xy, double);
+  YAML_LOAD_OPT(resolution_yaw_deg, double);
+  YAML_LOAD_OPT(z_from_map_radius, double);
+  ASSERT_GE_(z_from_map_radius, 0.0);
+  YAML_LOAD_OPT(icp_threshold, double);
+  YAML_LOAD_OPT(refine_icp_threshold, double);
+  YAML_LOAD_OPT(min_quality, double);
+  YAML_LOAD_OPT(same_mode_max_distance, double);
+  YAML_LOAD_OPT(same_mode_max_yaw_deg, double);
+  YAML_LOAD_OPT(min_quality_margin, double);
+  YAML_LOAD_OPT(retry_period, double);
+
+  ASSERT_GT_(resolution_xy, 0);
+  ASSERT_GT_(resolution_yaw_deg, 0);
+  ASSERT_LE_(min_half_width_xy, max_half_width_xy);
+  ASSERT_GE_(min_half_width_yaw_deg, 0.0);
 }
 
 void LidarOdometry::Parameters::ObservationValidityChecks::initialize(const Yaml & cfg)
@@ -446,15 +487,17 @@ void LidarOdometry::onParameterUpdate(const mrpt::containers::yaml & names_value
 
   ASSERT_(names_values.isMap());
 
-  auto lckState = mrpt::lockHelper(state_mtx_);
-
   // Load parameters:
   setActive(names_values.getOrDefault("active", isActive()));
 
-  params_.local_map_updates.enabled =
-    names_values.getOrDefault("mapping_enabled", params_.local_map_updates.enabled);
-  params_.simplemap.generate =
-    names_values.getOrDefault("generate_simplemap", params_.simplemap.generate);
+  // Applied by a queued request, not here: the caller (e.g. the ROS executor)
+  // must not wait for the scan being processed.
+  enqueue_locked_request([this, names_values]() {
+    params_.local_map_updates.enabled =
+      names_values.getOrDefault("mapping_enabled", params_.local_map_updates.enabled);
+    params_.simplemap.generate =
+      names_values.getOrDefault("generate_simplemap", params_.simplemap.generate);
+  });
 
   // Special triggering reset "variable":
   if (names_values.getOrDefault("reset_state", false)) {
@@ -463,18 +506,6 @@ void LidarOdometry::onParameterUpdate(const mrpt::containers::yaml & names_value
       reset();
     });
   }
-
-  // and reflect changes in the GUI, if used.
-#if !MOLA_VERSION_CHECK(2, 6, 0)
-  this->enqueue_request([this]() {
-    auto lckGuiMtx = mrpt::lockHelper(state_gui_mtx_);
-    if (gui_.cbActive) {
-      gui_.cbActive->setChecked(isActive());
-      gui_.cbMapping->setChecked(params_.local_map_updates.enabled);
-      gui_.cbSaveSimplemap->setChecked(params_.simplemap.generate);
-    }
-  });
-#endif
 }
 
 void LidarOdometry::onExposeParameters()
