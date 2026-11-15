@@ -59,12 +59,40 @@ without forking the profile. Two variables the caller sets:
 - `MOLA_LO_SKIP_STATE_ESTIMATOR=1`: for callers running a method with its
   own internal estimator (the DLIO / Fast-LIO2 wrappers).
 
+`MOLA_STATE_ESTIMATOR_YAML` given without `MOLA_STATE_ESTIMATOR` picks the
+class from the YAML itself (the smoother if it has `sliding_window_length`,
+the simple estimator otherwise), in every profile.
+
+The smoother's own defaults suit LiDAR odometry (tight increment sigmas, IMU
+preintegration on). The sigmas are shared by every odometry source, so when an
+odometry topic is fused too (`MOLA_ODOMETRY_TOPIC`, `MOLA_ODOM_TOPIC`), every
+profile sets the wheel-odometry values instead (`MOLA_REL_POSE_INCR_SIGMA_ANG`
+0.005, `MOLA_REL_POSE_INCR_SIGMA_LIN` 0.02, `MOLA_SMOOTHER_IMU_PREINTEGRATION`
+false); with LiDAR alone they still set `_ANG` to `1e-5`, for older smoother
+versions. An exported value wins. The ROS 2 launch does the same with
+`odom_topic_name` or `forward_ros_tf_odom_to_mola`; there LO itself publishes in
+the smoother's reference frame (`mola_lo_reference_frame:=map`), which is fused
+as absolute poses, not as increments.
+
+The hand-held profiles (hilti2022, newer-college, oxford-spires) set
+`MOLA_MINIMUM_RANGE_FILTER_L_INFINITY=false`: the range filter becomes a
+sphere, so narrow stairwells keep their nearest walls. The default cube is for
+vehicle footprints, and it is better on legged and vehicle data.
+
 A profile may also pick the pipeline, by publishing
 `MOLA_ODOMETRY_PIPELINE_YAML` the same way. Only where a dataset has a measured
 reason to differ, and the evidence goes in the profile.
 
 Adding a dataset means adding one profile plus two one-line wrappers, and
-listing it in `MOLA_LO_DATASET_WRAPPERS` in `CMakeLists.txt`.
+listing it in `MOLA_LO_DATASET_WRAPPERS` in `CMakeLists.txt`. In the same
+change, add a row to the hand-written overview table in the `mola` repo,
+`docs/source/supported-sensors.rst` (the per-dataset pages are generated from
+the profile, that table is not). The same applies to any new or renamed
+`mola-lo-{gui,cli}-*` launcher, dataset or not. Check: every
+`scripts/mola-lo-*` suffix must appear in that page.
+A new dataset launcher pair must also be added to `MOLA_LO_DATASET_WRAPPERS`
+in `CMakeLists.txt` (gui-only ones to `MOLA_LO_WRAPPER_PATHS`), or it is
+not installed.
 
 ## Sync rule: user-facing inputs and knobs
 
@@ -123,6 +151,25 @@ Check: `grep -rn MOLA_NEW_VAR` over both repos must hit every place above.
   no LiDAR in its bags. Note the IMU here reads gravity along -Z, i.e. it is
   mounted upside down; that is the rig, confirmed against both the dataset's
   own extrinsics and its ground-truth attitude, not a frame error.
+- **ntu-viral** (NTU-VIRAL drone dataset) has no `/tf`: poses are fixed from
+  the dataset's calibration in a base_link that is its z-down Body (IMU)
+  frame turned by a 180 deg pitch. Horizontal OS1-16 only (the CLI gives all
+  LiDARs one fixed pose); IMU on by default (`/imu/imu`), measured slightly
+  better than without it, with IMU de-skew. Its orientation output is z-down,
+  about 180 deg off the accelerometer, so `MOLA_IMU_ATTITUDE_SIGMA=0` (the
+  smoother ignores it). The ground truth is a Leica prism position: score
+  after moving the estimate to the prism, (0.2937, -0.0123, 0.2731) in
+  base_link.
+  `MOLA_LIDAR_TIME_OFFSET=-0.110` moves the LiDAR stamps (published at the
+  end of each sweep) back to the sweep they describe. The knob is the ROS 1
+  bag reader's per-sensor `time_offset` (rosbag1 launch and the CLI's rosbag1
+  input); not available for ROS 2 bags or live input.
+- **vbr** (Vision Benchmark in Rome) takes a sequence directory (preferring a
+  merged `*_lio.bag`, else the upstream `<seq>_NN.bag` chunks) or bag files.
+  No `/tf` in the bags: every pose is fixed from `vbr_calib.yaml`, identical
+  for the hand-held (OS0-128) and car (OS1-64) sequences. `base_link` is the
+  LiDAR, the ground-truth frame. `VBR_IMU=sbg|ouster` picks `/imu/data`
+  (default, 0.61 m below the LiDAR) or the Ouster's own IMU.
 - **grandtour** publishes one bag per topic, so the profile takes a *mission
   directory* (or one of its `*_<lidar>_undist.bag` files) and resolves the
   siblings by the `<mission>_<topic>.bag` naming. The robot carries three
@@ -152,7 +199,9 @@ Check: `grep -rn MOLA_NEW_VAR` over both repos must hit every place above.
   so it gets one wrapper per sensor (`-ouster-os0`, `-ouster-os1`,
   `-velodyne`, `-livox-horizon`, `-livox-avia`) rather than one that silently
   picks a winner. Extrinsics are a co-located placeholder: these bags carry
-  no `/tf` and the dataset publishes no calibration.
+  no `/tf` and the dataset publishes no calibration. IMU de-skew with each
+  lidar's own IMU, except the VLP-16 (borrowed IMU, not validated); the Livox
+  IMUs report units of g, converted automatically.
 - **oxford-spires** stitches multipart sequences, ordering the `raw/ros2bag/`
   parts by their trailing `_<n>` numerically.
 - **ouster** is gui-only: a live source, which the offline CLI cannot read.
@@ -217,14 +266,66 @@ the measurements behind that and behind its loose velocity sigmas. The one
 exception is `MOLA_GRANDTOUR_LIDAR=hesai_raw`, which turns it on and uses it
 for de-skewing.
 
+De-skew velocity: with an IMU de-skew method, `updatePipelineDynamicVariables()`
+queries the estimator's twist at `last_fused_scan_ref_time` (the reference time
+of the scan just fused; single-use, so only the previous scan's) and stores it
+in the velocity buffer with that stamp. The attitude sample stays at the
+observation stamp: `last_lidar_pose`, carried from `last_lidar_pose_stamp` with
+the buffer's angular velocities (gravity removal in the bridge; always inside
+the de-skew window). The twist variables keep `last_motion_model_output`. The
+de-skew blocks set `use_twist_with_imu_methods: false`, so the IMU methods
+integrate the accelerometer from that stamp to the sweep, while `Linear` uses
+the twist variables at t=0 (`MOLA_DESKEW_TWIST_WITH_IMU_METHODS=true` restores
+that for the IMU methods too). If the velocity sample is outside the window
+(previous scan dropped, or a point-time span shorter than half the scan
+period), mp2p_icp falls back to the twist at t=0 with a throttled warning.
+Hence `imu_propagation` is on in the simple estimator's YAML: its
+constant-twist velocity is filtered with a time constant of seconds, too slow
+for de-skew; bridging from it was measured to be worse than applying it at t=0
+on walking motion. Propagation also drives the ICP initial guess and the twist
+variables, and needs a +Z-up map frame. Requires the estimator version that
+returns the keyframe's own twist at its stamp: older ones return the filtered
+twist there. Hand-held and legged platforms must use the IMU methods: with
+`Linear`, propagation was measured to diverge after poor registrations on
+hand-held motion (4-8x ATE on one sequence), while IMU de-skew was fine there.
+
+## IMU gyroscope biases from other modules (`use_imu_bias_source`)
+
+If a module offers `mola::ImuBiasSource` (e.g. the smoother with
+`imu_bias_tracking`), `consumePendingImu()` removes each reading's gyro bias
+(`remove_imu_gyro_bias()`, `ImuBiasCorrection.h`) before the de-skew generators
+and the gravity estimator; the IMU initializer and the map gravity estimator keep
+the raw readings (they estimate biases themselves). Sources are found at
+`initialize()` (`imu_bias_sources_`, under `imu_state_mtx_`); readings of IMUs
+without an estimate pass through. `MOLA_LO_USE_IMU_BIAS_SOURCE` (default true).
+The GUI Status tab shows the current estimate of the IMU in use
+(`imu_bias_status_lines()`, queried at GUI rate), if there is a bias source.
+
+## Observations attached to simplemap keyframes
+
+`state_.attach_sources` (`KeyframeAttachmentBuffer`, `KeyframeAttachments.h`): one buffer
+per source, from which each new keyframe takes the observation closest in time. GNSS and
+IMU are fed by their callbacks after validation (`save_gnss_max_age`, `save_imu_max_age`);
+`simplemap.attach_observations` entries (`MOLA_SIMPLEMAP_ATTACH_LABEL`), e.g. camera
+images, by sensor label, optionally `attach_once`. Images are written to `<map>_Images/`
+(`image_format` jpg/png/inline) as the keyframe is created (`keyframeObservation()`,
+disk worker thread): the keyframe gets a copy pointing to the file, since `CImage` copies
+are shallow and the input observation is shared with other modules. The GNSS and IMU
+sources exist whenever `save_*_max_age > 0`, since the CLI sets labels after
+`initialize()`; the CLI forwards images to the odometry only if `attach_observations`
+is set. Live: `camera_topic_name:=/a,/b` (up to three BridgeROS2 `Image` subscriptions,
+labels `camera`, `camera_1`, `camera_2`, attach label = those in use; unused slots cleared). Each attach entry keeps
+one buffer per matching label, so a regex over several cameras stores one image of each.
+`mola-sm-attach-from-rosbag2` / `-rosbag1` (mola repo, mola_input_rosbag1) do the same offline.
+
 ## Attitude-only IMU for the simplemap (`attitude_imu_sensor_label`)
 
 Keyframes store the IMU reading closest in time (`simplemap.save_imu_max_age`),
 which is what gives `mola-sm-georeferencing` an azimuth observation. The LiDAR's
 built-in IMU is the right one for de-skew but carries no orientation, so an
 external AHRS can be named with `attitude_imu_sensor_label`
-(`MOLA_ATTITUDE_IMU_NAME`): its readings feed only `last_imu_`, and the main IMU
-then stops feeding it. All inputs (offline CLI, `lidar_odometry_from_rosbag2.yaml`,
+(`MOLA_ATTITUDE_IMU_NAME`): its readings feed only the simplemap IMU buffer, and the
+main IMU then stops feeding it. All inputs (offline CLI, `lidar_odometry_from_rosbag2.yaml`,
 `lidar_odometry_ros2.yaml`) read it from `MOLA_ATTITUDE_IMU_TOPIC` with label
 `imu_attitude`. The label must only be set when the topic is, so each entry point
 sets `MOLA_ATTITUDE_IMU_NAME` conditionally: the CLI binary, `profiles/rosbag2.sh`
@@ -300,8 +401,13 @@ basin is not used directly: the next filtered scan is matched against the map
 from a lattice of initial guesses around it (`mola::RelocalizationICP_SE2`,
 yaw too if uncertain, e.g. no IMU), see `doGlobalSearchForInitialPose()`. Only
 an unambiguous best match (`mola::select_relocalization_candidate()`) is
-accepted, and then it resets the state estimator to it; otherwise LO reports
-nothing and retries every `retry_period`. The search ICP is its own instance of
+accepted, and then it resets the state estimator to it, at the newest sensor
+time plus the estimator's planar relative motion since the searched scan (the
+vehicle may move during a long search); otherwise LO reports
+nothing and retries every `retry_period`, around the latest estimator pose
+only if its search is not larger (`search_region()`: the estimator covariance
+can blow up between measurements), or if its mean left the kept region. Searches over `max_initial_guesses` are not
+started, and shutdown aborts a running one (`MOLA_RELOCALIZATION_HAS_ABORT`). The search ICP is its own instance of
 the `icp_settings_without_vel` pipeline with its own `ParameterSource` (an ICP
 writes `ICP_ITERATION` into its source), and runs sequentially:
 `KeyframePointCloudMap` prepares one search submap per ICP run. Tested in
@@ -349,6 +455,21 @@ the estimator pose (`state_.initial_pose`, set by every initial localization
 method) and is not fused back into the estimator. With `estimate_geo_reference`,
 the smoother anchors the map frame where the vehicle starts, so that pose is the
 origin unless the vehicle moved before the first scan.
+
+### Optional learned registration covariance (`learned_covariance`)
+
+`pipelines/blocks/learned-covariance.yaml` (GICP pipeline), off while
+`MOLA_LEARNED_COVARIANCE_MODEL` is empty. Each accepted registration is queued
+to an `mp2p_icp::LearnedCovarianceEstimator` (worker thread, window of the last
+25 `deskewed` scans) BEFORE the scan joins its window, and the pose goes to the
+estimator with `fuse_pose_deferred()` and the covariance as a future (the
+solver's own if no learned one); the smoother waits for it in its backend.
+`MOLA_LEARNED_COVARIANCE_SENSOR` selects the model's sensor one-hot. The
+smoother only uses it with `MOLA_REL_POSE_INCR_FROM_SOURCE_COV=true`; the
+simple estimator only puts it in its prediction covariance (under its
+`MOLA_NAVSTATE_SIGMA_POSITION` floor, 0.5 m) and reads the deferred
+covariance at the next query. Using it as simple's velocity noise was
+measured and dropped (no gain).
 
 ### REP-105 `map -> odom` published directly (jitter-free)
 
@@ -416,6 +537,35 @@ of bugs this integration surfaced, several of which were in `mola_mapper_3d`,
 not here -- but two structural changes live in this file:
 `pushKeyframeToSharedKeyframeMap()`'s dedicated frame name, and the
 distance-checker `insert()` gating fix mentioned above.
+
+## Local map rebuild from a LocalMapCorrectionSource (`LidarOdometry_LocalMapRebuild.cpp`)
+
+If the keyframe sink module is also a `mola::LocalMapCorrectionSource` (e.g. `mola_mapper`,
+which advertises a correction after solves with new loop closures) and
+`local_map_updates.rebuild_on_corrections` (`MOLA_LO_LOCAL_MAP_REBUILD`, default on),
+a dedicated thread rebuilds the local map (not if it was loaded from a file, nor with
+`simplemap.generate_lazy_load_scan_files`, whose disk thread unloads the shared scans).
+A correction that cannot be applied yet (no reference, map changed meanwhile) is retried
+after the next pushed keyframe:
+- Reference: the newest pushed keyframe accepted by the sink (`last_pushed_keyframe`:
+  its id and LIO's own pose of it). Keyframes come back relative to it, so the map is
+  anchored at LIO's pose and the vehicle pose does not jump.
+- Keyframes within `max_distance_to_keep_keyframes` (keep it equal to the map's own point
+  eviction distance), earlier passes included, newest first, one per
+  `rebuild_keyframe_spacing`. Each is preprocessed again by a second copy of the pipelines
+  with its own `ParameterSource` (`RebuildPipelines`), de-skewed with the velocity buffer
+  and twist stored in its metadata (`deskew_twist`). Into point cloud maps it goes
+  re-expressed in the reference frame, with the reference as the robot pose, so their
+  distance eviction stays centered there; other classes (keyframe maps, TSDF, NDT) use the
+  insertion pose as a viewpoint, so they get each keyframe from its own pose, farthest first.
+- The local map insertions after the reference (`recent_local_map_insertions`, trimmed by
+  the final-pass filter) are merged again: before the keyframes into point clouds (their
+  points win), after them into other classes; mostly outside `state_mtx_`, the last few
+  under it. Then the `state_.local_map` pointer is swapped (the old map is freed without
+  the locks) and `kf_decider_local_map` is rebuilt from all of them.
+- `invalidateLocalMapRebuild()` (map restart/load/preload, any (re)localization pose,
+  re-leveling, a full insertion buffer, and `local_map_generation_` in `reset()`) drops the reference and
+  any rebuild in progress. Known gap: those frame changes are not told to the central map.
 
 ## Scan enqueue & overload handling (drop stale, keep freshest)
 
@@ -565,11 +715,78 @@ reopened, ICP locked onto a self-consistent but WRONG registration (a
 sudden ~30-40 deg yaw error that then persisted for the rest of the run,
 instead of a brief quality dip that recovers to the true pose).
 
+## Implausible predictions and stall recovery
+
+Seen on GEODE with the smoother: a wrong predicted velocity seeds ICP, which
+follows it where the geometry does not constrain the pose (a flat floor),
+and the result is fused back, so the estimator's velocity runs away. Then ICP
+fails, the estimator returns no prediction once its last pose is too old, and
+the pose freezes for the rest of the run. Two guards, both in
+`LidarOdometry_ProcessScan.cpp`:
+
+- `motionModelIsPlausible()`: the change of the predicted speed between scans
+  must agree with the IMU (accelerations rotated with the odometry attitude,
+  gravity removed), within `motion_model_max_extra_acceleration` times the
+  interval; else the prediction is not used and the estimator is reset. Not
+  checked for 1 s after a start or reset, while the estimator settles.
+- `recoverFromStall()`: after `stall_recovery.after_n_scans` scans with neither
+  a good ICP nor a prediction, the local map restarts at the last pose (the next
+  scan seeds it, through the first-scan path) and the estimator is reset.
+
+Both reset the estimator: a diverged smoother does not recover on its own.
+They call `resetNavStateMotion()`, i.e. `reset_motion()` where `mola_kernel` has
+it, since the trajectory goes on in the same frames (the smoother keeps them; its
+`reset()` would anchor {map} to the next pose and level gravity again). Without
+`reset_motion()` in `mola_kernel`, or for an estimator that does not override it,
+that is a full reset, which may redefine the estimator's frames. The initial
+localization, re-localization and the re-leveling fallback call
+`resetNavState()`, a full `reset()`; it also restarts the plausibility check
+(`restartPlausibilityCheck()`: settling time, no previous speed), as the stall
+recovery does.
+Measured alternatives that failed: a bound from |f| + g alone (a slower runaway
+grew to 15 m/s under it), and comparing with the speed of the last registered
+poses instead of the previous prediction (registration jitter on flat surfaces
+flagged correct predictions).
+
+## Per-point time outliers (`point_time_outliers`, `PointTimeOutlierFilter`)
+
+Seen on an Ouster OS0-32 left in `TIME_FROM_SYNC_PULSE_IN` with nothing wired to that
+input: spurious edges step the sensor clock by whole seconds inside a scan, so some
+columns get `t` of up to 4 s. `MiddleIsZero` then moves the scan time (and the pose
+stamp) ~1.5 s into the future, the smoother takes it as its chain tail and drops the next
+real readings as non-monotonic, its prediction runs away and the plausibility guard
+resets it; in a map-less (online geo-reference) run, {map} came back 222 m off.
+
+`observationFromRawSensor()` runs one `PointTimeOutlierFilter` per sensor label on each
+observation right after its generators: before the multi-LiDAR time shift and the
+timestamp adjustment (the user prefilter runs after the adjustment: too late). Usual
+range: medians of the per-scan min and max `t` of the last `window_length` (50) scans, as
+given, so a minority of bad scans does not move it. Margin: the largest of `margin_ratio`
+(0.5) of its width, `min_margin` (10 ms) and the sensor period (median interval between
+scan stamps), so sensors that drop no-return points (a narrow sector, then a full sweep)
+never lose good points. Points out of it are removed with all their fields (in-place
+compaction); nothing before `min_window_length` (10) scans. The local map rebuild checks
+old keyframes against a copy of the scan thread filters, taken under `state_mtx_` at each
+rebuild, without learning (`check()`), and logs at DEBUG. On by default
+(`MOLA_POINT_TIME_OUTLIERS`); Run totals report filtered scans and points.
+
+Measured (offline CLI, smoother with GNSS and wheel odometry, 1125 s Husky bag with 27
+bad scans): off, the same future chain tail as the live run, 9 non-monotonic readings,
+1 reset and a {map} 121 m off before it; on, 26 scans filtered, none of those, 0.84 m
+median error to RTK fixed. No rejection in 27k scans of healthy data: VBR (OS0-128, OS1-64), Newer
+College (OS1-64), Oxford Spires (Hesai QT64), GrandTour (Hesai XT32), BotanicGarden
+(VLP-16, Livox Avia), ConSLAM (VLP-16). Cost: ~45 us per 32k-point scan, ~155 us per
+131k-point scan (an equivalent `FilterByExpression` prefilter: ~530 us per 32k points).
+Not covered: scans whose times are compressed but within the usual range, the first
+10 scans after a start or reset, and the raw observations stored in keyframes (simplemap,
+central map), which keep their original times.
+
 ## `ESTIMATED_OBSERVATION_RADIUS` is fed back through the range filter
 
 The radius is an EMA updated from the first non-empty point layer of the
 **filtered** observation, and that filtering clips at
-`1.2*ESTIMATED_OBSERVATION_RADIUS` (L-infinity cube, `blocks/deskew-early.yaml`).
+`1.2*ESTIMATED_OBSERVATION_RADIUS` (L-infinity cube unless
+`MOLA_MINIMUM_RANGE_FILTER_L_INFINITY=false`, `blocks/deskew-early.yaml`).
 So it can only grow by a few percent per scan. When the scene outgrows it
 faster (a drone taking off from 3 m ranges at ~7 m/s), every point is cut and
 the radius could never update again: permanent `NoPairings`. When no filtered
@@ -710,7 +927,7 @@ straight back into scan-submission latency.
 
 `imu_state_mtx_` (recursive) now guards exactly the state the two threads share:
 `pending_imu_`, `imu_initializer`, `gravity_estimator`, `map_gravity`,
-`recent_imu_stamps`, the simplemap GNSS/IMU buffers (`last_gnss_`, `last_imu_`,
+`recent_imu_stamps`, the simplemap keyframe buffers (`attach_sources`,
 `recent_gnss_stamps`), `parameter_source` (variable map, `realize()` flags, and the
 `localVelocityBuffer` that IMU samples write and the deskew stage reads), and
 any *invocation* of `obs_generators`. GNSS is handled inline like IMU (it only
@@ -1022,8 +1239,9 @@ frame once, about the map origin, by the estimator's `Result::correction`.
 It is a **gauge change**, not a state update, and must stay one:
 `MapFrameRelevel.h` applies `p -> b + p` to the local map, the simplemap, the
 trajectory; `KeyframeDecider`/`SearchablePoseList::transform_left_multiply()`
-move the keyframe-density bookkeeping with them; and
-`NavStateFilter::transform_frame()` does the same inside the state estimator.
+move the keyframe-density bookkeeping with them;
+`NavStateFilter::transform_frame()` does the same inside the state estimator;
+and the learned-covariance reference window is cleared (it refills).
 Anything expressed in the *vehicle* frame (twists, sensor extrinsics) is
 invariant and must not be touched. The decision is taken in
 `evaluateMapFrameRelevel()` and applied by `applyMapFrameRelevel()`, which runs
@@ -1047,6 +1265,22 @@ Two things about the trigger that are easy to get wrong:
 The applied rotation is logged once at INFO and written to the local map's
 `metadata` and to every later keyframe's metadata observation, since a run with
 a re-leveled map frame is not pose-comparable with one without it.
+
+## Gravity-leveled fused output (`--output-fused-gravity-leveled`)
+
+`mola::GravityLeveler` (`GravityLeveler.h`) levels an output trajectory
+causally, without touching the odometry, its map or the estimator: a Kalman
+filter on [frame tilt (2), body-frame accelerometer error (3)], read every 1 s
+from the trailing 10 s mean specific force in the trajectory frame minus the
+trajectory's own acceleration; the tilt beyond a deadband (2 deg) is removed by
+rotating each increment and attitude. Only the CLI uses it, opt-in, on the
+`--output-tum-path-fused` path (`-deadband`, `-random-walk` options). The
+deadband is what keeps it inert where the odometry is already level: without
+it the accelerometer's own error (0.3-1.4 deg) is integrated along the path.
+Readings beyond `max_tilt` (5 deg), or with gravity pointing down, are
+ignored, not gated: they come from a failing trajectory attitude (seen at
+25-100 deg off gravity), and restarting the filter into them bends the whole
+path.
 
 ## Reproducible odometry evaluation
 
@@ -1074,6 +1308,12 @@ results, only CPU use (offline: 16 hardware threads, same speed as 8 at 2x the C
 The smoother also needs `-l <libmola_state_estimation_smoother.so>`; the CLI
 does not load that plugin by default and the class factory otherwise fails with
 "unknown class name".
+
+`--output-tum-path-fused` samples the estimator at the stamp of the newest
+registered pose (the scan's reference time), not at the observation stamp,
+which can be half a sweep later: that would score an extrapolation. The query
+at the observation stamp is still made, since the simple estimator fuses its
+buffered IMU readings on a query, so the run itself does not change.
 
 ## A second front-end in the batch CLI: `--module`
 
@@ -1107,8 +1347,8 @@ Notes:
   here; `mola::VisualSlam` is synchronous by design and therefore deterministic.
 - Sensors the LiDAR odometry ignores are not published by default. `--module`
   switches KITTI's `publish_image_0/1` on; for rosbags, name the topics with
-  `MOLA_CAMERA_TOPIC_0` / `MOLA_CAMERA_TOPIC_1` (labels `image_0` / `image_1`,
-  overridable with `MOLA_CAMERA_LABEL_0/1`), same empty-by-default convention as
+  `MOLA_CAMERA_TOPIC_0` / `_1` / `_2` (labels `image_0` / `image_1` / `image_2`,
+  overridable with `MOLA_CAMERA_LABEL_0/1/2`), same empty-by-default convention as
   `MOLA_ODOMETRY_TOPIC`.
 - A second front-end that pushes poses under its **own** frame id adds a frame
   variable to the smoother's factor graph, which is gauge-free on the first
@@ -1194,8 +1434,11 @@ pipeline YAML, not read directly in C++.)
 | `MOLA_LO_REG_GATE_LOG` | string | (empty = off) | `module/src/LidarOdometry_ProcessScan.cpp` | Path to a TSV dump, one row per scan: correction, predicted and ICP sigmas, and the Mahalanobis statistic, for choosing the threshold above from data. Same idiom as `MOLA_LO_MAP_GATE_LOG` |
 | `MOLA_LO_DISABLE_VERSION_CHECK` | bool | false | `module/src/LidarOdometry_Main.cpp` | Skips the daily online check for a newer release. Set in CI, so test coverage does not depend on network timing |
 | `MOLA_DROP_STALE_SCANS` | bool | true | all `pipelines/*.yaml` | false = lossless input queue (producer blocks instead of the queue evicting the older scan). `mola-lidar-odometry-cli` defaults it to false |
-| `MOLA_CAMERA_TOPIC_0` / `_1` | string | (empty = off) | `apps/mola-lidar-odometry-cli.cpp` | Rosbag camera topics to publish, for a `--module` front-end |
-| `MOLA_CAMERA_LABEL_0` / `_1` | string | `image_0` / `image_1` | `apps/mola-lidar-odometry-cli.cpp` | Sensor labels for the topics above |
+| `MOLA_CAMERA_TOPIC_0` / `_1` / `_2` | string | (empty = off) | `apps/mola-lidar-odometry-cli.cpp` | Rosbag camera topics to publish, for a `--module` front-end or simplemap keyframes |
+| `MOLA_CAMERA_LABEL_0` / `_1` / `_2` | string | `image_0` / `image_1` / `image_2` | `apps/mola-lidar-odometry-cli.cpp` | Sensor labels for the topics above |
+| `MOLA_SIMPLEMAP_ATTACH_LABEL` | string | (empty = off) | `pipelines/blocks/simplemap.yaml` | Sensor label regex of observations (e.g. images) stored in simplemap keyframes |
+| `MOLA_SIMPLEMAP_ATTACH_MAX_AGE` / `_ATTACH_ONCE` / `_ATTACH_QUEUE_SIZE` | double / bool / int | 0.5 / true / 10 | `pipelines/blocks/simplemap.yaml` | Max time offset to the keyframe; never the same observation in two keyframes |
+| `MOLA_SIMPLEMAP_IMAGE_FORMAT` / `MOLA_SIMPLEMAP_JPEG_QUALITY` | string / int | jpg / 95 | `pipelines/blocks/simplemap.yaml` | Keyframe images as jpg/png files in `<map>_Images/`, or inline |
 | `LO_PIPELINE_YAML` | string | (unset) | `test/test_lidar_odometry_rawlog.cpp`, `test/test_lidar_odometry_rosbag2.cpp` | Path to the LO pipeline YAML used by the test |
 | `LO_STATE_ESTIM_YAML` | string | (unset) | same tests | Path to the state-estimator YAML used by the test |
 | `LO_TEST_RAWLOG` | string | (unset) | `test/test_lidar_odometry_rawlog.cpp` | Path to the input rawlog dataset |
@@ -1239,7 +1482,7 @@ We use colcon, the ROS2 build tool, and mola_common with utility cmake helpers.
   Humble and Rolling testing entries exist commented-out, Lyrical has none.
   There, `setup ROS environment` only runs for testing entries, so stable ones
   need a prebuilt `ros:<distro>` image (or the manual `ubuntu:resolute` setup
-  used for pre-buildfarm distros like Lyrical). Self-hosted (arm64) only covers
+  used for pre-buildfarm distros like Lyrical). arm64 (GitHub-hosted `ubuntu-24.04-arm`) only covers
   Humble/Jazzy, each stable + testing, and runs `setup ROS environment`
   unconditionally for both.
 - Style: enforced with `.clang-format` and `.clang-tidy`
