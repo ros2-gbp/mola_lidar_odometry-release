@@ -32,9 +32,20 @@
 #include <mola_kernel/interfaces/MapSourceBase.h>
 #include <mola_kernel/interfaces/NavStateFilter.h>
 #include <mola_kernel/interfaces/Relocalization.h>
+#if __has_include(<mola_kernel/interfaces/ImuBiasSource.h>)
+#include <mola_kernel/interfaces/ImuBiasSource.h>
+#define MOLA_LO_HAS_IMU_BIAS_SOURCE 1
+#endif
 #if __has_include(<mola_kernel/interfaces/SharedKeyframeMap.h>)
 #include <mola_kernel/interfaces/SharedKeyframeMap.h>
 #define MOLA_HAS_SHARED_KEYFRAME_MAP_SINK 1
+#endif
+#if defined(MOLA_HAS_SHARED_KEYFRAME_MAP_SINK) && \
+  __has_include(<mola_kernel/interfaces/LocalMapCorrectionSource.h>)
+#include <mola_kernel/interfaces/LocalMapCorrectionSource.h>
+/** Feature macro: the local map can be rebuilt from the corrected keyframes of
+ *  a mola::LocalMapCorrectionSource (e.g. a global mapper with loop closures). */
+#define MOLA_LO_HAS_LOCAL_MAP_REBUILD 1
 #endif
 #if __has_include(<mola_kernel/interfaces/TransformTreeSource.h>)
 #include <mola_kernel/interfaces/TransformTreeSource.h>
@@ -54,8 +65,10 @@
 #define MOLA_LO_HAS_MAP_GRAVITY_ESTIMATOR 1
 #endif
 #include <mola_lidar_odometry/ImuScanSync.h>
+#include <mola_lidar_odometry/KeyframeAttachments.h>
 #include <mola_lidar_odometry/KeyframeDecider.h>
 #include <mola_lidar_odometry/MapFrameRelevel.h>
+#include <mola_lidar_odometry/PointTimeOutlierFilter.h>
 
 /** Feature macro: the one-off map-frame gauge change is available.
  *
@@ -89,6 +102,11 @@
 #include <mp2p_icp/GravityPrior.h>
 #define MOLA_LO_HAS_MP2P_GRAVITY_PRIOR 1
 #endif
+// Learned registration covariance (optional, recent mp2p_icp only).
+#if __has_include(<mp2p_icp/LearnedCovarianceEstimator.h>)
+#include <mp2p_icp/LearnedCovarianceEstimator.h>
+#define MOLA_LO_HAS_MP2P_LEARNED_COVARIANCE 1
+#endif
 #endif
 
 // MRPT
@@ -104,17 +122,21 @@
 // STD:
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
+#include <deque>
 #include <fstream>
 #include <future>
 #include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <regex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 // Forward declarations:
@@ -252,6 +274,13 @@ public:
      */
     std::optional<std::string> deskew_odometry_sensor_label;
 
+    /** If true and another module offers IMU bias estimates (mola::ImuBiasSource,
+     *  e.g. the state estimator with `imu_bias_tracking`), the gyroscope bias of
+     *  each IMU reading is subtracted before using it for IMU-based de-skew and
+     *  gravity alignment. Readings of IMUs without an estimate yet are used as is.
+     */
+    bool use_imu_bias_source = true;
+
     /** Minimum time (seconds) between scans for being attempted to be
          * aligned. Scans faster than this rate will be just silently ignored.
          */
@@ -314,6 +343,12 @@ public:
 
     MultipleLidarOptions multiple_lidars;
 
+    /** Points whose per-point time is far outside the usual range of their
+     *  sensor (e.g. after a jump of the LiDAR clock) are removed from each
+     *  observation, before its times are adjusted (see PointTimeOutlierFilter).
+     *  YAML block `point_time_outliers`, optional. */
+    PointTimeOutlierFilter::Parameters point_time_outliers;
+
     /** Keyframe-creation policy for the LOCAL METRIC MAP. The distance
          * thresholds, the occupancy count and the temporal window all come
          * from mola::KeyframeDecisionOptions, shared with SimpleMapOptions;
@@ -341,6 +376,20 @@ public:
       /** Publish updated map via mola::MapSourceBase once every N frames
              */
       uint32_t publish_map_updates_every_n = 5;
+
+      /** If a mola::LocalMapCorrectionSource (e.g. a global mapper) is present
+             * and keyframes are pushed to it, rebuild the local map after each
+             * of its corrections (loop closures), from its keyframes within
+             * max_distance_to_keep_keyframes, including those of earlier visits.
+             * The map is anchored at the newest pushed keyframe, so the vehicle
+             * pose does not jump.
+             */
+      bool rebuild_on_corrections = true;
+
+      /** Minimum distance between the keyframes used in a rebuild [m] (the
+             * newest ones are kept): denser keyframes mostly repeat points, and
+             * each one costs a scan preprocessing. */
+      double rebuild_keyframe_spacing = 1.0;
 
       /** Whether to publish the local map at all via mola::MapSourceBase.
              *
@@ -496,6 +545,15 @@ public:
       /// Can be any pointcloud field name. Will change to "z" for simple XYZ clouds.
       std::string local_map_colormap_color_by_field = "intensity";
 
+      /// Fraction of points at each end of the colored field (e.g. intensity,
+      /// z) left out of the colormap range, in the local map and the
+      /// observation clouds: a few outliers (retroreflectors, tree tops)
+      /// would otherwise squeeze almost all points into one color. 0: full range.
+      float colormap_outliers_percentile = 0.05f;
+      /// Fixed colormap limits for the local map (e.g. a z range). If both are
+      /// set (min < max), they replace the automatic range above.
+      std::optional<float> local_map_colormap_min, local_map_colormap_max;
+
       /// If show_localmap==true, how many frames to wait to update the visualization of the
       /// map, which is a costly operation.
       int map_update_decimation = 10;
@@ -589,6 +647,35 @@ public:
     };
     Diagnostics diagnostics;
 
+    /** Optional learned registration covariance: a model trained offline
+     *  (mp2p_icp::LearnedCovarianceEstimator) predicts the covariance of each
+     *  accepted registration, on a worker thread. The state estimator gets
+     *  the pose at once and the covariance when it is ready, through
+     *  NavStateFilter::fuse_pose_deferred(); the solver's own covariance is
+     *  what it gets if no learned one can be computed. */
+    struct LearnedCovariance
+    {
+      /// Model file; empty disables the feature.
+      std::string model_file;
+
+      /// Observation layer with the full-resolution, de-skewed scan.
+      std::string scan_layer = "deskewed";
+
+      /// Past scans forming the reference cloud of the feature evaluator.
+      /// Must match the model's training.
+      uint32_t window_scans = 25;
+
+      /// Context labels the model was trained with (framework_name, sensor,
+      /// mode); unknown ones contribute nothing.
+      std::map<std::string, std::string> context = {
+        {"framework_name", "mp2p_gicp"}, {"mode", "s2m"}};
+
+      bool enabled() const { return !model_file.empty(); }
+
+      void initialize(const Yaml & c);
+    };
+    LearnedCovariance learned_covariance;
+
     /** ICP parameters for the case of having, or not, a good velocity
          * model that works a good prior. Each entry in the vector is an
          * "ICP stage", to be run as a sequence of coarser to finer detail
@@ -643,6 +730,41 @@ public:
         * next to a keyframe's point cloud.
         */
       double save_imu_max_age = 0.1;  // [s]
+
+      /** Observations of other sensors (e.g. camera images) to store in
+       *  each keyframe, with the same "closest in time" rule as GNSS and IMU
+       *  above, among the observations received by the time the keyframe is
+       *  created (mola_mapper and mola-sm-attach-from-rosbag1/2, which can wait
+       *  for later ones, attach more). One entry per sensor or group of
+       *  sensors: a regex matching several cameras stores one image of each
+       *  in every keyframe. YAML:
+       *  \code
+       *  attach_observations:
+       *    - sensor_label: 'camera_left'  # regex; empty: entry ignored
+       *      max_age: 0.5                 # [s]
+       *      attach_once: true            # never the same one in two keyframes
+       *      queue_max_size: 10
+       *  \endcode
+       */
+      struct AttachedObservation
+      {
+        std::string sensor_label;
+        double max_age = 0.5;  // [s]
+        bool attach_once = true;
+        uint32_t queue_max_size = 10;
+      };
+      std::vector<AttachedObservation> attach_observations;
+
+      /** How images (CObservationImage) stored in keyframes are saved: "jpg"
+       *  or "png" files in the `<map>_Images/` directory next to
+       *  `save_final_map_to_file`, or "inline" (pixels inside the
+       *  .simplemap). Files are written as keyframes are created, only if
+       *  save_final_map_to_file is set; else images stay inline. Images that
+       *  are already files, or not 8-bit, are stored as they are. */
+      std::string image_format = "jpg";
+
+      /// Quality [1-100] of "jpg" keyframe images.
+      int jpeg_quality = 95;
 
       /** If enabled, a directory will be create alongside the .simplemap
              *  and pointclouds will be externally serialized there, for much
@@ -817,6 +939,11 @@ public:
         /// Spacing of the initial guesses
         double resolution_xy = 1.0;        // [m]
         double resolution_yaw_deg = 30.0;  // [deg]
+
+        /// A search with more initial guesses than this (one ICP each) is
+        /// not run, but retried later, when the state estimator may be less
+        /// uncertain: a search can not be interrupted by new scans.
+        int max_initial_guesses = 5000;
 
         /// The z of the prior (e.g. a GNSS altitude, often meters off) is
         /// replaced by the one that puts the ground of the scan, below the
@@ -1098,6 +1225,28 @@ public:
     ///  Minimum inverse covariance in (X,Y,Z) for a valid motion model
     double min_motion_model_xyz_cov_inv = 1.0;
 
+    /** [m/s^2] Plausibility margin for the state estimator's prediction. The
+     * IMU accelerations between two scans, rotated with the odometry attitude
+     * and without gravity, give the velocity change of the vehicle. If the
+     * predicted speed changes by more than that, plus this margin times the
+     * interval, the prediction is not used and the estimator is reset.
+     * Needs an IMU; 0 disables the check. */
+    double motion_model_max_extra_acceleration = 10.0;
+
+    /** Recovery from a stall: registration failed and the state estimator gave
+     * no usable prediction, so the pose cannot move. After `after_n_scans` such
+     * consecutive scans, the local map restarts at the last pose and the state
+     * estimator is reset, so registration resumes. Never applied to a loaded
+     * map or with local map updates disabled. */
+    struct StallRecovery
+    {
+      bool enabled = true;
+      uint32_t after_n_scans = 5;
+
+      void initialize(const Yaml & cfg);
+    };
+    StallRecovery stall_recovery;
+
     /** When publishing pose updates, the reference frame for both, estimated robot poses, and the local map.*/
     std::string publish_reference_frame = "odom";
 
@@ -1154,6 +1303,11 @@ public:
      */
   mrpt::poses::CPose3DInterpolator estimatedTrajectory() const;
 
+  /** Timestamp of the newest pose in estimatedTrajectory(), or std::nullopt
+   *  if it is still empty. Multi-thread safe to call; it copies nothing else.
+   */
+  std::optional<mrpt::Clock::time_point> newestTrajectoryStamp() const;
+
   /** Returns the last estimated kinematic state: pose of the vehicle in the LiDAR odometry
    *  frame, and its estimated local (body-frame) twist vector.
    *  It does not wait for a scan being processed: it returns the state as of the last processed one.
@@ -1161,6 +1315,10 @@ public:
    */
   std::optional<std::tuple<mrpt::poses::CPose3DPDFGaussian, mrpt::math::TTwist3D>>
   lastEstimatedState() const;
+
+  /** Number of local map rebuilds from the corrected keyframes of a
+   *  mola::LocalMapCorrectionSource (see MapUpdateOptions::rebuild_on_corrections). */
+  [[nodiscard]] std::size_t localMapRebuildCount() const { return local_map_rebuilds_.load(); }
 
   /** Returns the ICP quality (range: [0,1]) of the last registered scan. Only valid if lastEstimatedState() returns non-empty. */
   double lastIcpQuality() const;
@@ -1471,6 +1629,12 @@ private:
     /// odometry source. Protected by imu_state_mtx_.
     bool deskew_twist_from_odometry = false;
 
+    /// Reference time of the scan whose pose was just fused into the state
+    /// estimator. The next scan's de-skew queries the twist at this instant,
+    /// stores it in the velocity buffer with this stamp, and clears it.
+    /// Protected by state_mtx_.
+    std::optional<mrpt::Clock::time_point> last_fused_scan_ref_time;
+
     /// True when the map-origin verticality reference was captured from the
     /// odometry attitude source. The per-scan reading is then taken from that
     /// same source and from nowhere else: a reading referenced against a
@@ -1497,6 +1661,10 @@ private:
     std::optional<mrpt::poses::CPose3D> gravity_calib_pose;
 
     mrpt::poses::CPose3DPDFGaussian last_lidar_pose;  //!< in local map
+
+    /// The instant `last_lidar_pose` refers to [s], if known (the reference
+    /// time of the scan it was registered or predicted for).
+    std::optional<double> last_lidar_pose_stamp;
 
     /// Pose set by the last initial localization, whatever its method. The
     /// first keyframe of an empty local map is placed here.
@@ -1563,6 +1731,26 @@ private:
     // recovery in AdaptiveThreshold.
     int consecutive_bad_icps = 0;
 
+    /// Consecutive scans neither registered nor predicted (see StallRecovery).
+    uint32_t consecutive_stalled_scans = 0;
+
+    /// Stamp [s] and speed [m/s] of the last accepted state estimator prediction.
+    std::optional<std::pair<double, double>> last_motion_model_speed;
+
+    /// Stamp [s] of the start or last reset of the state estimator: its
+    /// predictions are not checked until it has settled.
+    std::optional<double> state_estimator_start_stamp;
+
+    /// One IMU specific force reading, in the vehicle frame.
+    struct SpecificForce
+    {
+      double stamp = 0;                ///< [s]
+      mrpt::math::TVector3D f;         ///< as read (m/s^2 or units of g)
+      mrpt::math::TVector3D acc_bias;  ///< [m/s^2] from an ImuBiasSource, or zero
+    };
+    /// Recent IMU specific forces. Protected by imu_state_mtx_.
+    std::deque<SpecificForce> recent_specific_force;
+
     /// Run totals, reported once at shutdown. `registration_no_motion_model` is
     /// the one that had no aggregate before: the front end already logs a
     /// throttled warning when the state estimator returns nothing (or returns a
@@ -1575,6 +1763,14 @@ private:
     size_t registration_no_motion_model = 0;
     size_t registration_icp_rejected = 0;
     size_t registration_gate_rejected = 0;
+    size_t motion_model_implausible = 0;
+    size_t stall_recoveries = 0;
+    /// Scans with per-point time outliers, and points removed for that:
+    size_t point_time_outlier_scans = 0;
+    size_t point_time_outlier_points = 0;
+
+    /// One per LiDAR sensor label (see Parameters::point_time_outliers).
+    std::map<std::string, PointTimeOutlierFilter> point_time_filters;
 
     // Automatic estimation of the observation bounding-radius (measured from
     // base_link, not from the sensor; see ESTIMATED_OBSERVATION_RADIUS docs):
@@ -1615,6 +1811,33 @@ private:
 
     /// See check_for_removal_every_n
     uint32_t localmap_check_removal_counter = 0;
+
+#if defined(MOLA_LO_HAS_LOCAL_MAP_REBUILD)
+    /// The newest keyframe accepted by shared_keyframe_map_sink, with its pose
+    /// in the odometry frame: the reference of the next local map rebuild.
+    struct PushedKeyframe
+    {
+      mola::SharedKeyframeMap::KeyFrameID id = 0;
+      mrpt::Clock::time_point stamp;
+      mrpt::poses::CPose3D pose;
+    };
+    std::optional<PushedKeyframe> last_pushed_keyframe;
+
+    /// A scan inserted into the local map, kept to insert it again into a
+    /// rebuilt one (the central map may not have it as a keyframe yet).
+    struct LocalMapInsertion
+    {
+      mrpt::Clock::time_point stamp;
+      mrpt::poses::CPose3D robot_pose;
+      mrpt::poses::CPose3D sensor_pose;  ///< in the vehicle frame
+      double obs_timestamp = 0;          ///< for the keyframe decider [s]
+      mp2p_icp::metric_map_t observation;
+    };
+    /// Insertions newer than last_pushed_keyframe, or than the reference of a
+    /// rebuild in progress (local_map_rebuild_reference).
+    std::deque<LocalMapInsertion> recent_local_map_insertions;
+    std::optional<mrpt::Clock::time_point> local_map_rebuild_reference;
+#endif
     uint32_t localmap_advertise_updates_counter = std::numeric_limits<uint32_t>::max();
 
     /// To update the map in the viz only if really needed
@@ -1652,14 +1875,30 @@ private:
     mp2p_icp::ICP::Ptr global_search_refine_icp;
     std::shared_ptr<mp2p_icp::ParameterSource> global_search_refine_param_source;
 
-    // GNSS: keep a list of recent observations to later on search the one
-    // closest to each LIDAR observation. Guarded by imu_state_mtx_.
-    std::map<mrpt::Clock::time_point, std::shared_ptr<const mrpt::obs::CObservationGPS>> last_gnss_;
-
-    // IMU: same as last_gnss_ above, but for the simplemap only. Independent
-    // of pending_imu_, which the LiDAR worker drains as it consumes readings.
+    // Recent observations to attach to simplemap keyframes, the one closest
+    // in time to each: GNSS and IMU (fed by onGPS() and the IMU callbacks,
+    // after validation), and one per simplemap.attach_observations entry (fed
+    // by sensor label, with one buffer per label: a regex matching several
+    // cameras stores one image of each). The IMU one is independent of
+    // pending_imu_, which the LiDAR worker drains as it consumes readings.
     // Guarded by imu_state_mtx_.
-    std::map<mrpt::Clock::time_point, std::shared_ptr<const mrpt::obs::CObservationIMU>> last_imu_;
+    struct AttachSource
+    {
+      KeyframeAttachmentBuffer::Options options;
+      /// Sensor label regex of simplemap.attach_observations entries.
+      std::optional<std::regex> sensor_label;
+      /// By sensor label (a single one, "", for GNSS and IMU).
+      std::map<std::string, KeyframeAttachmentBuffer> buffers;
+
+      void add(const mrpt::obs::CObservation::ConstPtr & o)
+      {
+        const std::string key = sensor_label ? o->sensorLabel : std::string();
+        buffers.try_emplace(key, options).first->second.add(o);
+      }
+    };
+    std::vector<AttachSource> attach_sources;
+    std::optional<std::size_t> attach_source_gnss;
+    std::optional<std::size_t> attach_source_imu;
 
     // Visualization:
     // Cache only the *expensive*, read-only-after-load vehicle model
@@ -1720,6 +1959,11 @@ private:
       const mrpt::Clock::time_point & stamp, const mrpt::system::COutputLogger & logger);
     void append_gnss_stamp(
       const mrpt::Clock::time_point & stamp, const mrpt::system::COutputLogger & logger);
+
+#if defined(MOLA_LO_HAS_MP2P_LEARNED_COVARIANCE)
+    /// Created in initialize() if Parameters::learned_covariance is enabled.
+    std::shared_ptr<mp2p_icp::LearnedCovarianceEstimator> learned_cov;
+#endif
 
   };  // end of MethodState
 
@@ -1816,10 +2060,21 @@ private:
   /// the input sequence.
   void onDeskewOdometry(const mrpt::obs::CObservation::ConstPtr & o);
 
-  /// Mean twist (vehicle frame) of the de-skew odometry source over
-  /// [t0, t0+span], or over its available part if it covers at least half of
-  /// it. Caller must hold imu_state_mtx_.
-  [[nodiscard]] std::optional<mrpt::math::TTwist3D> deskewTwistFromOdometry(
+  /// Mean motion of the de-skew odometry source over an interval.
+  struct DeskewOdometryTwist
+  {
+    /// Mean twist, in the vehicle frame at the start of the interval.
+    mrpt::math::TTwist3D twist;
+    /// Mean linear velocity, in the vehicle frame at the middle of the interval.
+    mrpt::math::TVector3D velocity_at_middle;
+    /// The middle of the interval [s], the instant the mean refers to.
+    double middle_stamp = 0;
+  };
+
+  /// Mean motion of the de-skew odometry source over [t0, t0+span], or over
+  /// its available part if it covers at least half of it. Caller must hold
+  /// imu_state_mtx_.
+  [[nodiscard]] std::optional<DeskewOdometryTwist> deskewTwistFromOdometry(
     double t0, double span) const;
 
   /// Captures the map-origin verticality reference from the accelerometer, if
@@ -1889,6 +2144,20 @@ private:
     1, mrpt::WorkerThreadsPool::POLICY_DROP_OLD, "worker_pub_map"};
 
   MethodState state_;
+
+#if defined(MOLA_LO_HAS_MP2P_LEARNED_COVARIANCE)
+  /** Queues the learned covariance of an accepted registration, against the
+   *  window of the previous scans. Returns the covariance (MRPT's
+   *  CPose3DPDFGaussian convention) as a future, or nothing if this
+   *  observation has no usable scan layer. */
+  std::optional<std::shared_future<mrpt::math::CMatrixDouble66>> submitLearnedCovariance(
+    const mp2p_icp::metric_map_t & observation, const ICP_Input & in, const mp2p_icp::Results & res,
+    const mrpt::poses::CPose3DPDFGaussian & pose);
+
+  /// Appends the scan to the evaluator's reference window.
+  void pushLearnedCovarianceWindow(
+    const mp2p_icp::metric_map_t & observation, const mrpt::poses::CPose3D & pose);
+#endif
   const MethodState & state() const { return state_; }
   MethodState stateCopy() const { return state_; }
 
@@ -1919,6 +2188,7 @@ private:
     mola::gui::LiveString::Ptr lbSpeed;
     mola::gui::LiveString::Ptr lbLidarQueue;
     mola::gui::LiveString::Ptr lbMapStats;
+    std::array<mola::gui::LiveString::Ptr, 3> lbImuBias;
   };
 
   // Accessing this struct in gui_ requires acquiring state_gui_mtx_
@@ -1926,6 +2196,76 @@ private:
 
   /// The configuration used in the last call to initialize()
   Yaml lastInitConfig_;
+
+  /// See localMapRebuildCount()
+  std::atomic<std::size_t> local_map_rebuilds_{0};
+
+#if defined(MOLA_LO_HAS_LOCAL_MAP_REBUILD)
+  /** @name Local map rebuild from a mola::LocalMapCorrectionSource
+   * (LidarOdometry_LocalMapRebuild.cpp). Kept outside state_, so they survive
+   * reset().
+   * @{ */
+  std::shared_ptr<mola::LocalMapCorrectionSource> local_map_correction_source_;
+  mola::LocalMapCorrectionSource::subscription_id_t local_map_correction_subscription_ = 0;
+  std::thread local_map_rebuild_thread_;
+  /// Guards the two flags below. A leaf lock.
+  std::mutex local_map_rebuild_mtx_;
+  std::condition_variable local_map_rebuild_cv_;
+  bool local_map_rebuild_requested_ = false;
+  bool local_map_rebuild_exit_ = false;
+  /// Stops a rebuild in progress (shutdown).
+  std::atomic<bool> local_map_rebuild_cancel_{false};
+  /// A correction not applied yet: retried after the next pushed keyframe.
+  std::atomic<bool> local_map_rebuild_pending_{false};
+  /// lastInitConfig_ when the rebuild started (the pipelines are built from it).
+  Yaml rebuild_config_;
+
+  /** Changed whenever the local map or the odometry frame change other than by
+   *  a scan insertion (restart, map load, re-leveling, reset): a rebuild that
+   *  started before is discarded. */
+  std::atomic<uint64_t> local_map_generation_{0};
+
+  /** The scan preprocessing and map insertion pipelines, again, attached to
+   *  their own parameter source, so the rebuild thread does not share them
+   *  with the scan thread. Only used by the rebuild thread. */
+  struct RebuildPipelines
+  {
+    mp2p_icp::ParameterSource parameter_source;
+    mp2p_icp_filters::GeneratorSet obs_generators;
+    mp2p_icp_filters::FilterPipeline adjust_timestamps;
+    mp2p_icp_filters::FilterPipeline prefilter;
+    mp2p_icp_filters::FilterPipeline deskew;
+    mp2p_icp_filters::FilterPipeline filter1;
+    mp2p_icp_filters::FilterPipeline filter2;
+    mp2p_icp_filters::FilterPipeline final_pass;
+    mp2p_icp_filters::GeneratorSet local_map_generators;
+    mp2p_icp_filters::FilterPipeline obs2map_merge;
+    /// Copies of the scan thread filters (one per LiDAR sensor label), taken
+    /// at each rebuild: old keyframes are checked against them, not learned.
+    std::map<std::string, PointTimeOutlierFilter> point_time_filters;
+  };
+  std::unique_ptr<RebuildPipelines> rebuild_pipelines_;
+
+  /// Subscribes to the correction source, if any (from initialize()).
+  void startLocalMapRebuild();
+  /// Unsubscribes and joins the rebuild thread (from shutdownCleanup()).
+  void stopLocalMapRebuild();
+  void localMapRebuildThreadLoop();
+  /// False if it could not be done now and should be retried later.
+  bool rebuildLocalMap();
+  /// The keyframe observations, as a scan would be before its ICP.
+  [[nodiscard]] std::optional<mp2p_icp::metric_map_t> preprocessKeyframeForRebuild(
+    const mrpt::obs::CSensoryFrame & sf, const mrpt::Clock::time_point & stamp,
+    const std::vector<std::regex> & lidarLabels, bool earlyDeskew);
+  /** Discards the reference and the buffered insertions of a rebuild, and any
+   *  rebuild in progress. Caller holds state_mtx_. */
+  void invalidateLocalMapRebuild();
+  /// Called after a keyframe push accepted by the central map, with state_mtx_.
+  void onKeyframePushed(
+    mola::SharedKeyframeMap::KeyFrameID id, const mrpt::Clock::time_point & stamp,
+    const mrpt::poses::CPose3D & pose, uint64_t generation);
+  /** @} */
+#endif
 
   /// Set once the state estimator callbacks are registered, so a reset()
   /// does not register them again.
@@ -1955,7 +2295,7 @@ private:
   /// straight back into scan submission latency.
   ///
   /// Covers pending_imu_ and, in MethodState: imu_initializer,
-  /// gravity_estimator, map_gravity, recent_imu_stamps, last_imu_, last_gnss_,
+  /// gravity_estimator, map_gravity, recent_imu_stamps, attach_sources,
   /// recent_gnss_stamps, parameter_source (its variable map, the realize()
   /// "evaluated" flags, and localVelocityBuffer), and any *invocation* of
   /// obs_generators (which writes the velocity buffer and reads those flags).
@@ -1970,6 +2310,15 @@ private:
   /// granularity is what keeps the ownership rule above reviewable, rather than
   /// threading a lock object through a dozen signatures.
   mutable std::recursive_mutex imu_state_mtx_;
+
+#if defined(MOLA_LO_HAS_IMU_BIAS_SOURCE)
+  /// IMU bias providers (use_imu_bias_source), guarded by imu_state_mtx_.
+  std::vector<std::shared_ptr<mola::ImuBiasSource>> imu_bias_sources_;
+  bool imu_bias_first_use_logged_ = false;
+  /// Label and stamp of the newest IMU reading received, for the GUI (imu_state_mtx_).
+  std::string imu_bias_gui_label_;
+  std::optional<mrpt::Clock::time_point> imu_bias_gui_stamp_;
+#endif
 
   /// Guards the *contents* (layers) of MethodState::local_map.
   /// Rendering the map is O(map size) and would stall every other user of
@@ -2001,9 +2350,11 @@ private:
   void relocalize_from_gnss_impl();
 
   /// Runs the pending global search for the initial pose with this
-  /// (filtered) observation. Once localized, the found pose is taken as the
-  /// pose at the newest sensor time (the vehicle is assumed still meanwhile).
-  void doGlobalSearchForInitialPose(const mp2p_icp::metric_map_t & observation);
+  /// (filtered) observation, whose reference time is scan_ref_time. Once
+  /// localized, the found pose is carried to the newest sensor time with the
+  /// vehicle motion the state estimator observed during the search.
+  void doGlobalSearchForInitialPose(
+    const mp2p_icp::metric_map_t & observation, const mrpt::Clock::time_point & scan_ref_time);
   MapServer::ReturnStatus map_load_impl(const std::string & path);
   MapServer::ReturnStatus map_save_impl(const std::string & path);
 
@@ -2062,6 +2413,27 @@ private:
   /// empty-map start. Caller must hold state_mtx_.
   void restartLocalMapFromScratch();
 
+  /// Whether the change of the predicted speed since the previous scan agrees
+  /// with the IMU. Caller must hold state_mtx_.
+  bool motionModelIsPlausible(double scanTime, double predictedSpeed);
+
+  /// Restarts the local map at the current pose and resets the state
+  /// estimator, keeping the trajectory. Caller must hold state_mtx_.
+  void recoverFromStall();
+
+  /// Resets the state estimator's motion but keeps its frames (where the
+  /// estimator overrides reset_motion(); otherwise, a full reset). Caller must
+  /// hold state_mtx_.
+  void resetNavStateMotion();
+
+  /// A full reset of the state estimator, which may redefine its frames, and
+  /// a restart of the prediction plausibility check. Caller must hold
+  /// state_mtx_.
+  void resetNavState();
+
+  /// The plausibility check starts over: settling time, no previous speed.
+  void restartPlausibilityCheck();
+
   /// Merges the observation layers into the local map, creating it from the
   /// raw observations if empty. Caller must hold state_mtx_.
   void insertScanIntoLocalMap(
@@ -2082,9 +2454,17 @@ private:
    *  for simplemap keyframes. Inline on the caller's thread, like onIMU(). */
   void onAttitudeIMU(const CObservation::ConstPtr & o);
 
-  /** Keeps `imu` in last_imu_ for simplemap keyframes, if enabled.
+  /** Keeps `imu` for simplemap keyframes, if enabled.
    *  Caller must hold imu_state_mtx_. */
   void storeImuForSimplemap(const mrpt::obs::CObservationIMU::ConstPtr & imu);
+
+  /** Creates state_.attach_sources from the parameters (GNSS, IMU and the
+   *  simplemap.attach_observations entries). */
+  void createKeyframeAttachSources();
+
+  /** Keeps `o` for simplemap keyframes in the attach_observations buffers
+   *  whose sensor label matches. Caller must hold imu_state_mtx_. */
+  void storeForSimplemapByLabel(const CObservation::ConstPtr & o);
 
   /** Stores the "up" direction implied by an odometry observation's absolute
    *  attitude, for use as the verticality reading. Like onIMU(), it only
@@ -2098,6 +2478,13 @@ private:
    *  them from pending_imu_.
    *  Caller must hold state_mtx_. */
   void consumePendingImu(double upToTime);
+
+  /** The reading with its gyroscope bias removed, if a mola::ImuBiasSource has
+   *  an estimate for it; else the same one. If given, `accBias` gets that
+   *  estimate's accelerometer bias [m/s^2] (zero if none). Caller holds
+   *  imu_state_mtx_. */
+  [[nodiscard]] mrpt::obs::CObservationIMU::ConstPtr imuBiasCorrected(
+    const mrpt::obs::CObservationIMU::ConstPtr & imu, mrpt::math::TVector3D * accBias = nullptr);
 
   void onGPS(const CObservation::ConstPtr & o);
   void onGPSImpl(const CObservation::ConstPtr & o);
@@ -2225,6 +2612,17 @@ private:
   void handleUnloadSinglePastObservation(
     CObservation::Ptr & o, const std::string & simplemapFile) const;
 
+  /** The lazy-load directory of `simplemapFile` ("<map>_Images"), created if
+   *  needed, and optionally set as mrpt::io::setLazyLoadPathBase(). */
+  std::string prepareLazyLoadDirectory(
+    const std::string & simplemapFile, bool setAsLazyLoadPathBase) const;
+
+  /** The observation to store in a simplemap keyframe for `o`: for images, a
+   *  copy that refers to an image file (see simplemap.image_format), queued
+   *  to be written; else `o` itself. Caller must hold state_mtx_. */
+  mrpt::obs::CObservation::Ptr keyframeObservation(
+    const mrpt::obs::CObservation::ConstPtr & o) const;
+
   void onPublishDiagnostics();
 
 #if MOLA_HAS_DIAGNOSTICS_PROVIDER
@@ -2287,6 +2685,21 @@ private:
    *  \return The submitted scan's future, or an invalid future if none was. */
   std::future<void> releaseLidarScansToWorker(double upToImuTime);
   mp2p_icp::metric_map_t::Ptr observationFromRawSensor(const mrpt::obs::CSensoryFrame & sf);
+
+  /** Adds \a dt [s] to the per-point times ("t") of every point layer that
+   *  has them. Used to bring the clouds of several LiDARs to a common
+   *  reference time before merging them. */
+  static void shiftPointTimes(mp2p_icp::metric_map_t & m, double dt);
+
+  /** Applies the per-point time outlier filter of the observation's sensor
+   *  (created on first use in state_.point_time_filters, which learns from it)
+   *  to the point layers of `m`, the points of that observation alone. */
+  PointTimeOutlierFilter::Result rejectPointTimeOutliers(
+    const mrpt::obs::CObservation & o, mp2p_icp::metric_map_t & m);
+
+  /// The point cloud layers of `m`.
+  static std::vector<mrpt::maps::CPointsMap *> pointCloudLayers(mp2p_icp::metric_map_t & m);
+
   mrpt::obs::CSensoryFrame collectRawObservations(const mrpt::obs::CObservation::ConstPtr & obs);
 
   void onInitializePersistentState();
