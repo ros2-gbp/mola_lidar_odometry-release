@@ -28,6 +28,7 @@
 #endif
 
 #include <mrpt/maps/CPointsMap.h>
+#include <mrpt/math/wrap2pi.h>
 #include <mrpt/poses/CPose3D.h>
 
 #include <algorithm>
@@ -77,15 +78,50 @@ std::optional<double> ground_height(
   std::nth_element(zs.begin(), low, zs.end());
   return *low;
 }
+
+// Region searched around a prior with this covariance, and its number of
+// initial guesses, counted as mola::RelocalizationICP_SE2 builds its lattice.
+struct SearchRegion
+{
+  double half_xy = 0;   // [m]
+  double half_yaw = 0;  // [rad]
+  size_t initial_guesses = 0;
+};
+
+template <class GlobalSearchParams>
+SearchRegion search_region(const mrpt::math::CMatrixDouble66 & cov, const GlobalSearchParams & gs)
+{
+  SearchRegion r;
+  const double xySigma = std::sqrt(std::max(cov(0, 0), cov(1, 1)));
+  r.half_xy = std::clamp(gs.sigma_factor * xySigma, gs.min_half_width_xy, gs.max_half_width_xy);
+  const double yawRange =
+    std::max(gs.sigma_factor * std::sqrt(cov(3, 3)), mrpt::DEG2RAD(gs.min_half_width_yaw_deg));
+  r.half_yaw = yawRange > mrpt::DEG2RAD(gs.icp_basin_yaw_deg) ? std::min(yawRange, M_PI) : 0.0;
+
+  const auto nXY = static_cast<size_t>(std::floor(2 * r.half_xy / gs.resolution_xy + 1e-6)) + 1;
+  const double resYaw = mrpt::DEG2RAD(gs.resolution_yaw_deg);
+  size_t nYaw = 0;
+  if (2 * r.half_yaw >= 2 * M_PI - 1e-6) {
+    nYaw = static_cast<size_t>(std::ceil(2 * M_PI / resYaw - 1e-6));
+  } else {
+    nYaw = static_cast<size_t>(std::floor(2 * r.half_yaw / resYaw + 1e-6)) + 1;
+  }
+  r.initial_guesses = nXY * nXY * nYaw;
+  return r;
+}
 }  // namespace
 
 void LidarOdometry::handleInitialLocalizationDoInitFromPose(
   const mrpt::poses::CPose3DPDFGaussian & initPose, bool resetStateEstimator,
   const std::optional<mrpt::Clock::time_point> & stamp)
 {
+#if defined(MOLA_LO_HAS_LOCAL_MAP_REBUILD)
+  // The pose chain the rebuild reference and recent scans belong to ends here:
+  invalidateLocalMapRebuild();
+#endif
   if (resetStateEstimator) {
     ASSERT_(state_.navstate_fuse);
-    state_.navstate_fuse->reset();  // needed after a re-localization to forget the past
+    resetNavState();  // needed after a re-localization to forget the past
 
     // Fake an evolution to be able to have an initial velocity estimation:
     // Use a tiny time step to let the filter remain with a large uncertainty about twist:
@@ -109,6 +145,7 @@ void LidarOdometry::handleInitialLocalizationDoInitFromPose(
 
   // also, keep it as the last pose for subsequent ICP runs:
   state_.last_lidar_pose = initPose;
+  state_.last_lidar_pose_stamp.reset();
   state_.initial_pose = initPose.mean;
 }
 
@@ -237,6 +274,9 @@ void LidarOdometry::handleInitialLocalization()
             auto lckMapContents = mrpt::lockHelper(local_map_content_mtx_);
             state_.local_map->clear();
           }
+#if defined(MOLA_LO_HAS_LOCAL_MAP_REBUILD)
+          invalidateLocalMapRebuild();
+#endif
           state_.gravity_calib_pitch_roll.reset();  // new map origin: recapture at next first KF
           state_.gravity_calib_pose.reset();
           state_.gravity_calib_first_available_time.reset();
@@ -455,7 +495,8 @@ void LidarOdometry::handleInitialLocalizationStateEstimation()
   }
 }
 
-void LidarOdometry::doGlobalSearchForInitialPose(const mp2p_icp::metric_map_t & observation)
+void LidarOdometry::doGlobalSearchForInitialPose(
+  const mp2p_icp::metric_map_t & observation, const mrpt::Clock::time_point & scan_ref_time)
 {
 #if defined(MOLA_RELOCALIZATION_HAS_CANDIDATES)
   const auto & gs = params_.initial_localization.global_search;
@@ -473,20 +514,51 @@ void LidarOdometry::doGlobalSearchForInitialPose(const mp2p_icp::metric_map_t & 
   }
   state_.last_global_search_attempt = now;
 
-  // Search around the latest state estimator pose:
+  // Search around the latest state estimator pose, unless it is more
+  // uncertain than the prior already kept (the estimator covariance may grow
+  // a lot between measurements, e.g. extrapolated with an uncertain velocity,
+  // and a needlessly large search may take minutes) while its mean is still
+  // within the region of the kept one (otherwise that one is stale).
+  auto region = search_region(state_.global_search_prior->cov, gs);
   if (mrpt::poses::CPose3DPDFGaussian latest;
       state_.navstate_fuse->has_converged_localization(latest)) {
-    state_.global_search_prior = latest;
+    const auto latestRegion = search_region(latest.cov, gs);
+    const auto keptMean = state_.global_search_prior->mean.asTPose();
+    const auto latestMean = latest.mean.asTPose();
+    // The searched XY region is a square:
+    const double keptHalfXY = std::max(region.half_xy, gs.icp_basin_xy);
+    const bool outsideKept = std::abs(latestMean.x - keptMean.x) > keptHalfXY ||
+                             std::abs(latestMean.y - keptMean.y) > keptHalfXY ||
+                             std::abs(mrpt::math::wrapToPi(latestMean.yaw - keptMean.yaw)) >
+                               std::max(region.half_yaw, mrpt::DEG2RAD(gs.icp_basin_yaw_deg));
+    if (latestRegion.initial_guesses <= region.initial_guesses || outsideKept) {
+      state_.global_search_prior = latest;
+      region = latestRegion;
+    }
   }
   const auto & prior = *state_.global_search_prior;
-  const auto & cov = prior.cov;
-  const double xySigma = std::sqrt(std::max(cov(0, 0), cov(1, 1)));
-  const double halfXY =
-    std::clamp(gs.sigma_factor * xySigma, gs.min_half_width_xy, gs.max_half_width_xy);
-  const double yawRange =
-    std::max(gs.sigma_factor * std::sqrt(cov(3, 3)), mrpt::DEG2RAD(gs.min_half_width_yaw_deg));
-  const double halfYaw =
-    yawRange > mrpt::DEG2RAD(gs.icp_basin_yaw_deg) ? std::min(yawRange, M_PI) : 0.0;
+  const double halfXY = region.half_xy;
+  const double halfYaw = region.half_yaw;
+
+  // The search can not be interrupted by new scans: do not start one that
+  // would take too long.
+  if (region.initial_guesses > static_cast<size_t>(gs.max_initial_guesses)) {
+    MRPT_LOG_WARN_FMT(
+      "Global search around %s (+-%.2f m, +-%.1f deg) would need %zu initial guesses "
+      "(max_initial_guesses=%d): waiting for a less uncertain state estimator pose.",
+      prior.mean.asString().c_str(), halfXY, mrpt::RAD2DEG(halfYaw), region.initial_guesses,
+      gs.max_initial_guesses);
+    return;
+  }
+  MRPT_LOG_INFO_FMT(
+    "Global search around %s (+-%.2f m, +-%.1f deg): starting, %zu initial guesses...",
+    prior.mean.asString().c_str(), halfXY, mrpt::RAD2DEG(halfYaw), region.initial_guesses);
+
+  // The estimator pose at the time of the searched cloud, to later carry the
+  // found pose over the vehicle motion during the search (the estimator may
+  // forget this time meanwhile):
+  const auto estimatorAtScan =
+    state_.navstate_fuse->estimated_navstate(scan_ref_time, params_.publish_reference_frame);
 
   mola::RelocalizationICP_SE2::Input in;
   in.reference_map = *state_.local_map;
@@ -532,7 +604,26 @@ void LidarOdometry::doGlobalSearchForInitialPose(const mp2p_icp::metric_map_t & 
     }
   }
 
+#if defined(MOLA_RELOCALIZATION_HAS_ABORT)
+  // Stop at shutdown, instead of keeping the process alive until the end.
+  // Not destructor_called_: shutdownCleanup() first waits for the pending
+  // scans, queued behind this one, and only then sets it.
+  in.abort_requested = [this]() { return shutdown_cleanup_done_.load(); };
+#endif
+
   const auto out = mola::RelocalizationICP_SE2::run(in);
+
+#if defined(MOLA_RELOCALIZATION_HAS_ABORT)
+  if (out.aborted) {
+    MRPT_LOG_INFO_FMT("Global search: aborted after %.2f s.", out.time_cost);
+    return;
+  }
+#endif
+
+  // Shutdown may also have started during the last ICP runs: skip refining.
+  if (shutdown_cleanup_done_.load()) {
+    return;
+  }
 
   mola::CandidateSelectionParameters sp;
   sp.same_mode_max_distance = gs.same_mode_max_distance;
@@ -576,15 +667,36 @@ void LidarOdometry::doGlobalSearchForInitialPose(const mp2p_icp::metric_map_t & 
     {mrpt::square(0.1), mrpt::square(0.1), mrpt::square(0.1), mrpt::square(mrpt::DEG2RAD(2.0)),
      mrpt::square(mrpt::DEG2RAD(2.0)), mrpt::square(mrpt::DEG2RAD(2.0))}));
 
-  // The scans that arrived during the search were dropped (drop_stale_scans):
-  // the vehicle is assumed still since this one, and the found pose is given
-  // at the newest sensor time, so the state estimator does not bridge the
-  // search time with a motion model:
+  // The scans that arrived during the search were dropped (drop_stale_scans),
+  // and the found pose is given at the newest sensor time, so the state
+  // estimator does not bridge the search time with a motion model. The
+  // vehicle may have moved meanwhile: add the motion the estimator observed
+  // since the searched scan (its absolute pose is too uncertain, but not its
+  // relative motion), and the next ICP corrects what remains.
   const double newestStamp = std::max(latest_obs_time_.load(), mrpt::Clock::toDouble(now));
-  MRPT_LOG_INFO_STREAM(
-    "Global search: localized at " << found.mean << " (taken as the pose "
-                                   << newestStamp - mrpt::Clock::toDouble(now)
-                                   << " s after its scan, at the end of the search)");
+  const double searchLag = newestStamp - mrpt::Clock::toDouble(scan_ref_time);
+  const auto estimatorAtNewest = state_.navstate_fuse->estimated_navstate(
+    mrpt::Clock::fromDouble(newestStamp), params_.publish_reference_frame);
+  if (estimatorAtScan && estimatorAtNewest) {
+    // Only its planar part, as in the search (the vertical one is the least
+    // reliable without precise GNSS altitude), composed in SE(2) to keep the
+    // found z, pitch and roll:
+    const auto motion =
+      mrpt::poses::CPose2D(estimatorAtNewest->pose.mean - estimatorAtScan->pose.mean);
+    const auto carried = mrpt::poses::CPose2D(found.mean) + motion;
+    MRPT_LOG_INFO_STREAM(
+      "Global search: localized at " << found.mean << " at its scan time; plus the motion "
+                                     << motion << " in the " << searchLag
+                                     << " s until the end of the search");
+    found.mean.x(carried.x());
+    found.mean.y(carried.y());
+    found.mean.setYawPitchRoll(carried.phi(), found.mean.pitch(), found.mean.roll());
+  } else {
+    MRPT_LOG_WARN_STREAM(
+      "Global search: localized at "
+      << found.mean << " (taken as the pose " << searchLag
+      << " s after its scan, at the end of the search: no state estimator motion to add)");
+  }
 
   handleInitialLocalizationDoInitFromPose(found, true, mrpt::Clock::fromDouble(newestStamp));
   state_.global_search_prior.reset();
