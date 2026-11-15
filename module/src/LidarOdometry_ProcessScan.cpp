@@ -338,6 +338,11 @@ void LidarOdometry::applyMapFrameRelevel()
   const auto & b = *pending;
   const ProfilerEntry tle(profiler_, "onLidar.map_frame_relevel");
 
+#if defined(MOLA_LO_HAS_LOCAL_MAP_REBUILD)
+  // The rebuild reference pose is in the old frame:
+  invalidateLocalMapRebuild();
+#endif
+
   // 1/6: the local map contents.
   {
     auto lckMapContents = mrpt::lockHelper(local_map_content_mtx_);
@@ -377,6 +382,14 @@ void LidarOdometry::applyMapFrameRelevel()
   }
   state_.last_deskewed_scan_for_publishing.reset();
 
+#if defined(MOLA_LO_HAS_MP2P_LEARNED_COVARIANCE)
+  // The learned-covariance reference window holds map-frame scan poses too;
+  // it refills from the next accepted scans.
+  if (state_.learned_cov) {
+    state_.learned_cov->clearWindow();
+  }
+#endif
+
   // 5/6: the state estimator, whose stored poses are map-frame too.
   if (state_.navstate_fuse) {
 #if defined(MOLA_KERNEL_NAVSTATE_FILTER_HAS_TRANSFORM_FRAME)
@@ -391,7 +404,7 @@ void LidarOdometry::applyMapFrameRelevel()
       MRPT_LOG_WARN(
         "The state estimator cannot re-express its state in a new frame; "
         "resetting it instead. Expect one scan without a motion model.");
-      state_.navstate_fuse->reset();
+      resetNavState();
       state_.last_motion_model_output.reset();
     }
   }
@@ -945,6 +958,9 @@ void LidarOdometry::processLidarScan(  // NOLINT
   // A bad ICP right after an empty-map start restarts the map from scratch:
   bool restartFromScratch = false;
 
+  // A stall long enough restarts the local map at the current pose:
+  bool recoverFromStallNow = false;
+
 #if defined(MOLA_HAS_SHARED_KEYFRAME_MAP_SINK)
   // Whether this scan's keyframe will be pushed to a central-map backend
   // (e.g. mola_mapper_3d), at the same sparsity as the self-written simplemap
@@ -954,6 +970,9 @@ void LidarOdometry::processLidarScan(  // NOLINT
   std::optional<mola::SharedKeyframeMap::KeyframeInsertRequest> pendingKfReq;
   std::shared_ptr<mola::SharedKeyframeMap> pendingKfSink;
 #endif
+#if defined(MOLA_LO_HAS_LOCAL_MAP_REBUILD)
+  const uint64_t localMapGeneration = local_map_generation_.load();
+#endif
 
   // First time we cannot do ICP since we need at least two pointclouds:
   ASSERT_(state_.local_map);
@@ -962,7 +981,7 @@ void LidarOdometry::processLidarScan(  // NOLINT
   // afterwards, even if localized: the search may take long, and the next scan
   // continues from the found pose.
   if (state_.global_search_prior) {
-    doGlobalSearchForInitialPose(*observation);
+    doGlobalSearchForInitialPose(*observation, scan_ref_time);
     return;
   }
 
@@ -992,6 +1011,20 @@ void LidarOdometry::processLidarScan(  // NOLINT
   // Nor is its prediction used right after a re-localization (see below):
   if (hasMotionModel && state_.step_counter_post_relocalization > 0) {
     hasMotionModel = false;
+  }
+
+  // Nor if it is physically implausible. Registration seeded by a runaway
+  // prediction may follow it where the geometry does not constrain the pose,
+  // and feed it back to the estimator, so the estimator is reset as well:
+  if (hasMotionModel) {
+    const auto & tw = state_.last_motion_model_output->twist;
+    const double speed = std::sqrt(tw.vx * tw.vx + tw.vy * tw.vy + tw.vz * tw.vz);
+    if (!motionModelIsPlausible(mrpt::Clock::toDouble(scan_ref_time), speed)) {
+      hasMotionModel = false;
+      state_.last_motion_model_output.reset();
+      resetNavStateMotion();
+      state_.motion_model_implausible++;
+    }
   }
 
   tleMotion.stop();
@@ -1554,11 +1587,41 @@ void LidarOdometry::processLidarScan(  // NOLINT
     const bool usePrediction = !icpIsGood && hasMotionModel && !restartFromScratch;
     state_.last_pose_from_prediction = usePrediction;
 
+    // Neither registered nor predicted: the pose cannot move. If it persists,
+    // no later scan can register either, so restart the local map here:
+    if (!icpIsGood && !usePrediction && !restartFromScratch) {
+      state_.consecutive_stalled_scans++;
+    } else {
+      state_.consecutive_stalled_scans = 0;
+    }
+    recoverFromStallNow =
+      params_.stall_recovery.enabled &&
+      state_.consecutive_stalled_scans >= params_.stall_recovery.after_n_scans &&
+      params_.local_map_updates.enabled && !state_.map_has_been_loaded;
+
     if (icpIsGood) {
       state_.last_lidar_pose = out.found_pose_to_wrt_from;
+      state_.last_lidar_pose_stamp = mrpt::Clock::toDouble(scan_ref_time);
     } else if (usePrediction) {
       state_.last_lidar_pose.copyFrom(state_.last_motion_model_output->pose);
+      state_.last_lidar_pose_stamp = mrpt::Clock::toDouble(scan_ref_time);
     }
+
+    // Learned covariance of this registration, if enabled: queued before the
+    // scan joins the window, so it is evaluated against the previous scans.
+    std::optional<std::shared_future<mrpt::math::CMatrixDouble66>> learnedCov;
+#if defined(MOLA_LO_HAS_MP2P_LEARNED_COVARIANCE)
+    if (state_.learned_cov) {
+      ProfilerEntry tle_lc(profiler_, "onLidar.3b.learned_covariance_submit");
+      if (icpIsGood) {
+        learnedCov =
+          submitLearnedCovariance(*observation, in, icp_result, out.found_pose_to_wrt_from);
+      }
+      if (icpIsGood || usePrediction) {
+        pushLearnedCovarianceWindow(*observation, state_.last_lidar_pose.mean);
+      }
+    }
+#endif
 
     // Update velocity model:
     // Snapshot before it gets decremented below, so the map-freeze check
@@ -1579,8 +1642,23 @@ void LidarOdometry::processLidarScan(  // NOLINT
         state_.step_counter_post_relocalization == 0 ||
         (state_.step_counter_post_relocalization == 1 && relocWindow > 1)) {
         // Do integrate info:
-        state_.navstate_fuse->fuse_pose(
-          scan_ref_time, out.found_pose_to_wrt_from, params_.publish_reference_frame);
+        if (learnedCov) {
+#if defined(MOLA_KERNEL_NAVSTATE_FILTER_HAS_FUSE_POSE_DEFERRED)
+          state_.navstate_fuse->fuse_pose_deferred(
+            scan_ref_time, out.found_pose_to_wrt_from.mean, *learnedCov,
+            params_.publish_reference_frame);
+#else
+          // An older mola_kernel: wait for the covariance here.
+          state_.navstate_fuse->fuse_pose(
+            scan_ref_time,
+            mrpt::poses::CPose3DPDFGaussian(out.found_pose_to_wrt_from.mean, learnedCov->get()),
+            params_.publish_reference_frame);
+#endif
+        } else {
+          state_.navstate_fuse->fuse_pose(
+            scan_ref_time, out.found_pose_to_wrt_from, params_.publish_reference_frame);
+        }
+        state_.last_fused_scan_ref_time = scan_ref_time;
       }
       if (state_.step_counter_post_relocalization > 0) {
         state_.step_counter_post_relocalization--;
@@ -1849,9 +1927,37 @@ void LidarOdometry::processLidarScan(  // NOLINT
     updateLocalMap = false;
   }
 
+  if (recoverFromStallNow) {
+    recoverFromStall();
+    updateLocalMap = false;
+    updateSimpleMap = false;
+  }
+
   // Stage 3: a new keyframe into the local map:
   if (updateLocalMap) {
     insertScanIntoLocalMap(sf, *observation, scan_ref_time);
+
+#if defined(MOLA_LO_HAS_LOCAL_MAP_REBUILD)
+    // Kept to insert it again into a rebuilt local map:
+    if (local_map_correction_source_) {
+      MethodState::LocalMapInsertion ins;
+      ins.stamp = scan_ref_time;
+      ins.robot_pose = state_.last_lidar_pose.mean;
+      ins.sensor_pose = obs->getSensorPose();
+      ins.obs_timestamp = mrpt::Clock::toDouble(obs->timestamp);
+      ins.observation = *observation;  // shallow copy of the layers
+      // Without what the scan does not keep after its ICP (e.g. full clouds):
+      mp2p_icp_filters::apply_filter_pipeline(state_.pc_filter3, ins.observation);
+      auto & q = state_.recent_local_map_insertions;
+      q.push_back(std::move(ins));
+      // Bounded, in case the central map stops accepting keyframes. Dropping
+      // one that a rebuild needs would leave a gap in it: no rebuild then.
+      constexpr std::size_t MAX_RECENT_INSERTIONS = 1000;
+      if (q.size() > MAX_RECENT_INSERTIONS) {
+        invalidateLocalMapRebuild();
+      }
+    }
+#endif
   }
 
   // Stage 4: optional simplemap, and shared keyframe map:
@@ -1899,7 +2005,17 @@ void LidarOdometry::processLidarScan(  // NOLINT
     updateStatusSnapshot();
     lckState.unlock();
     try {
-      pendingKfSink->requestInsertKeyframe(*pendingKfReq);
+      const auto kfId = pendingKfSink->requestInsertKeyframe(*pendingKfReq);
+#if defined(MOLA_LO_HAS_LOCAL_MAP_REBUILD)
+      if (kfId && local_map_correction_source_) {
+        lckState.lock();
+        onKeyframePushed(
+          *kfId, pendingKfReq->timestamp, pendingKfReq->pose_in_source.mean, localMapGeneration);
+        lckState.unlock();
+      }
+#else
+      (void)kfId;
+#endif
     } catch (const std::exception & e) {
       MRPT_LOG_WARN_STREAM(
         "shared keyframe map push failed at t="
@@ -2053,6 +2169,7 @@ void LidarOdometry::startMapAtFirstScan(
   // "empty" (an empty decider asks for a keyframe at every pose, which would
   // spuriously fire a second keyframe on the very next scan):
   state_.last_lidar_pose = initPose;
+  state_.last_lidar_pose_stamp = mrpt::Clock::toDouble(scan_ref_time);
   if (!state_.kf_decider_simplemap) {
     state_.kf_decider_simplemap.emplace(params_.simplemap);
   }
@@ -2065,6 +2182,9 @@ void LidarOdometry::startMapAtFirstScan(
 
 void LidarOdometry::restartLocalMapFromScratch()
 {
+#if defined(MOLA_LO_HAS_LOCAL_MAP_REBUILD)
+  invalidateLocalMapRebuild();
+#endif
   // Re-start the local map:
   {
     auto lckMapContents = mrpt::lockHelper(local_map_content_mtx_);
@@ -2087,6 +2207,140 @@ void LidarOdometry::restartLocalMapFromScratch()
   }
 
   MRPT_LOG_WARN("Bad first ICP, re-starting from scratch with a new local map");
+}
+
+bool LidarOdometry::motionModelIsPlausible(const double scanTime, const double predictedSpeed)
+{
+  const auto prev = state_.last_motion_model_speed;
+  state_.last_motion_model_speed = {scanTime, predictedSpeed};
+
+  const double margin = params_.motion_model_max_extra_acceleration;
+  if (margin <= 0 || !prev) {
+    return true;
+  }
+  const double dt = scanTime - prev->first;
+  constexpr double MAX_DT = 1.0;  // [s] older predictions are not comparable
+  if (dt <= 0 || dt > MAX_DT) {
+    return true;
+  }
+
+  // A newly started estimator is still converging to the actual velocity:
+  constexpr double SETTLING_TIME = 1.0;  // [s]
+  if (!state_.state_estimator_start_stamp) {
+    state_.state_estimator_start_stamp = scanTime;
+  }
+  if (scanTime - *state_.state_estimator_start_stamp < SETTLING_TIME) {
+    return true;
+  }
+
+  // Velocity change measured by the IMU in the interval: its specific forces,
+  // rotated with the attitude of the last odometry pose, plus gravity. The
+  // attitude comes from the odometry, not from the estimator under test.
+  const auto & lastPose = state_.last_lidar_pose.mean;
+  constexpr double GRAVITY = 9.81;  // [m/s^2]
+  mrpt::math::TVector3D dv(0, 0, 0);
+  size_t nInInterval = 0;
+  {
+    auto lckImu = mrpt::lockHelper(imu_state_mtx_);
+    const auto & buf = state_.recent_specific_force;
+    // Some drivers report accelerations in units of g:
+    double sumNorms = 0;
+    for (const auto & s : buf) {
+      sumNorms += s.f.norm();
+    }
+    constexpr double MAX_MEAN_NORM_IN_G_UNITS = 3.0;
+    const double scale =
+      (!buf.empty() && sumNorms / static_cast<double>(buf.size()) < MAX_MEAN_NORM_IN_G_UNITS)
+        ? GRAVITY
+        : 1.0;
+    double tLast = prev->first;
+    for (const auto & s : buf) {
+      if (s.stamp <= prev->first || s.stamp > scanTime) {
+        continue;
+      }
+      const double h = s.stamp - tLast;
+      tLast = s.stamp;
+      mrpt::math::TVector3D aWorld = lastPose.rotateVector(s.f * scale - s.acc_bias);
+      aWorld.z -= GRAVITY;
+      dv += aWorld * h;
+      nInInterval++;
+    }
+  }
+  if (nInInterval == 0) {
+    return true;  // no IMU readings to compare with
+  }
+
+  // The speed cannot change more than the velocity does:
+  const double speedChange = std::abs(predictedSpeed - prev->second);
+  const double allowed = dv.norm() + margin * dt;
+  if (speedChange <= allowed) {
+    return true;
+  }
+
+  MRPT_LOG_WARN_FMT(
+    "Not using the state estimator prediction, and resetting it: its speed changed by %.2f m/s "
+    "(%.2f -> %.2f m/s) in %.3f s, but the IMU measured a velocity change of %.2f m/s (margin "
+    "%.1f m/s^2)",
+    speedChange, prev->second, predictedSpeed, dt, dv.norm(), margin);
+  state_.last_motion_model_speed.reset();
+  state_.state_estimator_start_stamp = scanTime;
+  return false;
+}
+
+void LidarOdometry::resetNavStateMotion()
+{
+#if defined(MOLA_KERNEL_NAVSTATE_FILTER_HAS_RESET_MOTION)
+  state_.navstate_fuse->reset_motion();
+#else
+  state_.navstate_fuse->reset();
+#endif
+}
+
+void LidarOdometry::resetNavState()
+{
+  state_.navstate_fuse->reset();
+  // Its twist at an earlier fused scan is no longer available:
+  state_.last_fused_scan_ref_time.reset();
+  restartPlausibilityCheck();
+}
+
+void LidarOdometry::restartPlausibilityCheck()
+{
+  // A fresh estimator settles again, and its first prediction has no previous
+  // one to be compared with:
+  state_.last_motion_model_speed.reset();
+  state_.state_estimator_start_stamp.reset();
+}
+
+void LidarOdometry::recoverFromStall()
+{
+  MRPT_LOG_WARN_FMT(
+    "Registration stalled for %u scans without a usable prediction: restarting the local map "
+    "at the last pose and resetting the state estimator",
+    state_.consecutive_stalled_scans);
+
+#if defined(MOLA_LO_HAS_LOCAL_MAP_REBUILD)
+  invalidateLocalMapRebuild();
+#endif
+  {
+    auto lckMapContents = mrpt::lockHelper(local_map_content_mtx_);
+    state_.local_map->clear();
+  }
+  // The next scan starts the new map at this pose, as a first scan does. The
+  // trajectory is kept:
+  state_.initial_pose = state_.last_lidar_pose.mean;
+  state_.kf_decider_local_map.reset();
+
+  // The estimator may hold a diverged state. The trajectory goes on in the
+  // same frame, so an estimator that can keep its frames does:
+  resetNavStateMotion();
+  restartPlausibilityCheck();
+
+  // The matching threshold restarts as at the beginning of a run:
+  state_.adapt_thres_sigma = 0;
+  state_.consecutive_bad_icps = 0;
+  state_.consecutive_stalled_scans = 0;
+  state_.stall_recoveries++;
 }
 
 void LidarOdometry::insertScanIntoLocalMap(
@@ -2244,28 +2498,98 @@ mp2p_icp::metric_map_t::Ptr LidarOdometry::observationFromRawSensor(
     {
       // Shares obs_generators (and, through them, the localVelocityBuffer whose
       // reference-zero time they set) with the IMU thread's own
-      // apply_generators() call, plus the realize() flags that thread reads:
+      // apply_generators() call:
       auto lckImu = mrpt::lockHelper(imu_state_mtx_);
 
       mp2p_icp_filters::apply_generators(state_.obs_generators, *o, *obsTrg);
-
-      // Update relative timestamps for multiple lidars:
-      const double dt = mrpt::system::timeDifference(timeOfFirstSFObs, o->timestamp);
-
-      state_.parameter_source.updateVariable("SENSOR_TIME_OFFSET", dt);
-      // Make all changes effective and evaluate the variables now:
-      state_.parameter_source.realize();
     }
 
-    mp2p_icp_filters::apply_filter_pipeline(state_.pc_filterAdjustTimes, *obsTrg, profiler_);
+    // Before any use of its per-point times (time adjustment, merging):
+    ProfilerEntry tlePto(profiler_, "onLidar.0.point_time_outliers");
+    const auto pto = rejectPointTimeOutliers(*o, *obsTrg);
+    tlePto.stop();
+    if (pto.rejected > 0) {
+      state_.point_time_outlier_scans++;
+      state_.point_time_outlier_points += pto.rejected;
+    }
 
     // for multiple LiDAR setups:
     if (obsTrg != observation.get()) {
-      observation->merge_with(*obsTrg);
+      // Make per-point times relative to the first observation's stamp:
+      shiftPointTimes(thisObs, mrpt::system::timeDifference(timeOfFirstSFObs, o->timestamp));
+      observation->merge_with(thisObs);
     }
   }
+
+  if (sf.size() > 1) {
+    // Generators set the reference time to each observation's stamp: restore
+    // the common one the merged per-point times are now relative to.
+    auto lckImu = mrpt::lockHelper(imu_state_mtx_);
+    state_.parameter_source.localVelocityBuffer.set_reference_zero_time(
+      mrpt::Clock::toDouble(timeOfFirstSFObs));
+  }
+
+  // Adjust all points at once, so they share one time reference:
+  mp2p_icp_filters::apply_filter_pipeline(state_.pc_filterAdjustTimes, *observation, profiler_);
+
   tle0.stop();
   return observation;
+}
+
+PointTimeOutlierFilter::Result LidarOdometry::rejectPointTimeOutliers(
+  const mrpt::obs::CObservation & o, mp2p_icp::metric_map_t & m)
+{
+  if (!params_.point_time_outliers.enabled) {
+    return {};
+  }
+  auto it = state_.point_time_filters.find(o.sensorLabel);
+  if (it == state_.point_time_filters.end()) {
+    it = state_.point_time_filters
+           .emplace(o.sensorLabel, PointTimeOutlierFilter(params_.point_time_outliers))
+           .first;
+  }
+  const auto r = it->second.process(pointCloudLayers(m), mrpt::Clock::toDouble(o.timestamp));
+  if (r.rejected > 0 && r.accepted) {
+    MRPT_LOG_THROTTLE_WARN_FMT(
+      2.0,
+      "Point time outliers: dropped %zu of %zu points of a '%s' scan, whose per-point times "
+      "span [%.3f, %.3f] s while the accepted range is [%.3f, %.3f] s (a jump of the sensor "
+      "clock?)",
+      r.rejected, r.points, o.sensorLabel.c_str(), r.scan_min, r.scan_max, r.accepted->first,
+      r.accepted->second);
+  }
+  return r;
+}
+
+std::vector<mrpt::maps::CPointsMap *> LidarOdometry::pointCloudLayers(mp2p_icp::metric_map_t & m)
+{
+  std::vector<mrpt::maps::CPointsMap *> clouds;
+  for (auto & [name, layer] : m.layers) {
+    if (auto * pts = mp2p_icp::MapToPointsMap(*layer); pts != nullptr) {
+      clouds.push_back(pts);
+    }
+  }
+  return clouds;
+}
+
+void LidarOdometry::shiftPointTimes(mp2p_icp::metric_map_t & m, const double dt)
+{
+  if (dt == 0) {
+    return;
+  }
+  for (auto & [name, layer] : m.layers) {
+    auto * pts = mp2p_icp::MapToPointsMap(*layer);
+    if (pts == nullptr) {
+      continue;
+    }
+    auto * Ts = pts->getPointsBufferRef_float_field("t");
+    if (Ts == nullptr) {
+      continue;
+    }
+    for (auto & t : *Ts) {
+      t += static_cast<float>(dt);
+    }
+  }
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
@@ -2422,11 +2746,18 @@ void LidarOdometry::appendKeyframeMetadataObs(
   }
 
   // Store local velocity buffer in the KF metadata so it is possible to deskew
-  // the scan later on with precision.
-  kf_metadata["local_velocity_buffer"] = [this]() {
+  // the scan later on with precision, and the twist used for the de-skew:
+  {
     auto lckImu = mrpt::lockHelper(imu_state_mtx_);
-    return state_.parameter_source.localVelocityBuffer.toYAML();
-  }();
+    kf_metadata["local_velocity_buffer"] = state_.parameter_source.localVelocityBuffer.toYAML();
+    const auto & vars = state_.parameter_source.getVariableValues();
+    auto twist = mrpt::containers::yaml::Sequence();
+    for (const char * name : {"vx", "vy", "vz", "wx", "wy", "wz"}) {
+      const auto it = vars.find(name);
+      twist.asSequence().emplace_back(it != vars.end() ? it->second : 0.0);
+    }
+    kf_metadata["deskew_twist"] = twist;
+  }
 
 #if defined(MOLA_LO_HAS_MAP_GRAVITY_ESTIMATOR)
   // A map-frame gauge change makes the keyframe poses of this run
@@ -2475,61 +2806,33 @@ void LidarOdometry::doUpdateSimpleMap(
       keyframe_obs->insert(od);
     }
 
-    const auto curLidarStamp = scan_ref_time;
-
-    // insert GNSS too? Search for a close-enough observation:
-    std::optional<double> closestTimeAbsDiff;
-    mrpt::obs::CObservationGPS::ConstPtr closestGPS;
-
-    {
-      // Appended to by the sensor-input thread:
-      auto lckImu = mrpt::lockHelper(imu_state_mtx_);
-
-      for (const auto & [gpsStamp, gpsObs] : state_.last_gnss_) {
-        const double timeDiff = std::abs(mrpt::system::timeDifference(gpsStamp, curLidarStamp));
-
-        if (timeDiff > params_.simplemap.save_gnss_max_age) {
-          continue;
-        }
-
-        if (!closestTimeAbsDiff || timeDiff < *closestTimeAbsDiff) {
-          closestTimeAbsDiff = timeDiff;
-          closestGPS = gpsObs;
-        }
-      }
-    }
-    if (closestGPS) {
-      *keyframe_obs += std::const_pointer_cast<mrpt::obs::CObservationGPS>(closestGPS);
-    }
-
-    // insert IMU too? Same search as for GNSS above. Worth storing even
-    // though the live run has already consumed the reading: the IMU absolute
+    // Observations of other sensors, the one closest in time from each source
+    // (GNSS, IMU, simplemap.attach_observations). The IMU is worth storing even
+    // though the live run has already consumed the reading: its absolute
     // attitude is the only azimuth observation that offline georeferencing of
     // this simplemap can use, and it cannot be recovered from anything else
     // saved here.
-    if (params_.simplemap.save_imu_max_age > 0) {
-      std::optional<double> closestImuTimeAbsDiff;
-      mrpt::obs::CObservationIMU::ConstPtr closestIMU;
-
-      {
-        auto lckImu = mrpt::lockHelper(imu_state_mtx_);
-
-        for (const auto & [imuStamp, imuObs] : state_.last_imu_) {
-          const double timeDiff = std::abs(mrpt::system::timeDifference(imuStamp, curLidarStamp));
-
-          if (timeDiff > params_.simplemap.save_imu_max_age) {
-            continue;
-          }
-
-          if (!closestImuTimeAbsDiff || timeDiff < *closestImuTimeAbsDiff) {
-            closestImuTimeAbsDiff = timeDiff;
-            closestIMU = imuObs;
+    std::vector<mrpt::obs::CObservation::ConstPtr> attached;
+    {
+      // Appended to by the sensor-input thread:
+      auto lckImu = mrpt::lockHelper(imu_state_mtx_);
+      for (auto & src : state_.attach_sources) {
+        for (auto & [label, buffer] : src.buffers) {
+          if (auto o = buffer.take_closest(scan_ref_time); o) {
+            attached.push_back(o);
           }
         }
       }
-
-      if (closestIMU) {
-        *keyframe_obs += std::const_pointer_cast<mrpt::obs::CObservationIMU>(closestIMU);
+    }
+    for (std::size_t i = 0; i < attached.size(); i++) {
+      const auto & o = attached[i];
+      // The same observation may match more than one source, or be in `sf`:
+      const bool dup =
+        std::find(attached.begin(), attached.begin() + static_cast<std::ptrdiff_t>(i), o) !=
+          attached.begin() + static_cast<std::ptrdiff_t>(i) ||
+        std::any_of(sf.begin(), sf.end(), [&](const auto & e) { return e == o; });
+      if (!dup) {
+        keyframe_obs->insert(keyframeObservation(o));
       }
     }
   } else {

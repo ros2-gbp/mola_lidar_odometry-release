@@ -5,7 +5,7 @@
 -->
 <package format="3">
   <name>mola_lidar_odometry</name>
-  <version>3.4.0</version>
+  <version>3.5.0</version>
   <description>LIDAR odometry system based on MOLA and MRPT components</description>
 
   <maintainer email="joseluisblancoc@gmail.com">Jose-Luis Blanco-Claraco</maintainer>
@@ -63,13 +63,13 @@
   <depend>mola_state_estimation_simple</depend>
   <!-- for it to be selectable via the cli's state estimator flag -->
   <depend>mola_state_estimation_smoother</depend>
-  <depend>mola_imu_preintegration</depend>
+  <depend version_gte="3.1.0">mola_imu_preintegration</depend> <!-- ImuTransformer with accel_scale and rate-aware filters -->
 
   <!-- Needed by the mola-lo-* scripts: -->
   <exec_depend>mola_launcher</exec_depend>
   <exec_depend>mola_viz</exec_depend>
   <exec_depend>mola_viz_imgui</exec_depend>
-  <exec_depend>mola_bridge_ros2</exec_depend>
+  <exec_depend version_gte="3.4.1">mola_bridge_ros2</exec_depend> <!-- Image input, for camera_topic_name -->
   <exec_depend>mola_metric_maps</exec_depend> <!-- the 3D pipelines load its map classes at runtime -->
 
   <!-- Test datasets to run on them: -->
@@ -80,6 +80,7 @@
   <!-- For the ROS 2 launch integration test: -->
   <test_depend>launch_testing_ament_cmake</test_depend>
   <test_depend>launch_testing_ros</test_depend>
+  <test_depend>rosbag2_interfaces</test_depend>
   <test_depend>ros2bag</test_depend>
   <test_depend>rclpy</test_depend>
   <test_depend>sensor_msgs</test_depend>
