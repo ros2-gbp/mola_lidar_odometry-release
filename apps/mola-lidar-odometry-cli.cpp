@@ -25,15 +25,19 @@
 #include <mola_kernel/interfaces/OfflineDatasetSource.h>
 #include <mola_kernel/interfaces/RawDataConsumer.h>
 #include <mola_kernel/pretty_print_exception.h>
+#include <mola_lidar_odometry/GravityLeveler.h>
 #include <mola_lidar_odometry/LidarOdometry.h>
 #include <mola_yaml/yaml_helpers.h>
+#include <mp2p_icp/metricmap.h>
 #include <mrpt/core/Clock.h>
+#include <mrpt/core/bits_math.h>
 #include <mrpt/core/exceptions.h>
 #include <mrpt/core/get_env.h>
 #include <mrpt/obs/CObservation2DRangeScan.h>
 #include <mrpt/obs/CObservation3DRangeScan.h>
 #include <mrpt/obs/CObservationGPS.h>
 #include <mrpt/obs/CObservationIMU.h>
+#include <mrpt/obs/CObservationImage.h>
 #include <mrpt/obs/CObservationOdometry.h>
 #include <mrpt/obs/CObservationPointCloud.h>
 #include <mrpt/obs/CObservationRobotPose.h>
@@ -48,6 +52,7 @@
 #include <mrpt/system/progress.h>
 #include <mrpt/system/string_utils.h>
 
+#include <cmath>
 #include <memory>
 
 #if defined(HAVE_MOLA_SE_SIMPLE)
@@ -96,6 +101,7 @@
 #include <cstdlib>
 #include <deque>
 #include <exception>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <mutex>
@@ -216,9 +222,14 @@ struct Cli
   Opt<std::string> arg_outPath;
   Opt<std::string> arg_outPathFused;
   Opt<std::string> arg_outPathSmoothed;
+  Opt<std::string> arg_outEstimatorFrame;
+  Opt<bool> arg_levelFused;
+  Opt<double> arg_levelFusedDeadband;
+  Opt<double> arg_levelFusedRandomWalk;
   Opt<std::string> arg_moduleAttitudeLabel;
   Opt<std::string> arg_outTwist;
   Opt<std::string> arg_outSimpleMap;
+  Opt<std::string> arg_outGeoRef;
   Opt<int> arg_firstN;
   Opt<int> arg_skipFirstN;
   Opt<std::string> arg_lidarLabel;
@@ -338,6 +349,38 @@ struct Cli
           "carry a second front-end's contribution only through the motion prior.")
         ->option_text("output-fused.txt");
 
+    arg_outEstimatorFrame.opt =
+      cmd
+        .add_option(
+          "--output-estimator-frame", arg_outEstimatorFrame.value,
+          "Frame in which --output-tum-path-fused and --output-tum-path-smoothed sample the "
+          "state estimator (default: the odometry's publish_reference_frame). The odometry "
+          "frame is anchored on the odometry's own poses; the estimator's reference frame "
+          "(e.g. 'map') gives its own estimate.")
+        ->option_text("map");
+
+    arg_levelFused.opt = cmd.add_flag(
+      "--output-fused-gravity-leveled", arg_levelFused.value,
+      "Level the trajectory saved by --output-tum-path-fused with the IMU's gravity reading "
+      "(mola::GravityLeveler): a causal correction of the frame tilt that only changes what is "
+      "written out, never the odometry or the estimator.");
+
+    arg_levelFusedDeadband.value = mola::GravityLeveler::Parameters{}.deadband;
+    arg_levelFusedDeadband.opt =
+      cmd
+        .add_option(
+          "--output-fused-gravity-leveled-deadband", arg_levelFusedDeadband.value,
+          "Tilt [deg] that --output-fused-gravity-leveled leaves uncorrected.")
+        ->option_text(std::to_string(arg_levelFusedDeadband.value));
+
+    arg_levelFusedRandomWalk.value = mola::GravityLeveler::Parameters{}.tilt_random_walk;
+    arg_levelFusedRandomWalk.opt =
+      cmd
+        .add_option(
+          "--output-fused-gravity-leveled-random-walk", arg_levelFusedRandomWalk.value,
+          "Random walk of the frame tilt [deg/sqrt(s)] assumed by --output-fused-gravity-leveled.")
+        ->option_text(std::to_string(arg_levelFusedRandomWalk.value));
+
     arg_outPathSmoothed.opt =
       cmd
         .add_option(
@@ -352,6 +395,16 @@ struct Cli
       cmd
         .add_option("--output-twist", arg_outTwist.value, "Save the estimated twist as a TXT file")
         ->option_text("output-twist.txt");
+
+    arg_outGeoRef.opt =
+      cmd
+        .add_option(
+          "--output-georef", arg_outGeoRef.value,
+          "Save the state estimator's final geo-reference (datum + T_enu_to_map), fixed or "
+          "estimated from GNSS, as YAML in the mp2p_icp georeferencing format. Needs an "
+          "estimator implementing NavStateFilter::get_geo_reference(). Use "
+          "--output-estimator-frame enu to save the trajectories in that ENU frame.")
+        ->option_text("output.georef.yaml");
 
     arg_outSimpleMap.opt = cmd
                              .add_option(
@@ -577,7 +630,8 @@ std::vector<std::string> lidar_sensor_labels(const std::string & labels)
   return out;
 }
 
-std::string lidar_sensor_entries(const std::string & labels)
+// withTimeOffset: only the ROS 1 bag reader supports a per-sensor time_offset.
+std::string lidar_sensor_entries(const std::string & labels, bool withTimeOffset = false)
 {
   std::string s;
   for (const auto & p : lidar_sensor_labels(labels)) {
@@ -591,6 +645,9 @@ std::string lidar_sensor_entries(const std::string & labels)
       "${LIDAR_POSE_Z|0} ${LIDAR_POSE_YAW|0} ${LIDAR_POSE_PITCH|0} "
       "${LIDAR_POSE_ROLL|0}\"  # 'x y z yaw_deg pitch_deg roll_deg'";
     s += "\n          use_fixed_sensor_pose: ${MOLA_USE_FIXED_LIDAR_POSE|false}";
+    if (withTimeOffset) {
+      s += "\n          time_offset: ${MOLA_LIDAR_TIME_OFFSET|0.0}";
+    }
   }
   return s;
 }
@@ -675,6 +732,10 @@ std::shared_ptr<mola::OfflineDatasetSource> dataset_from_rosbag2(
           is_optional: true
         - topic: ${MOLA_CAMERA_TOPIC_1|''}
           sensorLabel: ${MOLA_CAMERA_LABEL_1|image_1}
+          type: CObservationImage
+          is_optional: true
+        - topic: ${MOLA_CAMERA_TOPIC_2|''}
+          sensorLabel: ${MOLA_CAMERA_LABEL_2|image_2}
           type: CObservationImage
           is_optional: true
 )"""",
@@ -786,9 +847,13 @@ std::shared_ptr<mola::OfflineDatasetSource> dataset_from_rosbag1(
           sensorLabel: ${MOLA_CAMERA_LABEL_1|image_1}
           type: CObservationImage
           is_optional: true
+        - topic: ${MOLA_CAMERA_TOPIC_2|''}
+          sensorLabel: ${MOLA_CAMERA_LABEL_2|image_2}
+          type: CObservationImage
+          is_optional: true
 )"""",
     bagsYaml.c_str(), cli.arg_baseLinkName.getValue().c_str(),
-    lidar_sensor_entries(cli.arg_lidarLabel.getValue()).c_str(),
+    lidar_sensor_entries(cli.arg_lidarLabel.getValue(), true).c_str(),
     cli.arg_imuLabel.getValue().c_str())));
 
   o->initialize(cfg);
@@ -1101,6 +1166,8 @@ int main_odometry(Cli & cli)
   // what --output-tum-path writes: a second front-end reaches those only
   // through the motion prior, so its contribution is largely invisible there.
   std::optional<mrpt::poses::CPose3DInterpolator> outFusedPath;
+  std::optional<mrpt::Clock::time_point> lastFusedSampleStamp;
+  std::optional<mola::GravityLeveler> fusedLeveler;
 
   bool liodom_emitted_log = false;
   std::mutex liodom_emitted_log_mtx;
@@ -1137,11 +1204,30 @@ int main_odometry(Cli & cli)
   // liodom->initialize_common(cfg); // can be skipped for a non-MOLA system
   liodom->initialize(cfg);
 
+  // Resolved after initialize(), which loads publish_reference_frame:
+  const std::string estimatorOutFrame = cli.arg_outEstimatorFrame.isSet()
+                                          ? cli.arg_outEstimatorFrame.getValue()
+                                          : liodom->params_.publish_reference_frame;
+
   if (cli.arg_outPathFused.isSet()) {
     ASSERTMSG_(
       stateEstimatorAsNavState,
       "--output-tum-path-fused needs a state estimator implementing mola::NavStateFilter");
     outFusedPath.emplace();
+  }
+  if (cli.arg_levelFused.isSet()) {
+    ASSERTMSG_(
+      cli.arg_outPathFused.isSet(), "--output-fused-gravity-leveled needs --output-tum-path-fused");
+    mola::GravityLeveler::Parameters lp;
+    lp.deadband = cli.arg_levelFusedDeadband.getValue();
+    lp.tilt_random_walk = cli.arg_levelFusedRandomWalk.getValue();
+    fusedLeveler.emplace(lp);
+  }
+
+  if (cli.arg_outGeoRef.isSet()) {
+    ASSERTMSG_(
+      stateEstimatorAsNavState,
+      "--output-georef needs a state estimator implementing mola::NavStateFilter");
   }
 
   if (cli.arg_outSimpleMap.isSet()) {
@@ -1153,11 +1239,12 @@ int main_odometry(Cli & cli)
     // Lazy-load scan files are written next to save_final_map_to_file, which
     // was just cleared, so the module silently keeps every scan in RAM:
     if (liodom->params_.simplemap.generate_lazy_load_scan_files) {
-      std::cerr << "[mola-lidar-odometry-cli] Warning: lazy-load simplemap generation "
-                   "(MOLA_SIMPLEMAP_GENERATE_LAZY_LOAD) is ignored with --output-simplemap: all "
-                   "scans are kept in RAM and saved inside the .simplemap. Use "
-                   "MOLA_GENERATE_SIMPLEMAP=true and MOLA_SIMPLEMAP_OUTPUT=<file> instead."
-                << std::endl;  // NOLINT(performance-avoid-endl)
+      std::cerr
+        << "[mola-lidar-odometry-cli] Warning: lazy-load simplemap generation "
+           "(MOLA_SIMPLEMAP_GENERATE_LAZY_LOAD) is ignored with --output-simplemap: all "
+           "scans (and keyframe images) are kept in RAM and saved inside the .simplemap. Use "
+           "MOLA_GENERATE_SIMPLEMAP=true and MOLA_SIMPLEMAP_OUTPUT=<file> instead."
+        << std::endl;  // NOLINT(performance-avoid-endl)
     }
   }
 
@@ -1249,7 +1336,10 @@ int main_odometry(Cli & cli)
 
     std::cout << "Ground truth available. Saving it to: " << gtOutFile << "\n";
 
-    gtPath.saveToTextFile_TUM(gtOutFile);
+    // Written before the run: an unwritable output directory fails here, not
+    // after the whole dataset has been processed.
+    ASSERTMSG_(
+      gtPath.saveToTextFile_TUM(gtOutFile), "Cannot write the ground truth to: " + gtOutFile);
   }
 
   const double tStart = mrpt::Clock::nowDouble();
@@ -1266,6 +1356,16 @@ int main_odometry(Cli & cli)
   }
 
   mrpt::keep_min(lastDatasetEntry, dataset->datasetSize());
+
+  // A skip past the end would otherwise run zero steps and exit successfully
+  // with an empty trajectory.
+  if (cli.arg_skipFirstN.isSet()) {
+    ASSERTMSG_(
+      firstDatasetEntry < dataset->datasetSize(),
+      mrpt::format(
+        "--skip-first-n=%zu is not below the dataset size (%zu entries)", firstDatasetEntry,
+        dataset->datasetSize()));
+  }
 
   // Progress bar verbosity: unset => print on (almost) every entry (legacy
   // behavior); 0 => fully disabled; >0 => only every that many percent
@@ -1324,6 +1424,36 @@ int main_odometry(Cli & cli)
     for (auto * consumer : extraModulesAsRawConsumers) {
       for (const auto & anyObs : *sf) {
         consumer->onNewObservation(anyObs);
+      }
+    }
+
+    // Accelerometer readings for the fused-path leveling, in the vehicle frame:
+    if (fusedLeveler) {
+      for (const auto & anyObs : *sf) {
+        const auto imu = std::dynamic_pointer_cast<CObservationIMU>(anyObs);
+        if (
+          !imu || !imu->has(mrpt::obs::IMU_X_ACC) || !imu->has(mrpt::obs::IMU_Y_ACC) ||
+          !imu->has(mrpt::obs::IMU_Z_ACC)) {
+          continue;
+        }
+        const auto & lbl = liodom->params_.imu_sensor_label;
+        if (lbl && !std::regex_match(imu->sensorLabel, *lbl)) {
+          continue;
+        }
+        const mrpt::math::TVector3D f(
+          imu->get(mrpt::obs::IMU_X_ACC), imu->get(mrpt::obs::IMU_Y_ACC),
+          imu->get(mrpt::obs::IMU_Z_ACC));
+        fusedLeveler->add_imu(
+          mrpt::Clock::toDouble(imu->timestamp), imu->sensorPose.rotateVector(f));
+      }
+    }
+
+    // Camera images, only for simplemap keyframes (simplemap.attach_observations):
+    if (!liodom->params_.simplemap.attach_observations.empty()) {
+      for (const auto & anyObs : *sf) {
+        if (std::dynamic_pointer_cast<mrpt::obs::CObservationImage>(anyObs)) {
+          liodom->onNewObservation(anyObs);
+        }
       }
     }
 
@@ -1432,12 +1562,28 @@ int main_odometry(Cli & cli)
     }
 
     // Sample the fused estimate for this scan, now that the worker is done and
-    // whatever the other front-ends contributed is already in the graph:
+    // whatever the other front-ends contributed is already in the graph. It is
+    // sampled at the stamp of the newest registered pose (the scan's reference
+    // time, which may differ from the observation stamp), so that it is the
+    // estimator's solved state and not an extrapolation from it:
     if (outFusedPath && obsIsLidarScan) {
-      const auto st = stateEstimatorAsNavState->estimated_navstate(
-        obs->timestamp, liodom->params_.publish_reference_frame);
-      if (st.has_value()) {
-        outFusedPath->insert(obs->timestamp, st->pose.mean.asTPose());
+      // Some estimators advance their own state on a query (e.g. fusing the
+      // buffered IMU readings up to the queried time), so the query at the
+      // observation stamp is kept: without it the run would change, not only
+      // what is written out.
+      (void)stateEstimatorAsNavState->estimated_navstate(obs->timestamp, estimatorOutFrame);
+
+      const auto tSample = liodom->newestTrajectoryStamp().value_or(obs->timestamp);
+      if (!lastFusedSampleStamp || tSample > *lastFusedSampleStamp) {
+        const auto st = stateEstimatorAsNavState->estimated_navstate(tSample, estimatorOutFrame);
+        if (st.has_value()) {
+          auto p = st->pose.mean;
+          if (fusedLeveler) {
+            p = fusedLeveler->add_pose(mrpt::Clock::toDouble(tSample), p);
+          }
+          outFusedPath->insert(tSample, p.asTPose());
+          lastFusedSampleStamp = tSample;
+        }
       }
     }
 
@@ -1471,6 +1617,24 @@ int main_odometry(Cli & cli)
     }
   }
 
+  // A failed write must not pass silently: every output is still attempted,
+  // and the exit code reports any that could not be written.
+  bool saveFailed = false;
+  const auto checkSaved = [&saveFailed](bool ok, const std::string & fil) {
+    if (!ok) {
+      std::cerr << "\nERROR: could not write: " << fil << "\n";
+      saveFailed = true;
+    }
+  };
+  // An output that could not be produced must not leave a previous run's file
+  // behind, where a later step would take it for this run's:
+  const auto removeStaleOutput = [&saveFailed](const std::string & fil) {
+    if (mrpt::system::fileExists(fil) && !mrpt::system::deleteFile(fil)) {
+      std::cerr << "\nERROR: could not remove a stale file: " << fil << "\n";
+      saveFailed = true;
+    }
+  };
+
   if (cli.arg_outPath.isSet()) {
     const auto fil = cli.arg_outPath.getValue();
     std::cout << "\nSaving estimated path in TUM format to: " << fil
@@ -1478,7 +1642,23 @@ int main_odometry(Cli & cli)
 
     const mrpt::poses::CPose3DInterpolator lastEstimatedTrajectory = liodom->estimatedTrajectory();
 
-    lastEstimatedTrajectory.saveToTextFile_TUM(fil);
+    checkSaved(lastEstimatedTrajectory.saveToTextFile_TUM(fil), fil);
+  }
+
+  if (fusedLeveler) {
+    const auto & st = fusedLeveler->stats();
+    const auto tilt = fusedLeveler->tilt();
+    std::cout << "\nGravity leveling of the fused path: " << st.imu_readings << " IMU readings, "
+              << st.tilt_readings << " tilt readings, " << st.gated_readings << " gated, "
+              << st.implausible_readings << " implausible, " << st.restarts << " restarts";
+    if (tilt) {
+      std::cout << ", final tilt " << mrpt::RAD2DEG(std::hypot(tilt->x, tilt->y)) << " deg";
+    }
+    std::cout << "\n";
+    if (st.imu_readings == 0) {
+      std::cerr << "Warning: --output-fused-gravity-leveled received no accelerometer readings "
+                   "matching the IMU sensor label: the fused path was not leveled.\n";
+    }
   }
 
   if (outFusedPath) {
@@ -1486,7 +1666,7 @@ int main_odometry(Cli & cli)
     std::cout << "\nSaving the state estimator's fused path (" << outFusedPath->size()
               << " poses) in TUM format to: " << fil
               << std::endl;  // NOLINT(performance-avoid-endl)
-    outFusedPath->saveToTextFile_TUM(fil);
+    checkSaved(outFusedPath->saveToTextFile_TUM(fil), fil);
   }
 
   if (cli.arg_outPathSmoothed.isSet()) {
@@ -1497,20 +1677,47 @@ int main_odometry(Cli & cli)
 
     // The whole run: the estimator returns whatever part of it it kept.
     const auto traj = stateEstimatorAsNavState->estimated_trajectory(
-      mrpt::Clock::time_point::min(), mrpt::Clock::time_point::max(),
-      liodom->params_.publish_reference_frame);
+      mrpt::Clock::time_point::min(), mrpt::Clock::time_point::max(), estimatorOutFrame);
 
     if (traj.has_value()) {
       std::cout << "\nSaving the state estimator's smoothed path (" << traj->size()
                 << " poses) in TUM format to: " << fil
                 << std::endl;  // NOLINT(performance-avoid-endl)
-      traj->saveToTextFile_TUM(fil);
+      checkSaved(traj->saveToTextFile_TUM(fil), fil);
     } else {
       std::cerr << "\nWARNING: the state estimator returned no smoothed trajectory; nothing "
                    "written to "
                 << fil << ". For the smoother, it must run with keep_finalized_trajectory enabled."
                 << std::endl;  // NOLINT(performance-avoid-endl)
     }
+  }
+
+  if (cli.arg_outGeoRef.isSet()) {
+    const auto fil = cli.arg_outGeoRef.getValue();
+#if defined(MOLA_KERNEL_NAVSTATE_FILTER_HAS_GEO_REFERENCE)
+    if (const auto g = stateEstimatorAsNavState->get_geo_reference(); g.has_value()) {
+      mp2p_icp::metric_map_t::Georeferencing mg;
+      mg.geo_coord = g->geo_coord;
+      mg.T_enu_to_map = g->T_enu_to_map;
+      std::cout << "\nSaving the state estimator's geo-reference to: " << fil
+                << std::endl;  // NOLINT(performance-avoid-endl)
+      std::ofstream f(fil);
+      const bool opened = f.is_open();
+      if (opened) {
+        f << mp2p_icp::ToYAML(mg);
+        f.close();
+      }
+      checkSaved(opened && !f.fail(), fil);
+    } else {
+      std::cerr << "\nWARNING: the state estimator has no geo-reference; nothing written to " << fil
+                << std::endl;  // NOLINT(performance-avoid-endl)
+      removeStaleOutput(fil);
+    }
+#else
+    std::cerr << "\nWARNING: this MOLA version cannot query geo-references; nothing written to "
+              << fil << std::endl;  // NOLINT(performance-avoid-endl)
+    removeStaleOutput(fil);
+#endif
   }
 
   if (cli.arg_outSimpleMap.isSet()) {
@@ -1521,19 +1728,23 @@ int main_odometry(Cli & cli)
     std::cout << "\nSaving reconstructed map with " << sm.size() << " keyframes to: " << fil
               << std::endl;  // NOLINT(performance-avoid-endl)
 
-    ASSERTMSG_(sm.saveToFile(fil), "Error saving reconstructed simplemap file");
+    checkSaved(sm.saveToFile(fil), fil);
   }
 
   if (outTwist) {
     const auto fil = cli.arg_outTwist.getValue();
     std::cout << "\nSaving estimated twist to: " << fil
               << std::endl;  // NOLINT(performance-avoid-endl)
-    outTwist->saveToTextFile(fil);
+    checkSaved(outTwist->saveToTextFile(fil), fil);
   }
 
   if (liodom->hasFatalError()) {
     std::cerr << "\nERROR: the LiDAR odometry stopped after a fatal error (see the log above); "
                  "the outputs only cover the dataset up to that point.\n";
+    return 1;
+  }
+
+  if (saveFailed) {
     return 1;
   }
 

@@ -142,9 +142,8 @@ mola_lo_use_smoother() {
   : "${MOLA_LINK_FIRST_POSE_SIGMA:=1e-6}"
   export MOLA_LINK_FIRST_POSE_SIGMA
 
+  # A caller's own YAML: the class follows it (mola_lo_resolve_state_estimator).
   if [ -n "${MOLA_STATE_ESTIMATOR_YAML:-}" ]; then
-    : "${MOLA_STATE_ESTIMATOR:=mola::state_estimation_smoother::StateEstimationSmoother}"
-    export MOLA_STATE_ESTIMATOR
     return 0
   fi
 
@@ -160,6 +159,76 @@ mola_lo_use_smoother() {
   : "${MOLA_STATE_ESTIMATOR:=mola::state_estimation_smoother::StateEstimationSmoother}"
   MOLA_STATE_ESTIMATOR_YAML="$yaml"
   export MOLA_STATE_ESTIMATOR MOLA_STATE_ESTIMATOR_YAML
+}
+
+# A params YAML given without its class (MOLA_STATE_ESTIMATOR_YAML alone) would
+# otherwise run whatever the launch file or the binary defaults to, which may
+# not be the estimator the YAML was written for. The class is inferred from a
+# key only the smoother has (and requires). Callers that pick their own
+# estimator (MOLA_LO_SKIP_STATE_ESTIMATOR=1) are left alone.
+mola_lo_resolve_state_estimator() {
+  if [ "${MOLA_LO_SKIP_STATE_ESTIMATOR:-0}" = "1" ]; then
+    return 0
+  fi
+  # A class inferred here for a different YAML (an earlier load in the same
+  # shell) is not the caller's choice: infer it again, unless the caller has
+  # set a different class since.
+  if [ -n "${MOLA_LO_SE_INFERRED_FOR:-}" ] &&
+    [ "$MOLA_LO_SE_INFERRED_FOR" != "${MOLA_STATE_ESTIMATOR_YAML:-}" ]; then
+    if [ "${MOLA_STATE_ESTIMATOR:-}" = "${MOLA_LO_SE_INFERRED_CLASS:-}" ]; then
+      unset MOLA_STATE_ESTIMATOR
+    fi
+    unset MOLA_LO_SE_INFERRED_FOR MOLA_LO_SE_INFERRED_CLASS
+  fi
+  if [ -n "${MOLA_STATE_ESTIMATOR:-}" ] || [ -z "${MOLA_STATE_ESTIMATOR_YAML:-}" ]; then
+    return 0
+  fi
+  if grep -qsE '^[[:space:]]*sliding_window_length:' "$MOLA_STATE_ESTIMATOR_YAML"; then
+    MOLA_STATE_ESTIMATOR=mola::state_estimation_smoother::StateEstimationSmoother
+  else
+    MOLA_STATE_ESTIMATOR=mola::state_estimation_simple::StateEstimationSimple
+  fi
+  MOLA_LO_SE_INFERRED_FOR=$MOLA_STATE_ESTIMATOR_YAML
+  MOLA_LO_SE_INFERRED_CLASS=$MOLA_STATE_ESTIMATOR
+  export MOLA_STATE_ESTIMATOR
+}
+
+# The smoother's defaults suit LiDAR odometry: tight per-increment sigmas and
+# IMU preintegration. The sigmas are shared by every odometry source, so when
+# another one (wheel, legged) is fused too, its looser values are used, with
+# preintegration off. The angular sigma is also set for LiDAR alone, which
+# older smoother versions need (their default suits wheel odometry). The
+# caller's values still win.
+mola_lo_smoother_lidar_defaults() {
+  # A value set here by an earlier load in the same shell is not the caller's
+  # choice: drop it, unless the caller has changed it since.
+  local var mark
+  for var in MOLA_REL_POSE_INCR_SIGMA_ANG MOLA_REL_POSE_INCR_SIGMA_LIN MOLA_SMOOTHER_IMU_PREINTEGRATION; do
+    mark=MOLA_LO_DEFAULTED_$var
+    if [ -n "${!mark:-}" ] && [ "${!var:-}" = "${!mark}" ]; then
+      unset "$var"
+    fi
+    unset "$mark"
+  done
+  if [ "${MOLA_STATE_ESTIMATOR:-}" != "mola::state_estimation_smoother::StateEstimationSmoother" ]; then
+    return 0
+  fi
+  if [ -n "${MOLA_ODOMETRY_TOPIC:-}" ] || [ -n "${MOLA_ODOM_TOPIC:-}" ]; then
+    mola_lo_smoother_default MOLA_REL_POSE_INCR_SIGMA_ANG 0.005
+    mola_lo_smoother_default MOLA_REL_POSE_INCR_SIGMA_LIN 0.02
+    mola_lo_smoother_default MOLA_SMOOTHER_IMU_PREINTEGRATION false
+  else
+    mola_lo_smoother_default MOLA_REL_POSE_INCR_SIGMA_ANG 1e-5
+  fi
+}
+
+# Sets and exports $1=$2 unless the caller set $1, remembering it was a default.
+mola_lo_smoother_default() {
+  if [ -z "${!1:-}" ]; then
+    printf -v "$1" '%s' "$2"
+    printf -v "MOLA_LO_DEFAULTED_$1" '%s' "$2"
+    export "${1?}"
+  fi
 }
 
 # Sources a profile and runs it. $1 is the profile name, the rest are the
@@ -191,7 +260,9 @@ mola_lo_load_profile() {
     return 1
   fi
 
-  mola_lo_profile_resolve "$@"
+  mola_lo_profile_resolve "$@" || return
+  mola_lo_resolve_state_estimator
+  mola_lo_smoother_lidar_defaults
 }
 
 # Both exec helpers below default the pipeline YAML the same way every
