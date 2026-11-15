@@ -81,6 +81,8 @@ modules:
       start_paused: ${MOLA_DATASET_START_PAUSED|false}
 
       base_link_frame_id: "${MOLA_TF_BASE_LINK|base_link}"
+      # Optional ground-truth trajectory (TUM format), drawn by the GUI:
+      ground_truth_tum_file: "${MOLA_GROUND_TRUTH_TUM_FILE|}"
 
       # Note: /tf and /tf_static topic names are fixed in Rosbag1Dataset.
       # All /tf_static transforms are pre-scanned at startup so sensor poses
@@ -99,6 +101,9 @@ modules:
           # If present, this will override whatever /tf tells about the sensor pose:
           fixed_sensor_pose: "${LIDAR_POSE_X|0} ${LIDAR_POSE_Y|0} ${LIDAR_POSE_Z|0} ${LIDAR_POSE_YAW|0} ${LIDAR_POSE_PITCH|0} ${LIDAR_POSE_ROLL|0}" # 'x y z yaw_deg pitch_deg roll_deg'
           use_fixed_sensor_pose: ${MOLA_USE_FIXED_LIDAR_POSE|false}
+          # Constant correction [s] added to the LiDAR stamps, e.g. for a driver
+          # that stamps each cloud at the end of its sweep:
+          time_offset: ${MOLA_LIDAR_TIME_OFFSET|0.0}
 
         # For GPS messages of type 'sensor_msgs/NavSatFix'
         - topic: ${MOLA_GNSS_TOPIC|'/gps'}
@@ -123,6 +128,20 @@ modules:
           # If present, this will override whatever /tf tells about the sensor pose:
           fixed_sensor_pose: "${CAMERA_POSE_X|0} ${CAMERA_POSE_Y|0} ${CAMERA_POSE_Z|0} ${CAMERA_POSE_YAW|0} ${CAMERA_POSE_PITCH|0} ${CAMERA_POSE_ROLL|0}" # 'x y z yaw_deg pitch_deg roll_deg'
           use_fixed_sensor_pose: ${MOLA_USE_FIXED_CAMERA_POSE|false}
+        # More cameras, e.g. stored in simplemap keyframes with
+        # MOLA_SIMPLEMAP_ATTACH_LABEL='camera.*':
+        - topic: ${MOLA_CAMERA_TOPIC_1|''}
+          is_optional: true
+          sensorLabel: ${MOLA_CAMERA_SENSOR_NAME_1|camera_1}
+          type: CObservationImage
+          fixed_sensor_pose: "${CAMERA_1_POSE_X|0} ${CAMERA_1_POSE_Y|0} ${CAMERA_1_POSE_Z|0} ${CAMERA_1_POSE_YAW|0} ${CAMERA_1_POSE_PITCH|0} ${CAMERA_1_POSE_ROLL|0}" # 'x y z yaw_deg pitch_deg roll_deg'
+          use_fixed_sensor_pose: ${MOLA_USE_FIXED_CAMERA_1_POSE|false}
+        - topic: ${MOLA_CAMERA_TOPIC_2|''}
+          is_optional: true
+          sensorLabel: ${MOLA_CAMERA_SENSOR_NAME_2|camera_2}
+          type: CObservationImage
+          fixed_sensor_pose: "${CAMERA_2_POSE_X|0} ${CAMERA_2_POSE_Y|0} ${CAMERA_2_POSE_Z|0} ${CAMERA_2_POSE_YAW|0} ${CAMERA_2_POSE_PITCH|0} ${CAMERA_2_POSE_ROLL|0}" # 'x y z yaw_deg pitch_deg roll_deg'
+          use_fixed_sensor_pose: ${MOLA_USE_FIXED_CAMERA_2_POSE|false}
 
         # Wheel/robot odometry (disabled by default). CObservationOdometry is
         # planar: (x, y, yaw) plus a 2D twist. For a 3D odometry source
