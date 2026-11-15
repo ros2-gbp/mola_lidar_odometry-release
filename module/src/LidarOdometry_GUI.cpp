@@ -20,6 +20,7 @@
  */
 
 // This module:
+#include <mola_lidar_odometry/ImuBiasCorrection.h>
 #include <mola_lidar_odometry/LidarOdometry.h>
 
 // MOLA:
@@ -178,6 +179,19 @@ mola::gui::Tab LidarOdometry::buildTabStatus()
   tab.widgets.emplace_back(Label{gui_.lbTime});
   tab.widgets.emplace_back(Label{gui_.lbLidarQueue});
   tab.widgets.emplace_back(Label{gui_.lbMapStats});
+#if defined(MOLA_LO_HAS_IMU_BIAS_SOURCE)
+  // Only with a bias source (found at initialize(), before the GUI is built):
+  bool hasBiasSource = false;
+  {
+    auto lckImu = mrpt::lockHelper(imu_state_mtx_);
+    hasBiasSource = !imu_bias_sources_.empty();
+  }
+  if (hasBiasSource) {
+    for (const auto & lb : gui_.lbImuBias) {
+      tab.widgets.emplace_back(Label{lb});
+    }
+  }
+#endif
   return tab;
 }
 
@@ -430,6 +444,9 @@ void LidarOdometry::internalBuildGUI()
   gui_.lbSpeed = std::make_shared<LiveString>(" ");
   gui_.lbLidarQueue = std::make_shared<LiveString>(" ");
   gui_.lbMapStats = std::make_shared<LiveString>(" ");
+  for (auto & lb : gui_.lbImuBias) {
+    lb = std::make_shared<LiveString>(" ");
+  }
 
   // Background 3D scene: change background color (backend-agnostic)
   visualizer_->execute_custom_code_on_background_scene([this](mrpt::viz::Scene & scene) {
@@ -519,7 +536,8 @@ namespace
 {
 void doRecolorize(
   const mrpt::img::TColormap & colormap, const std::string & colorByField,
-  const mrpt::maps::CPointsMap * org_cloud, const mrpt::viz::CPointCloudColoured::Ptr & cloud)
+  const mrpt::maps::CPointsMap * org_cloud, const mrpt::viz::CPointCloudColoured::Ptr & cloud,
+  float outliersPercentile)
 {
   if (colormap == mrpt::img::TColormap::cmNONE) {
     return;
@@ -529,6 +547,13 @@ void doRecolorize(
   mrpt::obs::PointCloudRecoloringParameters rp;
   rp.colorMap = colormap;
   rp.colorizeByField = colorByField;
+#if MRPT_VERSION >= 0x020f0d
+  if (outliersPercentile > 0) {
+    rp.outlierRejectionPercentile = outliersPercentile;
+  }
+#else
+  (void)outliersPercentile;
+#endif
 
   mrpt::obs::recolorize3Dpc(cloud, org_cloud, rp);
 };
@@ -905,6 +930,7 @@ void LidarOdometry::updateVisualizationCurrentObservation(
   const float decayPointSize = params_.visualization.last_deskewed_observations_point_size;
   const float decayAlpha = params_.visualization.observations_initial_alpha;
   const double decaySeconds = params_.visualization.observations_decay_seconds;
+  const float colorOutliersPct = params_.visualization.colormap_outliers_percentile;
 
   const bool hideBackFacing = params_.visualization.hide_back_facing_points;
   const float backFacingNormals_deg = params_.visualization.back_facing_max_angle_normals_deg;
@@ -942,7 +968,7 @@ void LidarOdometry::updateVisualizationCurrentObservation(
 
       if (auto cloud = glCurrentObs->getByClass<mrpt::viz::CPointCloudColoured>(0); cloud) {
         const auto orgCloud = mm.point_layer("raw");
-        doRecolorize(curObsColormap, curObsColorField, orgCloud.get(), cloud);
+        doRecolorize(curObsColormap, curObsColorField, orgCloud.get(), cloud, colorOutliersPct);
       }
 
       vizUpsert3D(viz, "liodom/cur_obs", glCurrentObs, vizFrame);
@@ -969,7 +995,7 @@ void LidarOdometry::updateVisualizationCurrentObservation(
 
       if (auto cloud = glDecayObs->getByClass<mrpt::viz::CPointCloudColoured>(0); cloud) {
         cloud->setPose(currentPose);
-        doRecolorize(decayColormap, decayColorField, deskewed.get(), cloud);
+        doRecolorize(decayColormap, decayColorField, deskewed.get(), cloud, colorOutliersPct);
 
 #if defined(MOLA_KERNEL_VIZ_HAS_MOVABLE_FRAMES)
         viz->insert_point_cloud_with_decay(cloud, decaySeconds, "main", "main", vizFrame);
@@ -1014,6 +1040,14 @@ void LidarOdometry::updateVisualizationLocalMap()
     auto & cm = rp.points.allLayers.colorMode.emplace();
     cm.colorMap = params_.visualization.local_map_colormap;
     cm.recolorizeByField = params_.visualization.local_map_colormap_color_by_field;
+    if (const auto & v = params_.visualization;
+        v.local_map_colormap_min && v.local_map_colormap_max &&
+        *v.local_map_colormap_min < *v.local_map_colormap_max) {
+      cm.colorMapMinCoord = *v.local_map_colormap_min;
+      cm.colorMapMaxCoord = *v.local_map_colormap_max;
+    } else if (v.colormap_outliers_percentile > 0) {
+      cm.autoBoundingBoxOutliersPercentile = v.colormap_outliers_percentile;
+    }
 
     rp.points.allLayers.render_voxelmaps_free_space =
       params_.visualization.local_map_render_voxelmap_free_space;
@@ -1290,6 +1324,18 @@ void LidarOdometry::updateVisualizationTextLabels()
   } else {
     gui_.lbSpeed->set("Speed: (Not available)");
   }
+
+#if defined(MOLA_LO_HAS_IMU_BIAS_SOURCE)
+  {
+    // The current estimate of the IMU in use:
+    auto lckImu = mrpt::lockHelper(imu_state_mtx_);
+    const auto lines =
+      imu_bias_status_lines(imu_bias_sources_, imu_bias_gui_label_, imu_bias_gui_stamp_);
+    for (size_t i = 0; i < lines.size(); i++) {
+      gui_.lbImuBias[i]->set(lines[i]);
+    }
+  }
+#endif
 }
 
 }  // namespace mola

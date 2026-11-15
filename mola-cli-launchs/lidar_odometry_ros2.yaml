@@ -99,6 +99,15 @@ modules:
       # be queried and forwarded as an `CObservationOdometry` reading to the MOLA subsystem:
       forward_ros_tf_as_mola_odometry_observations: ${MOLA_FORWARD_ROS_TF_ODOM_TO_MOLA|false}
 
+      # How nav_msgs/Odometry topics (MOLA_ODOM_TOPIC below) are forwarded:
+      #  - true: as a 3D CObservationRobotPose (6x6 covariance). The smoother fuses
+      #    its increments with relative_pose_increment_sigma_*, the same sigmas as
+      #    any other odometry frame (e.g. LiDAR odometry poses in their own frame).
+      #  - false: as a planar CObservationOdometry (pose + velocities). The smoother
+      #    fuses its increments with the wheel odometry motion model
+      #    (odom_motion_model_a1..a4), so it can be weighted apart from other sources.
+      odometry_as_robot_pose_observation: ${MOLA_ODOM_AS_ROBOT_POSE_OBS|true}
+
       # If enabled, SLAM/Localization results will be published as nav_msgs/Odometry messages.
       publish_odometry_msgs_from_slam: ${MOLA_LOCALIZATION_PUBLISH_ODOM_MSGS|true}
 
@@ -194,6 +203,36 @@ modules:
         - topic: ${MOLA_ATTITUDE_IMU_TOPIC|}
           msg_type: Imu
           output_sensor_label: ${MOLA_ATTITUDE_IMU_NAME|imu_attitude}
+
+        # Optional cameras (up to three), only stored into simplemap keyframes
+        # with MOLA_SIMPLEMAP_ATTACH_LABEL='camera.*' (the launch file sets both
+        # from camera_topic_name). Each one is disabled unless its topic is set.
+        # Use low-rate topics: every image is decoded (and demosaiced).
+        # Requires a BridgeROS2 (mola) with sensor_msgs/Image support.
+        - topic: ${MOLA_CAMERA_TOPIC|}
+          msg_type: Image
+          output_sensor_label: ${MOLA_CAMERA_SENSOR_NAME|camera}
+          fixed_sensor_pose: "${CAMERA_POSE_X|0} ${CAMERA_POSE_Y|0} ${CAMERA_POSE_Z|0} ${CAMERA_POSE_YAW|0} ${CAMERA_POSE_PITCH|0} ${CAMERA_POSE_ROLL|0}" # 'x y z yaw_deg pitch_deg roll_deg'
+          use_fixed_sensor_pose: ${MOLA_USE_FIXED_CAMERA_POSE|false}
+          qos:
+            reliability: ${MOLA_CAMERA_QOS_RELIABILITY|best_effort}
+            depth: ${MOLA_CAMERA_QOS_DEPTH|5}  # few: images are large
+        - topic: ${MOLA_CAMERA_TOPIC_1|}
+          msg_type: Image
+          output_sensor_label: ${MOLA_CAMERA_SENSOR_NAME_1|camera_1}
+          fixed_sensor_pose: "${CAMERA_1_POSE_X|0} ${CAMERA_1_POSE_Y|0} ${CAMERA_1_POSE_Z|0} ${CAMERA_1_POSE_YAW|0} ${CAMERA_1_POSE_PITCH|0} ${CAMERA_1_POSE_ROLL|0}" # 'x y z yaw_deg pitch_deg roll_deg'
+          use_fixed_sensor_pose: ${MOLA_USE_FIXED_CAMERA_1_POSE|false}
+          qos:
+            reliability: ${MOLA_CAMERA_QOS_RELIABILITY|best_effort}
+            depth: ${MOLA_CAMERA_QOS_DEPTH|5}  # few: images are large
+        - topic: ${MOLA_CAMERA_TOPIC_2|}
+          msg_type: Image
+          output_sensor_label: ${MOLA_CAMERA_SENSOR_NAME_2|camera_2}
+          fixed_sensor_pose: "${CAMERA_2_POSE_X|0} ${CAMERA_2_POSE_Y|0} ${CAMERA_2_POSE_Z|0} ${CAMERA_2_POSE_YAW|0} ${CAMERA_2_POSE_PITCH|0} ${CAMERA_2_POSE_ROLL|0}" # 'x y z yaw_deg pitch_deg roll_deg'
+          use_fixed_sensor_pose: ${MOLA_USE_FIXED_CAMERA_2_POSE|false}
+          qos:
+            reliability: ${MOLA_CAMERA_QOS_RELIABILITY|best_effort}
+            depth: ${MOLA_CAMERA_QOS_DEPTH|5}  # few: images are large
 
         # Optional: direct subscription to a nav_msgs/Odometry topic (e.g., wheel odometry).
         # Leave MOLA_ODOM_TOPIC empty (default) to disable. Set to e.g. "/wheel_odom" to enable.
