@@ -152,8 +152,9 @@ layer and the per-scan ``observation`` layer, since ICP pairs the two:
        that is updated in place instead of being rebuilt on every scan. The
        index is selectable: a hashed voxel grid (``VoxelHash``, the default) or
        an incremental, self-balancing k-d tree (``KDTree``).
-       **Odometry only:** a global SE(3) re-map would force a full rebuild, so
-       it must not be used together with loop closure.
+       With a central map that closes loops (e.g. ``mola_mapper``), the local
+       map is rebuilt from the corrected keyframes after each correction (see
+       ``MOLA_LO_LOCAL_MAP_REBUILD``).
    * - ``mola::KeyframePointCloudMap``
      - Keyframe-based: points are stored in per-keyframe local frames, so the
        map survives a loop-closure re-map. Select it for SLAM
@@ -592,6 +593,11 @@ Sensor inputs: LiDAR
   (L-infinity cube around ``base_link``) for 3D points used by ICP; intended to cut out points coming from
   the robot/vehicle body itself or a person standing right next to it.
 
+- ``MOLA_MINIMUM_RANGE_FILTER_L_INFINITY`` (Default: ``true``): Shape of the minimum (and maximum) range
+  filter. ``true``: L-infinity cube around ``base_link``, which covers a vehicle footprint. ``false``:
+  Euclidean sphere, which keeps the closest structure along the cube's diagonals (narrow stairwells and
+  corridors). The hand-held dataset profiles set it to ``false``.
+
 Sensor inputs: IMU (optional)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
@@ -691,6 +697,23 @@ Scan de-skew options
 
      **IMPORTANT**: If you do not change this from its default, IMU data will not be used for deskewing.
      To fully achieve the best accuracy when an IMU is available, set this to ``MotionCompensationMethod::IMU``.
+     Always do so on hand-held and legged platforms: ``Linear`` assumes a constant velocity over the sweep, which
+     their motion violates, and combined with inertial propagation (``MOLA_NAVSTATE_IMU_PROPAGATION``) it was seen
+     to diverge on such motion after a stretch of poor registrations.
+
+  With the IMU methods, the linear velocity is the state estimator's estimate right after the previous scan,
+  carried to the current sweep by integrating the accelerometer; the gyroscope gives the rotation.
+  This needs a velocity that follows accelerations: with the simple state estimator, keep
+  ``MOLA_NAVSTATE_IMU_PROPAGATION`` enabled (the default) in custom parameter files.
+  It also needs ``mola_state_estimation`` newer than 3.2.0: earlier versions return their filtered
+  velocity at the stamp of the last pose, even with propagation enabled, so the IMU methods would carry
+  a lagged velocity. With those, set ``MOLA_DESKEW_TWIST_WITH_IMU_METHODS=true``.
+  If that velocity is not within the de-skew sample window (twice the point-time span around the
+  scan reference time), e.g. after a dropped scan or with a span shorter than half the scan period,
+  the twist variables are used at the scan reference time instead, with a throttled warning.
+
+- ``MOLA_DESKEW_TWIST_WITH_IMU_METHODS`` (Default: ``false``): If ``true``, the IMU methods apply the twist
+  variables at the scan reference time instead, as in earlier versions.
 
 - ``MOLA_IGNORE_NO_POINT_STAMPS`` (Default: ``true``): If enabled (default), input point clouds without per-point timestamps
   will be processed without doing any de-skew. If set to ``false``, an exception is triggered in that event,
@@ -698,6 +721,19 @@ Scan de-skew options
 
 - ``MOLA_SCAN_POINT_STAMPS_ADJUST_METHOD`` (Default: ``TimestampAdjustMethod::MiddleIsZero``): Method for adjusting
   per-point timestamps so that the scan mid-point is at time zero. Affects how twist is applied during deskewing.
+  With several LiDARs, it applies to their merged clouds, so time zero (and the pose timestamp) is the middle of the
+  combined sweep.
+
+- ``MOLA_POINT_TIME_OUTLIERS`` (Default: ``true``): Before the per-point times are adjusted, points whose time
+  is far outside the usual range of their sensor are removed (block ``point_time_outliers`` of ``inputs.yaml``, also
+  in ``extras/lidar3d-kissicp-like.yaml``; a pipeline without that block keeps the filter on with its defaults). The
+  usual range is the median of the minimum and of the maximum time of the last 50 scans of that sensor, widened by the
+  largest of ``MOLA_POINT_TIME_OUTLIERS_MARGIN_RATIO`` (Default: ``0.5``) of its width, 10 ms, and the sensor period.
+  It catches columns stamped seconds away from the rest after a jump of the LiDAR clock (e.g. an Ouster in
+  ``TIME_FROM_SYNC_PULSE_IN`` mode with spurious pulses), which would otherwise move the scan time, and with it the
+  pose stamp, by that much. Normal scans are never modified: the cost is one pass over the time field per scan.
+  Not covered: the first 10 scans after a start or reset, and the raw observations stored in keyframes
+  (simplemap, central map), which keep their original times for later processing.
 
 
 General options
@@ -764,6 +800,21 @@ The adaptive threshold controls the ICP matching window (sigma), following the a
   per bad frame during recovery.
 
 
+Prediction plausibility and stall recovery
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+- ``MOLA_MOTION_MODEL_MAX_EXTRA_ACC`` (Default: ``10.0`` [m/s^2]): Between two scans, the IMU accelerations, rotated
+  with the odometry attitude, without gravity and without the accelerometer bias of an IMU bias source, give the
+  velocity change of the vehicle. If the speed of the state estimator prediction changes by more than that, plus this
+  margin times the interval, the prediction is not used (ICP starts from the last pose) and the state estimator is
+  reset. Not checked during the first second after a start or reset. Needs an IMU; ``0`` disables it.
+
+- ``MOLA_STALL_RECOVERY`` (Default: ``true``): If ICP fails and there is no usable prediction, the pose cannot move,
+  and no later scan can register against the map either. After ``MOLA_STALL_RECOVERY_AFTER_N_SCANS`` (Default:
+  ``5``) such consecutive scans, the local map restarts at the last pose and the state estimator is reset. The
+  trajectory is kept. Never applied to a loaded map, or with local map updates disabled.
+
+
 Local map update
 ^^^^^^^^^^^^^^^^^^^^^^
 
@@ -776,6 +827,14 @@ Local map update
 - ``MOLA_LOCAL_MAP_MAX_SIZE`` (In meters; default: heuristic formula, see YAML file): Parts of the local metric map farther
   away than this distance, measured from the current robot pose, will be removed. This saves memory and avoids
   inconsistencies before loop-closure (which is handled outside of the LO module).
+
+- ``MOLA_LO_LOCAL_MAP_REBUILD`` (Default: ``true``): If a central map that corrects the pushed keyframes is
+  running (e.g. ``mola_mapper``, after loop closures), rebuild the local map after each correction from its keyframes
+  within ``MOLA_LOCAL_MAP_MAX_SIZE``, with their corrected poses, including those of earlier visits to the same place.
+  The rebuilt map is anchored at the newest pushed keyframe, so the vehicle pose does not jump.
+
+- ``MOLA_LO_LOCAL_MAP_REBUILD_SPACING`` (In meters; default: ``1.0``): Minimum distance between the keyframes used to
+  rebuild the local map (the newest ones are kept).
 
 - ``MOLA_LOCAL_VOXELMAP_RESOLUTION`` (In meters; default: heuristic formula, see YAML file): Size of voxels for the local map.
   **Not used in the GICP pipeline**, which uses a keyframe-based map instead.
@@ -972,6 +1031,27 @@ Simple-map generation
 - ``MOLA_SAVE_DESKEWED_SCANS`` (Default: ``false``): If enabled, deskewed (motion-compensated) scans are stored
   into simple-map keyframes instead of raw scans. Useful when post-processing requires already-compensated clouds.
 
+- ``MOLA_SIMPLEMAP_ATTACH_LABEL`` (Default: empty, disabled): Sensor label (regex) of observations of another sensor,
+  e.g. camera images, to store in simple-map keyframes, the one closest in time to each keyframe, as for GNSS and
+  IMU. ``MOLA_SIMPLEMAP_ATTACH_MAX_AGE`` (Default: ``0.5`` s) is the maximum time offset, and
+  ``MOLA_SIMPLEMAP_ATTACH_ONCE`` (Default: ``true``) never stores the same observation in two keyframes, and
+  ``MOLA_SIMPLEMAP_ATTACH_QUEUE_SIZE`` (Default: ``10``) is how many recent observations are kept to choose from (raise
+  it for high-rate cameras). A regex matching several cameras (e.g. ``camera.*``) stores one image of each in every
+  keyframe. Other sensors can be listed in the ``simplemap.attach_observations`` section of the pipeline. Only observations
+  received by the time a keyframe is created are candidates: ``mola-sm-attach-from-rosbag2`` (or ``-rosbag1``)
+  adds them offline from a bag instead, choosing the closest keyframe of each one. Image inputs: with
+  ``mola-lidar-odometry-cli``, ``MOLA_CAMERA_TOPIC_0``, ``_1``, ``_2`` (labels ``image_0``, ``image_1``,
+  ``image_2``: use ``image_.*``); with ``mola-lo-gui-rosbag2`` and ``mola-lo-gui-rosbag1``, ``MOLA_CAMERA_TOPIC``,
+  ``_1``, ``_2`` (labels ``camera``, ``camera_1``, ``camera_2``: use ``camera.*``; note the different names of the
+  first camera in the CLI and the GUIs); with the ROS 2 node, ``camera_topic_name:=/a,/b`` (which also sets
+  ``MOLA_SIMPLEMAP_ATTACH_LABEL`` to their labels).
+
+- ``MOLA_SIMPLEMAP_IMAGE_FORMAT`` (Default: ``jpg``): Keyframe images are written as ``jpg`` or ``png`` files to
+  ``<map>_Images/`` next to ``MOLA_SIMPLEMAP_OUTPUT`` (``MOLA_SIMPLEMAP_JPEG_QUALITY``, default ``95``), or kept
+  ``inline`` in the ``.simplemap``. They are also inline with ``mola-lidar-odometry-cli --output-simplemap``. Images
+  are written as keyframes are created; those already stored as files, or not 8-bit, are kept as they are. A map saved
+  elsewhere with the ``map_save`` service still refers to the files in ``<map>_Images/`` of ``MOLA_SIMPLEMAP_OUTPUT``.
+
 
 Trajectory files generation
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -1048,6 +1128,11 @@ Initial localization
 - ``MOLA_LO_INIT_GLOBAL_SEARCH_RES_XY``, ``MOLA_LO_INIT_GLOBAL_SEARCH_RES_YAW`` (Default: ``1.0`` [m],
   ``30.0`` [deg]): Spacing of the initial guesses of the search.
 
+- ``MOLA_LO_INIT_GLOBAL_SEARCH_MAX_GUESSES`` (Default: ``5000``): A search with more initial guesses than this
+  (one ICP each) is not run, but retried later: a search cannot be interrupted by new scans. Each retry uses the
+  latest state estimator pose only if it gives a search no larger than the previous one (the estimator
+  uncertainty may grow a lot between measurements), or if it is out of the previous search region.
+
 - ``MOLA_LO_INIT_GLOBAL_SEARCH_MIN_QUALITY``, ``MOLA_LO_INIT_GLOBAL_SEARCH_MIN_MARGIN`` (Default: ``0.5``, ``0.1``):
   Minimum ICP quality of a match, and by how much the best match must beat any other distinct pose. Otherwise
   (e.g. identical crop rows), the search is retried later and no pose is reported.
@@ -1087,6 +1172,14 @@ Visualization
      colorize the local map in the GUI (e.g. ``x``, ``y``, ``z``, ``ring``, ``intensity``).
    - All the ``*_COLOR_FIELD`` variables and ``MOLA_GUI_LOCAL_MAP_COLOR_BY_COORDINATE`` also accept ``rgb``,
      to show the per-point ``color_r/g/b`` fields of RGB LiDARs (e.g. Ouster Rev8 "-RGB" models) instead of a colormap.
+   - ``MOLA_GUI_COLOR_OUTLIERS_PERCENTILE`` (Default: ``0.05``): Fraction of points at each end of the colored
+     field left out of the colormap range, in the local map and the observation clouds. Heavy-tailed fields
+     (``intensity``, ``reflectivity``: a few retroreflector returns) otherwise squeeze almost all points into one
+     color; ``0.10`` suits Ouster ``reflectivity``. ``0``: the full range.
+   - ``MOLA_GUI_LOCAL_MAP_COLOR_MIN`` / ``MOLA_GUI_LOCAL_MAP_COLOR_MAX`` (Default: empty): Fixed colormap limits for the
+     local map (e.g. a ``z`` range in meters), instead of the automatic one.
+   - Local maps that render themselves (e.g. ``mola::KeyframePointCloudMap``) ignore the local map colormap options
+     above and use their own render options.
 
 
 Motion model
@@ -1097,6 +1190,11 @@ A constant velocity motion model is used by default, provided by the ``mola_stat
   velocity model. Larger delays will cause the latest vehicle pose to be used as the initial guess instead.
 - ``MOLA_NAVSTATE_SIGMA_RANDOM_WALK_LINACC`` (Default: ``1.0`` [m/s^2]): Linear acceleration standard deviation.
 - ``MOLA_NAVSTATE_SIGMA_RANDOM_WALK_ANGACC`` (Default: ``10.0`` [rad/s^2]): Angular acceleration standard deviation.
+- ``MOLA_NAVSTATE_IMU_PROPAGATION`` (Default: ``true``): If IMU accelerometer readings are available, predict with
+  the IMU between scans and estimate the velocity inertially. This prediction is the ICP initial guess and gives the
+  twist variables (e.g. for ``Linear`` de-skew) and the velocity for IMU de-skew. Without accelerometer readings, the
+  constant velocity model above is used. It needs a map frame with +Z up (e.g. initialized from the IMU pitch and
+  roll): set it to ``false`` otherwise.
 
 
 .. _pipeline_icp_log_files:
