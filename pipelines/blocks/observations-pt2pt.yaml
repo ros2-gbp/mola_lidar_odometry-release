@@ -50,7 +50,7 @@ observations_filter_1st_pass:
       output_layer_between: "decimated_for_map_by_range"
       range_min: "${MOLA_MINIMUM_RANGE_FILTER|max(1.0, 0.03*ESTIMATED_OBSERVATION_RADIUS)}"
       range_max: 1.2*ESTIMATED_OBSERVATION_RADIUS
-      metric_l_infinity: true
+      metric_l_infinity: "${MOLA_MINIMUM_RANGE_FILTER_L_INFINITY|true}"
 
   # Remove close ceilings (problematic in most cases!)
   - class_name: mp2p_icp_filters::FilterBoundingBox
@@ -88,6 +88,9 @@ observations_filter_2nd_pass:
       # These (vx,...,wz) are variable names that must be defined via the
       # mp2p_icp::Parameterizable API to update them dynamically.
       twist: [vx, vy, vz, wx, wy, wz]
+      # IMU methods: take the state estimator's velocity at the instant it refers to,
+      # and carry it to the sweep with the accelerometer (twist is for Linear only).
+      use_twist_with_imu_methods: "${MOLA_DESKEW_TWIST_WITH_IMU_METHODS|false}"
 
   - class_name: mp2p_icp_filters::FilterDeskew
     params:
@@ -101,6 +104,9 @@ observations_filter_2nd_pass:
       # These (vx,...,wz) are variable names that must be defined via the
       # mp2p_icp::Parameterizable API to update them dynamically.
       twist: [vx, vy, vz, wx, wy, wz]
+      # IMU methods: take the state estimator's velocity at the instant it refers to,
+      # and carry it to the sweep with the accelerometer (twist is for Linear only).
+      use_twist_with_imu_methods: "${MOLA_DESKEW_TWIST_WITH_IMU_METHODS|false}"
 
 # final pass:
 observations_filter_final_pass:
