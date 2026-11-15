@@ -35,15 +35,20 @@ find_package(mola_relocalization REQUIRED)
 # -----------------------
 # define lib:
 set(LIB_SRCS
+  module/src/GravityLeveler.cpp
   module/src/IcpPrior.cpp
+  module/src/KeyframeAttachments.cpp
   module/src/KeyframeDecider.cpp
   module/src/LidarOdometry_Main.cpp
   module/src/MapFrameRelevel.cpp
+  module/src/PointTimeOutlierFilter.cpp
   module/src/LidarOdometry_Relocalization.cpp
   module/src/LidarOdometry_Parameters.cpp
   module/src/LidarOdometry_Initialize.cpp
   module/src/LidarOdometry_ProcessScan.cpp
+  module/src/LidarOdometry_LearnedCovariance.cpp
   module/src/LidarOdometry_AdaptiveVariables.cpp
+  module/src/LidarOdometry_LocalMapRebuild.cpp
   module/src/LidarOdometry_MapServer.cpp
   module/src/LidarOdometry_GUI.cpp
   module/src/LidarOdometry_SensorCallbacks.cpp
@@ -54,9 +59,12 @@ set(LIB_SRCS
 )
 
 set(LIB_PUBLIC_HDRS
+  module/include/mola_lidar_odometry/GravityLeveler.h
   module/include/mola_lidar_odometry/IcpPrior.h
+  module/include/mola_lidar_odometry/KeyframeAttachments.h
   module/include/mola_lidar_odometry/LidarOdometry.h
   module/include/mola_lidar_odometry/MapFrameRelevel.h
+  module/include/mola_lidar_odometry/PointTimeOutlierFilter.h
 )
 
 mola_add_library(
@@ -270,16 +278,20 @@ set(MOLA_LO_DATASET_WRAPPERS
     citrusfarm
     conslam
     fomo
+    geode
     grandtour
     hilti2022
     kitti
     kitti360
     mulran
+    newer-college
+    ntu-viral
     oxford-spires
     paris-luco
     rawlog
     rosbag1
     rosbag2
+    vbr
     # TIERS records five lidars at once, so it gets one wrapper per sensor
     # rather than one that silently picks a winner:
     tiers-ouster-os0
