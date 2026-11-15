@@ -8,6 +8,7 @@ from launch.actions import (DeclareLaunchArgument, SetEnvironmentVariable,
                             GroupAction, Shutdown, OpaqueFunction)
 from ament_index_python import get_package_share_directory
 import os
+import re
 
 
 def resolve_gnss_mode(context, *args, **kwargs):
@@ -149,7 +150,22 @@ def resolve_state_estimator_config(context, *args, **kwargs):
         # Default path for the simple estimator
         yaml_path = '../state-estimator-params/state-estimation-simple.yaml'
 
-    return [SetEnvironmentVariable(name='MOLA_STATE_ESTIMATOR_YAML', value=yaml_path)]
+    actions = [SetEnvironmentVariable(name='MOLA_STATE_ESTIMATOR_YAML', value=yaml_path)]
+
+    # The smoother's defaults suit LiDAR odometry alone (tight per-increment
+    # sigmas, IMU preintegration). The sigmas are shared by every odometry
+    # source, so another one (wheel odometry) gets the looser values, with
+    # preintegration off, unless already set in the environment.
+    other_odometry = (
+        LaunchConfiguration('odom_topic_name').perform(context).strip() != '' or
+        LaunchConfiguration('forward_ros_tf_odom_to_mola').perform(context).lower() == 'true')
+    if use_smoother and other_odometry:
+        for name, value in (('MOLA_REL_POSE_INCR_SIGMA_ANG', '0.005'),
+                            ('MOLA_REL_POSE_INCR_SIGMA_LIN', '0.02'),
+                            ('MOLA_SMOOTHER_IMU_PREINTEGRATION', 'false')):
+            if not os.environ.get(name):
+                actions.append(SetEnvironmentVariable(name=name, value=value))
+    return actions
 
 
 def generate_launch_description():
@@ -250,6 +266,43 @@ def generate_launch_description():
         return [SetEnvironmentVariable(name='MOLA_ATTITUDE_IMU_TOPIC', value=v),
                 SetEnvironmentVariable(name='MOLA_ATTITUDE_IMU_NAME', value='imu_attitude')]
     attitude_imu_topic_env_var = OpaqueFunction(function=_apply_attitude_imu_topic)
+    # ~~~~~~~~~~~~
+    camera_topic_name_arg = DeclareLaunchArgument(
+        "camera_topic_name", default_value="",
+        description="Optional sensor_msgs/Image topics (raw, not compressed; e.g. low-rate cameras), "
+                    "comma-separated, up to three. Their images are only stored into simplemap keyframes "
+                    "(needs generate_simplemap:=True), one of each camera per keyframe, the closest in "
+                    "time (for visual place recognition), as jpg/png files next to the simplemap. Their "
+                    "frames must be in /tf (or set MOLA_USE_FIXED_CAMERA_POSE, _CAMERA_1_POSE, "
+                    "_CAMERA_2_POSE). Empty (default) disables it.")
+
+    # Naming the topics is enough: they go to the camera slots of the YAML
+    # (labels camera, camera_1, camera_2, or MOLA_CAMERA_SENSOR_NAME[_1,_2]), and
+    # the odometry is told to store their images, unless
+    # MOLA_SIMPLEMAP_ATTACH_LABEL is already set.
+    def _apply_camera_topic(context, *args, **kwargs):
+        v = LaunchConfiguration('camera_topic_name').perform(context)
+        topics = [t.strip() for t in v.split(',') if t.strip()]
+        if not topics:
+            return []
+        if len(topics) > 3:
+            raise RuntimeError(
+                f"camera_topic_name: at most three topics are supported, got {len(topics)}")
+        suffixes = ['', '_1', '_2']
+        defaults = ['camera', 'camera_1', 'camera_2']
+        actions = []
+        labels = []
+        for i, sfx in enumerate(suffixes):
+            # Slots not given are cleared, so none is inherited from the shell:
+            topic = topics[i] if i < len(topics) else ''
+            actions.append(SetEnvironmentVariable(name='MOLA_CAMERA_TOPIC' + sfx, value=topic))
+            if topic:
+                labels.append(os.environ.get('MOLA_CAMERA_SENSOR_NAME' + sfx) or defaults[i])
+        if not os.environ.get('MOLA_SIMPLEMAP_ATTACH_LABEL'):
+            actions.append(SetEnvironmentVariable(
+                name='MOLA_SIMPLEMAP_ATTACH_LABEL', value='|'.join(re.escape(l) for l in labels)))
+        return actions
+    camera_topic_env_var = OpaqueFunction(function=_apply_camera_topic)
 
     # ~~~~~~~~~~~~
     # Subscription QoS overrides (per REP-2003 the defaults are best-effort
@@ -757,6 +810,8 @@ def generate_launch_description():
         imu_topic_name_env_var,
         attitude_imu_topic_name_arg,
         attitude_imu_topic_env_var,
+        camera_topic_name_arg,
+        camera_topic_env_var,
         imu_qos_reliability_arg,
         imu_qos_reliability_env_var,
         imu_qos_depth_arg,
