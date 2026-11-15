@@ -20,6 +20,7 @@
  */
 
 // This module:
+#include <mola_lidar_odometry/ImuBiasCorrection.h>
 #include <mola_lidar_odometry/LidarOdometry.h>
 
 // Others:
@@ -153,6 +154,13 @@ void LidarOdometry::onNewObservation(const CObservation::ConstPtr & o)
     params_.gnss_sensor_label &&
     std::regex_match(o->sensorLabel, params_.gnss_sensor_label.value())) {
     onGPS(o);
+  }
+
+  // Is it to be stored in simplemap keyframes (simplemap.attach_observations)?
+  // Inline, for the same reason as the IMU above: it only buffers.
+  if (!params_.simplemap.attach_observations.empty()) {
+    auto lckImu = mrpt::lockHelper(imu_state_mtx_);
+    storeForSimplemapByLabel(o);
   }
 
   // Is it a LIDAR obs?
@@ -597,6 +605,13 @@ void LidarOdometry::onIMUImpl(const CObservation::ConstPtr & o)
     // Rate stats are pure instrumentation, so they are updated on arrival: they
     // must keep reporting a live IMU even while no scan is being processed.
     state_.append_imu_stamp(imu->timestamp, *this);
+#if defined(MOLA_LO_HAS_IMU_BIAS_SOURCE)
+    // Also on arrival, for the GUI: the newest IMU reading, even while scans lag.
+    if (!imu_bias_gui_stamp_ || imu->timestamp > *imu_bias_gui_stamp_) {
+      imu_bias_gui_label_ = imu->sensorLabel;
+      imu_bias_gui_stamp_ = imu->timestamp;
+    }
+#endif
 
     // Keep the latest IMU observations for simplemap insertion. Kept apart
     // from pending_imu_ above, which is drained as the readings are consumed,
@@ -644,14 +659,49 @@ void LidarOdometry::onAttitudeIMU(const CObservation::ConstPtr & o)
 
 void LidarOdometry::storeImuForSimplemap(const mrpt::obs::CObservationIMU::ConstPtr & imu)
 {
-  if (params_.simplemap.save_imu_max_age <= 0) {
-    return;
+  if (state_.attach_source_imu) {
+    state_.attach_sources.at(*state_.attach_source_imu).add(imu);
   }
+}
 
-  state_.last_imu_.emplace(imu->timestamp, imu);
+void LidarOdometry::storeForSimplemapByLabel(const CObservation::ConstPtr & o)
+{
+  for (auto & src : state_.attach_sources) {
+    if (src.sensor_label && std::regex_match(o->sensorLabel, *src.sensor_label)) {
+      src.add(o);
+    }
+  }
+}
 
-  while (state_.last_imu_.size() > params_.imu_queue_max_size) {
-    state_.last_imu_.erase(state_.last_imu_.begin());
+void LidarOdometry::createKeyframeAttachSources()
+{
+  auto lckImu = mrpt::lockHelper(imu_state_mtx_);
+
+  auto & s = state_;
+  s.attach_sources.clear();
+  s.attach_source_gnss.reset();
+  s.attach_source_imu.reset();
+
+  // Without checking the sensor labels: only their callbacks feed these two,
+  // and the labels may be set after initialize() (e.g. by the CLI).
+  if (params_.simplemap.save_gnss_max_age > 0) {
+    s.attach_source_gnss = s.attach_sources.size();
+    s.attach_sources.push_back(
+      {{params_.simplemap.save_gnss_max_age, false, params_.gnss_queue_max_size},
+       std::nullopt,
+       {}});
+  }
+  if (params_.simplemap.save_imu_max_age > 0) {
+    s.attach_source_imu = s.attach_sources.size();
+    s.attach_sources.push_back(
+      {{params_.simplemap.save_imu_max_age, false, params_.imu_queue_max_size}, std::nullopt, {}});
+  }
+  for (const auto & a : params_.simplemap.attach_observations) {
+    s.attach_sources.push_back(
+      {{a.max_age, a.attach_once, a.queue_max_size}, std::regex(a.sensor_label), {}});
+    MRPT_LOG_INFO_FMT(
+      "Simplemap keyframes will store observations of '%s' (max_age=%.03f s, attach_once=%s)",
+      a.sensor_label.c_str(), a.max_age, a.attach_once ? "true" : "false");
   }
 }
 
@@ -666,12 +716,16 @@ void LidarOdometry::consumePendingImu(const double upToTime)
   mp2p_icp::metric_map_t dummy_map;
 
   for (const auto & imuPtr : pending_imu_.take_up_to(upToTime)) {
-    const auto & imu = *imuPtr;
-
-    // 1) Initial pitch/roll estimation:
+    // 1) Initial pitch/roll estimation: raw readings, as it estimates the bias
+    //    at rest itself.
     if (state_.imu_initializer.has_value()) {
       state_.imu_initializer->add(imuPtr);
     }
+
+    // Below, the gyroscope bias is removed if a bias source knows it:
+    mrpt::math::TVector3D accBias;
+    const auto correctedPtr = imuBiasCorrected(imuPtr, &accBias);
+    const auto & imu = *correctedPtr;
 
     // 2) Precise scan de-skewing is done via Generator, which in turns passes the IMU data to the
     //    LocalVelocityBuffer inside the ParameterSource.
@@ -679,20 +733,69 @@ void LidarOdometry::consumePendingImu(const double upToTime)
     //    out in updatePipelineDynamicVariables()
     mp2p_icp_filters::apply_generators(state_.obs_generators, imu, dummy_map);
 
-    // 3) Gravity estimation for ICP verticality correction:
+    // 3) Specific forces, to check the plausibility of predictions:
+    if (
+      imu.has(mrpt::obs::IMU_X_ACC) && imu.has(mrpt::obs::IMU_Y_ACC) &&
+      imu.has(mrpt::obs::IMU_Z_ACC)) {
+      const double t = mrpt::Clock::toDouble(imu.timestamp);
+      auto & buf = state_.recent_specific_force;
+      if (buf.empty() || t > buf.back().stamp) {
+        const mrpt::math::TVector3D f(
+          imu.get(mrpt::obs::IMU_X_ACC), imu.get(mrpt::obs::IMU_Y_ACC),
+          imu.get(mrpt::obs::IMU_Z_ACC));
+        MethodState::SpecificForce sf;
+        sf.stamp = t;
+        sf.f = imu.sensorPose.rotateVector(f);
+        sf.acc_bias = imu.sensorPose.rotateVector(accBias);
+        buf.push_back(sf);
+        constexpr double MAX_AGE = 2.0;  // [s]
+        while (buf.front().stamp < t - MAX_AGE) {
+          buf.pop_front();
+        }
+      }
+    }
+
+    // 4) Gravity estimation for ICP verticality correction:
     if (params_.imu_gravity_correction.enabled) {
       state_.gravity_estimator.add(imu, params_.imu_gravity_correction.averaging_samples);
 
 #if defined(MOLA_LO_HAS_MAP_GRAVITY_ESTIMATOR)
-      // 3b) Preintegrate for the map-frame gravity estimator. Unlike the
+      // 4b) Preintegrate for the map-frame gravity estimator. Unlike the
       //     accelerometer average above, this consumes EVERY sample and does not
       //     require the platform to be quasi-static.
       if (params_.imu_gravity_correction.map_gravity.enabled) {
-        accumulateImuForMapGravity(imu);
+        // Raw readings: it estimates the gyroscope bias itself.
+        accumulateImuForMapGravity(*imuPtr);
       }
 #endif
     }
   }
+}
+
+mrpt::obs::CObservationIMU::ConstPtr LidarOdometry::imuBiasCorrected(
+  const mrpt::obs::CObservationIMU::ConstPtr & imu, mrpt::math::TVector3D * accBias)
+{
+  if (accBias) {
+    *accBias = {0, 0, 0};
+  }
+#if defined(MOLA_LO_HAS_IMU_BIAS_SOURCE)
+  if (imu_bias_sources_.empty()) {
+    return imu;
+  }
+  auto [out, bias] = remove_imu_gyro_bias(imu, imu_bias_sources_);
+  if (bias && accBias) {
+    *accBias = bias->acc;
+  }
+  if (bias && !imu_bias_first_use_logged_) {
+    imu_bias_first_use_logged_ = true;
+    MRPT_LOG_INFO_STREAM(
+      "Removing the gyroscope bias of '" << imu->sensorLabel << "': " << bias->gyro.asString()
+                                         << " rad/s");
+  }
+  return out;
+#else
+  return imu;
+#endif
 }
 
 void LidarOdometry::onGPS(const CObservation::ConstPtr & o)
@@ -746,11 +849,8 @@ void LidarOdometry::onGPSImpl(const CObservation::ConstPtr & o)
   state_.append_gnss_stamp(gps->timestamp, *this);
 
   // Keep the latest GPS observations for simplemap insertion:
-  state_.last_gnss_.emplace(gps->timestamp, gps);
-
-  // remove old ones:
-  while (state_.last_gnss_.size() > params_.gnss_queue_max_size) {
-    state_.last_gnss_.erase(state_.last_gnss_.begin());
+  if (state_.attach_source_gnss) {
+    state_.attach_sources.at(*state_.attach_source_gnss).add(gps);
   }
 }
 
