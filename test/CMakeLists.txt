@@ -3,6 +3,9 @@
 ament_add_gtest(test_icp_prior test_icp_prior.cpp)
 target_link_libraries(test_icp_prior mola::mola_lidar_odometry)
 
+ament_add_gtest(test_gravity_leveler test_gravity_leveler.cpp)
+target_link_libraries(test_gravity_leveler mola::mola_lidar_odometry)
+
 ament_add_gtest(test_keyframe_decider test_keyframe_decider.cpp)
 target_link_libraries(test_keyframe_decider mola::mola_lidar_odometry)
 
@@ -12,11 +15,24 @@ target_link_libraries(test_map_frame_relevel mola::mola_lidar_odometry mrpt::mrp
 ament_add_gtest(test_imu_scan_sync test_imu_scan_sync.cpp)
 target_link_libraries(test_imu_scan_sync mola::mola_lidar_odometry mrpt::mrpt_obs)
 
+ament_add_gtest(test_imu_bias_correction test_imu_bias_correction.cpp)
+target_link_libraries(test_imu_bias_correction mola::mola_lidar_odometry mrpt::mrpt_obs)
+
+ament_add_gtest(test_point_time_outlier_filter test_point_time_outlier_filter.cpp)
+target_link_libraries(test_point_time_outlier_filter mola::mola_lidar_odometry)
+
 # Every shipped pipeline, with its blocks, must resolve to a complete config:
 ament_add_gtest(test_pipelines_load test_pipelines_load.cpp
   ENV LO_PIPELINES_DIR=${mola_lidar_odometry_SOURCE_DIR}/pipelines
 )
 target_link_libraries(test_pipelines_load mola::mola_lidar_odometry mola::mola_yaml)
+
+# The dataset-profile library's choice of state estimator class:
+ament_add_test(test_dataset_profile_estimator
+  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test_dataset_profile_estimator.sh
+    ${mola_lidar_odometry_SOURCE_DIR}/scripts/lib/dataset-profile.sh
+  GENERATE_RESULT_FOR_RETURN_CODE_ZERO
+)
 
 # -----------------------------------------------------------------------
 # Data-dependent integration tests (require optional packages):
@@ -68,6 +84,23 @@ if(mola_metric_maps_FOUND AND mola_state_estimation_simple_FOUND)
     ENV MOLA_PROFILER=false
   )
   target_link_libraries(test_robustness
+    mrpt::mrpt_obs
+    mola::mola_state_estimation_simple
+    mola::mola_lidar_odometry
+  )
+endif()
+
+# Test: the local map rebuilt from the keyframes of a central map after one of
+# its corrections, on synthetic data generated on the fly: no dataset needed.
+# ------------------------------------------------------------------------------
+if(mola_metric_maps_FOUND AND mola_state_estimation_simple_FOUND)
+  ament_add_gtest(test_local_map_rebuild test_local_map_rebuild.cpp
+    TIMEOUT 600
+    ENV LO_PIPELINE_YAML=${mola_lidar_odometry_SOURCE_DIR}/pipelines/lidar3d-default.yaml
+    ENV LO_STATE_ESTIM_YAML=${mola_lidar_odometry_SOURCE_DIR}/state-estimator-params/state-estimation-simple.yaml
+    ENV MOLA_PROFILER=false
+  )
+  target_link_libraries(test_local_map_rebuild
     mrpt::mrpt_obs
     mola::mola_state_estimation_simple
     mola::mola_lidar_odometry
