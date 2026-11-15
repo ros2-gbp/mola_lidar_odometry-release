@@ -14,6 +14,19 @@ params:
     lidar_count: ${MOLA_LIDAR_COUNT|1} # useful only if using several lidar_sensor_labels or regex's.
     max_time_offset: ${MOLA_LIDAR_MAX_TIME_OFFSET|0.1} # [s]
 
+  # Per-point time outliers: points whose time ("t" field) is far outside the
+  # usual [min, max] of the recent scans of their sensor (median of the last
+  # window_length scans, widened by the largest of margin_ratio of its width,
+  # min_margin and the sensor period) are removed before the time adjustment,
+  # e.g. columns stamped after a jump of the LiDAR clock, which would otherwise
+  # move the scan time.
+  point_time_outliers:
+    enabled: ${MOLA_POINT_TIME_OUTLIERS|true}
+    window_length: 50 # [scans]
+    min_window_length: 10 # [scans] nothing removed before this
+    margin_ratio: ${MOLA_POINT_TIME_OUTLIERS_MARGIN_RATIO|0.5}
+    min_margin: 0.01 # [s]
+
   # These sensor labels will be handled as IMU observations:
   imu_sensor_label: "${MOLA_IMU_NAME|imu}"
 
@@ -30,6 +43,11 @@ params:
   # sweep (e.g. leg or wheel odometry) instead of the state estimator's, which
   # is derived from this odometry's own registrations:
   deskew_odometry_sensor_label: "${MOLA_DESKEW_ODOMETRY_NAME|}"
+
+  # If another module offers IMU bias estimates (e.g. the state estimator with
+  # imu_bias_tracking), remove the gyroscope bias of each IMU reading before
+  # using it for de-skew and gravity alignment:
+  use_imu_bias_source: ${MOLA_LO_USE_IMU_BIAS_SOURCE|true}
 
   # Optionally, drop lidar data too close in time:
   min_time_between_scans: 1e-3 # [seconds]

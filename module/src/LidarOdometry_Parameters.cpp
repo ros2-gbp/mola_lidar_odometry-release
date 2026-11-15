@@ -28,6 +28,20 @@
 namespace mola
 {
 
+void LidarOdometry::Parameters::LearnedCovariance::initialize(const Yaml & cfg)
+{
+  YAML_LOAD_OPT(model_file, std::string);
+  YAML_LOAD_OPT(scan_layer, std::string);
+  YAML_LOAD_OPT(window_scans, uint32_t);
+  ASSERT_GT_(window_scans, 0U);
+  if (cfg.has("context")) {
+    ASSERT_(cfg["context"].isMap());
+    for (const auto & [k, v] : cfg["context"].asMapRange()) {
+      context[k.as<std::string>()] = v.as<std::string>();
+    }
+  }
+}
+
 void LidarOdometry::Parameters::Diagnostics::initialize(const Yaml & cfg)
 {
   YAML_LOAD_OPT(icp_quality_warn, double);
@@ -108,6 +122,16 @@ void LidarOdometry::Parameters::AdaptiveThreshold::initialize(const Yaml & cfg)
       "adaptive_threshold: recover_growth_factor (%.3f) must be > 1.0", recover_growth_factor));
 }
 
+void LidarOdometry::Parameters::StallRecovery::initialize(const Yaml & cfg)
+{
+  YAML_LOAD_OPT(enabled, bool);
+  YAML_LOAD_OPT(after_n_scans, uint32_t);
+
+  ASSERTMSG_(
+    after_n_scans >= 1,
+    mrpt::format("stall_recovery: after_n_scans (%u) must be >= 1", after_n_scans));
+}
+
 void LidarOdometry::Parameters::Visualization::initialize(const Yaml & cfg)
 {
   YAML_LOAD_OPT(map_update_decimation, int);
@@ -153,6 +177,13 @@ void LidarOdometry::Parameters::Visualization::initialize(const Yaml & cfg)
 
   MCP_LOAD_OPT(cfg, local_map_colormap);
   MCP_LOAD_OPT(cfg, local_map_colormap_color_by_field);
+  MCP_LOAD_OPT(cfg, colormap_outliers_percentile);
+  if (const auto mn = cfg.getOrDefault<std::string>("local_map_colormap_min", ""); !mn.empty()) {
+    local_map_colormap_min = std::stof(mn);
+  }
+  if (const auto mx = cfg.getOrDefault<std::string>("local_map_colormap_max", ""); !mx.empty()) {
+    local_map_colormap_max = std::stof(mx);
+  }
 
   YAML_LOAD_OPT(gui_subwindow_starts_hidden, bool);
   YAML_LOAD_OPT(show_tab_status, bool);
@@ -273,6 +304,38 @@ void LidarOdometry::Parameters::SimpleMapOptions::initialize(const Yaml & cfg, P
   YAML_LOAD_OPT(save_gnss_max_age, double);
   YAML_LOAD_OPT(save_imu_max_age, double);
   YAML_LOAD_OPT(save_deskewed_scans, bool);
+  YAML_LOAD_OPT(image_format, std::string);
+  YAML_LOAD_OPT(jpeg_quality, int);
+  ASSERTMSG_(
+    is_valid_keyframe_image_format(image_format),
+    "simplemap.image_format must be one of: jpg, png, inline. Got: '" + image_format + "'");
+  ASSERTMSG_(
+    jpeg_quality >= 1 && jpeg_quality <= 100,
+    mrpt::format("simplemap.jpeg_quality must be in [1,100], got %d", jpeg_quality));
+
+  attach_observations.clear();
+  if (cfg.has("attach_observations") && !cfg["attach_observations"].isNullNode()) {
+    ASSERTMSG_(
+      cfg["attach_observations"].isSequence(), "simplemap.attach_observations must be a sequence");
+    const auto entries = cfg["attach_observations"].asSequence();
+    for (const auto & e : entries) {
+      const auto entry = Yaml(e);
+      AttachedObservation a;
+      a.sensor_label = entry.getOrDefault<std::string>("sensor_label", a.sensor_label);
+      a.max_age = entry.getOrDefault<double>("max_age", a.max_age);
+      a.attach_once = entry.getOrDefault<bool>("attach_once", a.attach_once);
+      a.queue_max_size = entry.getOrDefault<uint32_t>("queue_max_size", a.queue_max_size);
+      // An empty label disables the entry, so a YAML can leave it to an
+      // environment variable:
+      if (!a.sensor_label.empty()) {
+        ASSERTMSG_(
+          a.max_age >= 0 && a.queue_max_size > 0,
+          "simplemap.attach_observations: max_age must be >= 0 and queue_max_size > 0 ('" +
+            a.sensor_label + "')");
+        attach_observations.push_back(a);
+      }
+    }
+  }
 }
 
 void LidarOdometry::Parameters::MultipleLidarOptions::initialize(
@@ -290,6 +353,8 @@ void LidarOdometry::Parameters::MapUpdateOptions::initialize(const Yaml & cfg, P
   DECLARE_PARAMETER_IN_OPT(cfg, check_for_removal_every_n, parent);
   DECLARE_PARAMETER_IN_OPT(cfg, publish_map_updates_every_n, parent);
   YAML_LOAD_OPT(publish_local_map, bool);
+  YAML_LOAD_OPT(rebuild_on_corrections, bool);
+  YAML_LOAD_OPT(rebuild_keyframe_spacing, double);
   YAML_LOAD_OPT(load_existing_local_map, std::string);
   YAML_LOAD_OPT(save_final_local_map, std::string);
 
@@ -365,6 +430,7 @@ void LidarOdometry::Parameters::InitialLocalizationOptions::GlobalSearch::initia
   YAML_LOAD_OPT(max_position_sigma, double);
   YAML_LOAD_OPT(resolution_xy, double);
   YAML_LOAD_OPT(resolution_yaw_deg, double);
+  YAML_LOAD_OPT(max_initial_guesses, int);
   YAML_LOAD_OPT(z_from_map_radius, double);
   ASSERT_GE_(z_from_map_radius, 0.0);
   YAML_LOAD_OPT(icp_threshold, double);
@@ -377,6 +443,7 @@ void LidarOdometry::Parameters::InitialLocalizationOptions::GlobalSearch::initia
 
   ASSERT_GT_(resolution_xy, 0);
   ASSERT_GT_(resolution_yaw_deg, 0);
+  ASSERT_GT_(max_initial_guesses, 0);
   ASSERT_LE_(min_half_width_xy, max_half_width_xy);
   ASSERT_GE_(min_half_width_yaw_deg, 0.0);
 }
