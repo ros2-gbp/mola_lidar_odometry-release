@@ -161,6 +161,15 @@ runs **MOLA-LO** live on point clouds received from a ROS 2 topic, **demonstrati
       Its readings are only stored into simplemap keyframes, for later
       geo-referencing, instead of those of ``imu_topic_name``.
 
+    * ``camera_topic_name`` (default ``""``, disabled):
+      Optional ``sensor_msgs/Image`` topics, comma-separated, up to three (labels ``camera``,
+      ``camera_1``, ``camera_2``). Their images are only stored into simplemap keyframes, one
+      of each camera per keyframe, the closest in time (``MOLA_SIMPLEMAP_ATTACH_LABEL``, set to
+      their labels by the launch file unless already set), e.g. for visual place recognition.
+      Needs ``generate_simplemap:=True`` and a ``BridgeROS2`` with image support. Raw images only
+      (not ``CompressedImage``), and the camera frames must be in ``/tf`` (or use the fixed poses
+      below). Use low-rate topics: every image is decoded.
+
     * ``enforce_planar_motion`` (default ``False``):
       Whether to enforce z, pitch, and roll to be zero.
 
@@ -297,6 +306,11 @@ runs **MOLA-LO** live on point clouds received from a ROS 2 topic, **demonstrati
       If non-empty, BridgeROS2 subscribes directly to this ``nav_msgs/Odometry`` topic
       and forwards each message as a 3D ``CObservationRobotPose`` (6×6 covariance),
       preferred for smoother fusion. Mutually exclusive with ``forward_ros_tf_odom_to_mola``.
+      With ``MOLA_ODOM_AS_ROBOT_POSE_OBS=false``, it is forwarded as a planar
+      ``CObservationOdometry`` instead, which the smoother fuses with its wheel odometry
+      motion model (``odom_motion_model_a1..a4``) rather than with the
+      ``relative_pose_increment_sigma_*`` shared by every pose source (e.g. LiDAR odometry
+      published in its own frame), so wheels and LiDAR odometry can be weighted apart.
 
     * ``publish_local_map`` (default ``True``):
       Whether to publish the local map as a point cloud on ``/lidar_odometry/localmap_points``.
@@ -410,6 +424,11 @@ runs **MOLA-LO** live on point clouds received from a ROS 2 topic, **demonstrati
         - ``LIDAR_POSE_X``, ``LIDAR_POSE_Y``, ``LIDAR_POSE_Z`` (in meters).
         - ``LIDAR_POSE_YAW``, ``LIDAR_POSE_PITCH``, ``LIDAR_POSE_ROLL`` (in degrees).
 
+    - ``MOLA_LIDAR_TIME_OFFSET`` (Default: ``0.0``): A constant correction, in seconds, added to
+      the LiDAR stamps, e.g. for a driver that stamps each cloud at the end of its sweep.
+      ROS 1 bags only (rosbag1 launch and ``mola-lidar-odometry-cli`` with a ``.bag``); not
+      available for ROS 2 bags or live input.
+
     - ``MOLA_GNSS_TOPIC`` (Default: ``'/gps'``): The ``sensor_msgs/NavSatFix`` topic with GNSS data (optional).
     
     - ``MOLA_USE_FIXED_GNSS_POSE`` (Default: ``false``): If false, sensor pose will be retrieved from ``/tf``. You can also set it to true and then the sensor pose will be given by these env. variables:
@@ -429,6 +448,19 @@ runs **MOLA-LO** live on point clouds received from a ROS 2 topic, **demonstrati
       Setting the topic is enough with ``mola-lo-gui-rosbag2``, ``mola-lo-cli-rosbag2`` and the ROS 2 launch file
       (``attitude_imu_topic_name:=``). Running ``lidar_odometry_from_rosbag2.yaml`` directly with ``mola-cli`` also
       needs ``MOLA_ATTITUDE_IMU_NAME=imu_attitude`` (see :ref:`pipeline sensor inputs <mola_lo_pipeline_sensor_inputs>`).
+
+    - ``MOLA_CAMERA_TOPIC``, ``MOLA_CAMERA_TOPIC_1``, ``MOLA_CAMERA_TOPIC_2`` (Default: empty, disabled): Up to
+      three ``sensor_msgs/Image`` topics (labels ``MOLA_CAMERA_SENSOR_NAME``, ``_1``, ``_2``, defaults ``camera``,
+      ``camera_1``, ``camera_2``), whose images are stored into simple-map keyframes if
+      ``MOLA_SIMPLEMAP_ATTACH_LABEL`` matches their labels (the ROS 2 launch file sets all of them with
+      ``camera_topic_name:=``). ``MOLA_CAMERA_QOS_DEPTH`` (Default: ``5``) and ``MOLA_CAMERA_QOS_RELIABILITY``
+      (Default: ``best_effort``), live only.
+
+    - ``MOLA_USE_FIXED_CAMERA_POSE`` (Default: ``false``): If false, the camera pose will be retrieved from ``/tf``.
+      Else, from ``CAMERA_POSE_X``, ``CAMERA_POSE_Y``, ``CAMERA_POSE_Z`` (in meters) and ``CAMERA_POSE_YAW``,
+      ``CAMERA_POSE_PITCH``, ``CAMERA_POSE_ROLL`` (in degrees). The same for the other two cameras with
+      ``MOLA_USE_FIXED_CAMERA_1_POSE`` / ``CAMERA_1_POSE_*`` and ``MOLA_USE_FIXED_CAMERA_2_POSE`` /
+      ``CAMERA_2_POSE_*`` (ROS 2 node and rosbag1 inputs).
 
 
 .. dropdown:: More LO parameters
