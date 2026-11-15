@@ -172,6 +172,10 @@ void LidarOdometry::initialize_frontend(const Yaml & c)
       }
     }
 
+    if (cfg.has("use_imu_bias_source")) {
+      params_.use_imu_bias_source = cfg["use_imu_bias_source"].as<bool>();
+    }
+
     if (cfg.has("deskew_odometry_sensor_label")) {
       const auto label = cfg["deskew_odometry_sensor_label"].as<std::string>();
       if (!label.empty()) {
@@ -184,6 +188,17 @@ void LidarOdometry::initialize_frontend(const Yaml & c)
 
     if (cfg.has("multiple_lidars")) {
       params_.multiple_lidars.initialize(cfg["multiple_lidars"], params_);
+    }
+
+    if (cfg.has("point_time_outliers")) {
+      const auto & pto = cfg["point_time_outliers"];
+      auto & p = params_.point_time_outliers;
+      p.enabled = pto.getOrDefault("enabled", p.enabled);
+      p.window_length = pto.getOrDefault("window_length", p.window_length);
+      p.min_window_length = pto.getOrDefault("min_window_length", p.min_window_length);
+      p.margin_ratio = pto.getOrDefault("margin_ratio", p.margin_ratio);
+      p.min_margin = pto.getOrDefault("min_margin", p.min_margin);
+      p.validate();
     }
 
     // this one is std::optional
@@ -218,6 +233,7 @@ void LidarOdometry::initialize_frontend(const Yaml & c)
     YAML_LOAD_OPT(params_, gnss_queue_max_size, uint32_t);
     YAML_LOAD_OPT(params_, imu_queue_max_size, uint32_t);
     YAML_LOAD_OPT(params_, min_motion_model_xyz_cov_inv, double);
+    YAML_LOAD_OPT(params_, motion_model_max_extra_acceleration, double);
 
     YAML_LOAD_OPT(params_, optimize_twist, bool);
     YAML_LOAD_OPT(params_, optimize_twist_rerun_min_trans, double);
@@ -232,8 +248,34 @@ void LidarOdometry::initialize_frontend(const Yaml & c)
       params_.adaptive_threshold.initialize(cfg["adaptive_threshold"]);
     }
 
+    if (cfg.has("stall_recovery")) {
+      params_.stall_recovery.initialize(cfg["stall_recovery"]);
+    }
+
     if (cfg.has("diagnostics")) {
       params_.diagnostics.initialize(cfg["diagnostics"]);
+    }
+
+    if (cfg.has("learned_covariance")) {
+      params_.learned_covariance.initialize(cfg["learned_covariance"]);
+    }
+    if (params_.learned_covariance.enabled()) {
+#if defined(MOLA_LO_HAS_MP2P_LEARNED_COVARIANCE)
+      const auto & lc = params_.learned_covariance;
+      mp2p_icp::LearnedCovarianceEstimator::Parameters lcp;
+      lcp.model_file = lc.model_file;
+      lcp.window_scans = lc.window_scans;
+      lcp.context = lc.context;
+      state_.learned_cov = std::make_shared<mp2p_icp::LearnedCovarianceEstimator>(lcp);
+      MRPT_LOG_INFO_STREAM(
+        "Learned registration covariance: " << state_.learned_cov->model().numMembers()
+                                            << " members from '" << lc.model_file << "' ("
+                                            << state_.learned_cov->model().note() << ")");
+#else
+      THROW_EXCEPTION(
+        "learned_covariance.model_file is set, but this build of mp2p_icp has no "
+        "LearnedCovarianceEstimator");
+#endif
     }
 
     if (cfg.has("visualization")) {
@@ -255,6 +297,7 @@ void LidarOdometry::initialize_frontend(const Yaml & c)
     if (cfg.has("simplemap")) {
       params_.simplemap.initialize(cfg["simplemap"], params_);
     }
+    createKeyframeAttachSources();
 
     if (cfg.has("estimated_trajectory")) {
       params_.estimated_trajectory.initialize(cfg["estimated_trajectory"]);
@@ -556,6 +599,32 @@ void LidarOdometry::initialize_frontend(const Yaml & c)
     }
   }
 #endif
+#if defined(MOLA_LO_HAS_LOCAL_MAP_REBUILD)
+  startLocalMapRebuild();
+#endif
+
+#if defined(MOLA_LO_HAS_IMU_BIAS_SOURCE)
+  // Optional: IMU bias estimates from another module (e.g. the state estimator).
+  {
+    auto lckImu = mrpt::lockHelper(imu_state_mtx_);
+    imu_bias_sources_.clear();
+    imu_bias_gui_label_.clear();
+    imu_bias_gui_stamp_.reset();
+  }
+  if (params_.use_imu_bias_source) {
+    auto lckImu = mrpt::lockHelper(imu_state_mtx_);
+    for (const auto & m : findService<mola::ImuBiasSource>()) {
+      if (auto src = std::dynamic_pointer_cast<mola::ImuBiasSource>(m); src) {
+        imu_bias_sources_.push_back(src);
+      }
+    }
+    if (!imu_bias_sources_.empty()) {
+      MRPT_LOG_DEBUG_STREAM(
+        "Detected " << imu_bias_sources_.size()
+                    << " IMU bias source(s): gyro biases will be removed from IMU readings.");
+    }
+  }
+#endif
 
 #if defined(MOLA_HAS_TRANSFORM_TREE_SOURCE)
   // Optional: a data source exposing a /tf tree, used only by the (opt-in)
@@ -645,6 +714,9 @@ void LidarOdometry::doPreloadLocalMap()
 
     state_.mark_local_map_as_updated(true);
     state_.mark_local_map_georef_as_updated();
+#if defined(MOLA_LO_HAS_LOCAL_MAP_REBUILD)
+    invalidateLocalMapRebuild();
+#endif
 
     // Pre-warm ICP search structures for each layer that supports it.
     //
