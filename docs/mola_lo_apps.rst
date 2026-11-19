@@ -22,7 +22,7 @@ and CLI usage, next we list the environment variables common to all of them.
 
 .. note::
 
-    Apart of the environment variables defined here, which are **specific** to these
+    Apart from the environment variables defined here, which are **specific** to these
     mola-cli launch files (see: :ref:`role of MOLA-LO module <mola-lo-role>`),
     remember that there are **many additional parameters**
     associated to the LO pipeline YAML file, listed `here <pipelines_env_vars>`_.
@@ -34,7 +34,7 @@ Common elements of all GUI apps
 ---------------------------------
 ``mola_viz`` provides a unified API for all MOLA modules to display custom UI subwindows, controls, and 3D objects.
 Next we describe how to manipulate or interpret the **common elements in this UI**, which is the same in all MOLA-LO
-programs, except ``mola-lidar-odometry-cli`` which is explicitly design not to have any GUI.
+programs, except ``mola-lidar-odometry-cli`` which is explicitly designed not to have any GUI.
 
 .. image:: imgs/gui_parts.png
 
@@ -128,30 +128,8 @@ This command will open the mola_viz GUI and build a map from ROS 2 bags:
         mola-lo-gui-rosbag2 /path/to/your/dataset_directory/
 
 
-.. dropdown:: Does your bag lack ``/tf``?
-    :icon: alert
-
-    By default, MOLA will try to use ``tf2`` messages in the rosbag to find out the relative pose
-    of the LiDAR sensor with respect to the vehicle frame (default: ``base_link``). If your system **does not** have ``tf`` data
-    (for example, if you only launched the LiDAR driver node) you must then set the environment variable ``MOLA_USE_FIXED_LIDAR_POSE=true``
-    to use the default (identity) sensor pose on the vehicle. So, launch it like: 
-
-    .. code-block:: bash
-
-        MOLA_USE_FIXED_LIDAR_POSE=true \
-        MOLA_LIDAR_TOPIC=/ouster/points \
-        mola-lo-gui-rosbag2 /path/to/your/dataset.mcap
-
-    In the common case of launching only the Ouster ROS 2 driver node, you may already have the
-    ``/tf_static`` messages defining the TF frames ``os_sensor``, ``os_lidar``, and ``os_imu``, so
-    you can make use of them with:
-
-    .. code-block:: bash
-
-        MOLA_TF_BASE_LINK=os_sensor  \
-        MOLA_LIDAR_TOPIC=/ouster/points \
-        mola-lo-gui-rosbag2 /path/to/your/dataset.mcap
-
+If your bag has no ``/tf`` for the sensors, see :ref:`your_own_rosbag`. If only the Ouster
+driver was recorded, ``MOLA_TF_BASE_LINK=os_sensor`` uses the frames of its own ``/tf_static``.
 
 Environment variables specific for ``mola-lo-gui-rosbag2``:
 
@@ -165,12 +143,12 @@ Environment variables specific for ``mola-lo-gui-rosbag2``:
 
 |
 
-- ``MOLA_TIME_WARP`` (Default: 1.0): Time wrapping for rosbag replay.
+- ``MOLA_TIME_WARP`` (Default: 1.0): Time warping (playback speed factor) for the replay.
 
 - ``MOLA_DATASET_START_PAUSED`` (Default: false): Start with replay paused. Then can be resumed from the GUI.
 
 Also, see :ref:`variables to control sensor inputs <mola_lo_ros_mola-cli-env-vars>`, including
-manually-provided sensor poses for the LiDAR, IMU, or GNNS sensors.
+manually-provided sensor poses for the LiDAR, IMU, or GNSS sensors.
 
 |
 
@@ -190,7 +168,7 @@ Environment variables specific for ``mola-lo-gui-rawlog``:
 
 |
 
-- ``MOLA_TIME_WARP`` (Default: 1.0): Time wrapping for rosbag replay.
+- ``MOLA_TIME_WARP`` (Default: 1.0): Time warping (playback speed factor) for the replay.
 
 - ``MOLA_DATASET_START_PAUSED`` (Default: false): Start with replay paused. Then can be resumed from the GUI.
 
@@ -201,32 +179,13 @@ Environment variables specific for ``mola-lo-gui-rawlog``:
 
 
 .. _mola-lo-gui-kitti:
+.. _mola_lo_gui_mulran:
 
-1.3. mola-lo-gui-kitti
+1.3. Public datasets
 ------------------------------
-Runs MOLA-LO on a sequence of the KITTI odometry dataset :cite:`geiger2013vision`.
-
-.. dropdown:: How to run it
-   :icon: checklist
-
-   - Download the KITTI Odometry dataset and extract them anywhere, such as the files layout matches
-     the expected tree structure described in :ref:`doxid-classmola_1_1_kitti_odometry_dataset`.
-   - Set the environment variable ``KITTI_BASE_DIR`` to the root "KITTI" directory in the tree layout above:
-
-     .. code-block:: bash
-
-        export KITTI_BASE_DIR=/path/to/dataset/
-
-   - And run it for the desired sequence number:
-
-     .. code-block:: bash
-
-        # mola-lo-gui-kitti SEQUENCE
-        # SEQUENCE: 00,01,...21
-        
-        # Example:
-        mola-lo-gui-kitti 00
-
+Each supported public dataset (KITTI, MulRan, Newer College, ...) has its own launcher,
+``mola-lo-gui-<dataset>``, and a page with where to put the data and the exact commands:
+see :ref:`supported_datasets`.
 
 .. raw:: html
 
@@ -236,87 +195,24 @@ Runs MOLA-LO on a sequence of the KITTI odometry dataset :cite:`geiger2013vision
      </video>
    </div>
 
-.. dropdown:: Inner workings
-   :icon: light-bulb
-
-   - mola-cli launch file: `mola-cli-launchs/lidar_odometry_from_kitti.yaml <https://github.com/MOLAorg/mola_lidar_odometry/blob/develop/mola-cli-launchs/lidar_odometry_from_kitti.yaml>`_
-   - Dataset C++ MOLA module: :ref:`doxid-classmola_1_1_kitti_odometry_dataset`
-
-|
-
-
-
-1.4. mola-lo-gui-kitti360
-------------------------------
-Runs MOLA-LO on a sequence of the KITTI-360 dataset.
-
-
-|
-
-
-.. _mola_lo_gui_mulran:
-
-
-1.5. mola-lo-gui-mulran
-------------------------------
-Runs MOLA-LO on a sequence of the Mulran dataset.
-
-.. dropdown:: How to run it
-   :icon: checklist
-
-    - Download the MulRan dataset (:cite:`gskim-2020-mulran`) from their `website <https://sites.google.com/view/mulran-pr/>`_,
-      and extract the files anywhere in your system such as the files layout is as expected by :ref:`mola::MulranDataset <doxid-classmola_1_1_mulran_dataset>`.
-
-    - Set the environment variable ``MULRAN_BASE_DIR`` to the root directory of your dataset, for example: 
-
-    .. code-block:: bash
-
-        export MULRAN_BASE_DIR=/home/myuser/mulran/
-
-    - And run it for the desired sequence:
-
-    .. code-block:: bash
-
-        # mola-lo-gui-mulran SEQUENCE
-        # SEQUENCE: KAIST01, KAIST02,..., DCC03,...
-        
-        # Example:
-        mola-lo-gui-mulran KAIST01
-
-        # Example using the 3D-NDT alternative pipeline:
-        MOLA_ODOMETRY_PIPELINE_YAML=$(ros2 pkg prefix mola_lidar_odometry)/share/mola_lidar_odometry/pipelines/lidar3d-ndt.yaml \
-        MOLA_LOCAL_VOXELMAP_RESOLUTION=5.0 \
-        mola-lo-gui-mulran KAIST01
-
-.. raw:: html
-
-   <div style="width: 100%; overflow: hidden;">
-     <video controls autoplay loop muted style="width: 100%;">
-       <source src="https://mrpt.github.io/videos/mola-slam-mulran-demo-ndt.mp4" type="video/mp4">
-     </video>
-   </div>
-
-
-
-.. dropdown:: Inner workings
-   :icon: light-bulb
-
-   - mola-cli launch file: `mola-cli-launchs/lidar_odometry_from_mulran.yaml <https://github.com/MOLAorg/mola_lidar_odometry/blob/develop/mola-cli-launchs/lidar_odometry_from_mulran.yaml>`_
-   - Dataset C++ MOLA module: :ref:`mola::MulranDataset <doxid-classmola_1_1_mulran_dataset>`
-
-
 |
 
 .. _mola-gui-apps-common-env-vars:
 
-1.6. Common env variables
+1.4. Common env variables
 ------------------------------
 
 - ``MOLA_ODOMETRY_PIPELINE_YAML`` (Default: the installed ``lidar3d-default.yaml``,
   which is a symlink to :ref:`lidar3d-gicp.yaml <mola_3d_gicp_pipeline>`): set it to
   override the default pipeline and experiment with custom MOLA-LO systems described
-  through a modified YAML file. See :ref:`the available pipelines <mola_icp_pipelines_summary>`,
-  and the example for :ref:`mola-lo-gui-mulran <mola_lo_gui_mulran>`.
+  through a modified YAML file. See :ref:`the available pipelines <mola_icp_pipelines_summary>`.
+  For example, to use the 3D-NDT pipeline:
+
+  .. code-block:: bash
+
+     MOLA_ODOMETRY_PIPELINE_YAML=$(ros2 pkg prefix mola_lidar_odometry)/share/mola_lidar_odometry/pipelines/lidar3d-ndt.yaml \
+     MOLA_LOCAL_VOXELMAP_RESOLUTION=5.0 \
+       mola-lo-gui-mulran KAIST01
 
 - ``MOLA_WITH_GUI`` (Default: ``true``): set to ``false`` to run a ``mola-lo-gui-*``
   launcher headless, e.g. over ssh or in a batch job.
@@ -387,30 +283,8 @@ Process a ROS 2 bag
     Scans are then written to ``myMap_Images/`` next to the map while running, which ``sm2mm`` and
     other tools find by themselves.
 
-.. dropdown:: Does your bag lack ``/tf``?
-    :icon: alert
-
-    By default, ``mola-lidar-odometry-cli`` will try to use ``tf2`` messages in the rosbag to find out the relative pose
-    of the LiDAR sensor with respect to the vehicle frame (default: ``base_link``). If your system **does not** have ``tf`` data
-    (for example, if you only launched the LiDAR driver node) you must then set the environment variable ``MOLA_USE_FIXED_LIDAR_POSE=true``
-    to use the default (identity) sensor pose on the vehicle. So, launch it like: 
-
-    .. code-block:: bash
-
-        MOLA_USE_FIXED_LIDAR_POSE=true \
-        mola-lidar-odometry-cli \
-          [...]  # the rest does not change.
-
-    If you forget adding this flag, tons of errors like this will show up:
-
-    .. code-block:: bash
-
-        [ERROR|mola::Rosbag2Dataset:dataset_input] findOutSensorPose (label='lidar', hesai_lidar<-base_link): "base_link" passed to lookupTransform argument target_frame does not exist. 
-        [ERROR|mola::Rosbag2Dataset:dataset_input] Exception while processing topic message (ignore if the error stops later one, e.g. missing /tf):
-        ==== MRPT exception ====
-        Message:  Assert condition failed: sensorPoseOK
-
-
+If your bag has no ``/tf`` for the sensors, see :ref:`your_own_rosbag`: otherwise, MOLA keeps
+reporting that ``base_link`` does not exist in ``/tf``.
 
 .. dropdown:: Want to visualize the output in real-time?
     :icon: light-bulb
@@ -545,24 +419,19 @@ are already working and publishing ROS topics.
    REP-105 on/off, namespaces, GNSS modes) see the
    :ref:`MOLA in ROS 2 cookbook <mola_ros2_cookbook>`.
 
-.. dropdown:: Does your system lack ``/tf``?
-    :icon: alert
-
-    By default, MOLA-LO will try to use ``tf2`` messages to find out the relative pose
-    of the LiDAR sensor with respect to the vehicle frame (default: ``base_link``). If your system **does not** have ``tf`` data
-    (for example, if you only launched the LiDAR driver node) you must then set the environment variable ``MOLA_USE_FIXED_LIDAR_POSE=true``
-    to use the default (identity) sensor pose on the vehicle.
+.. _ros2_node_lo_docs:
 
 3.1. ROS 2 launch file: live LiDAR odometry
 --------------------------------------------------
-It is documented :ref:`here <ros2_node_lo_docs>`.
+
+.. include:: ../../../mola_lidar_odometry/docs/mola_lo_ros_node.rst
 
 |
 
 3.2. ROS 2 launch file: LiDAR odometry for KITTI
 --------------------------------------------------
 
-This demo launch file (`view sources <https://github.com/MOLAorg/mola_lidar_odometry/blob/develop/ros2-launchs/kitti-ros2-lidar-odometry.launch.py>`_)
+This demo launch file (`view sources <https://github.com/MOLAorg/mola_lidar_odometry/blob/develop/ros2-launchs/kitti-ros2-lidar-odometry.launch.py>`__)
 runs **MOLA-LO** on a sequence of the KITTI odometry dataset :cite:`geiger2013vision`, 
 **demonstrating a few features**:
 
@@ -597,8 +466,10 @@ runs **MOLA-LO** on a sequence of the KITTI odometry dataset :cite:`geiger2013vi
 ====================================
 4. Running from ROS 1 bags
 ====================================
-ROS 1 bags are not directly supported by MOLA-LO. However, given the large amount of public datasets
-already published in this format, we provide two pathways to parse them.
+ROS 1 bags (``.bag``) are read directly, with no ROS 1 installation needed, by
+``mola-lo-gui-rosbag1`` and ``mola-lo-cli-rosbag1``, or by ``mola-lidar-odometry-cli --input-rosbag1``.
+Several bags can be given at once, and are replayed jointly as one merged stream.
+See :ref:`dataset_rosbag1`.
 
-- Porting to ROS 2 bags:  :ref:`ros1_to_ros2`.
-- Converting to MRPT rawlog: :ref:`rosbag2rawlog`
+They can also be converted, e.g. to use other tools: to ROS 2 bags (:ref:`ros1_to_ros2`)
+or to MRPT rawlogs (:ref:`rosbag2rawlog`, ROS 1 version).

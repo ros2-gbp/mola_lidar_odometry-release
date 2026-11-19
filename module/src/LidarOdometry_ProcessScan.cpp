@@ -42,6 +42,8 @@
 #include <mrpt/obs/CObservationVelodyneScan.h>
 #include <mrpt/poses/Lie/SO.h>
 
+// Eigen (CMatrixFixed::asEigen() products):
+#include <Eigen/Dense>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -1019,7 +1021,14 @@ void LidarOdometry::processLidarScan(  // NOLINT
   if (hasMotionModel) {
     const auto & tw = state_.last_motion_model_output->twist;
     const double speed = std::sqrt(tw.vx * tw.vx + tw.vy * tw.vy + tw.vz * tw.vz);
-    if (!motionModelIsPlausible(mrpt::Clock::toDouble(scan_ref_time), speed)) {
+    const double scanTime = mrpt::Clock::toDouble(scan_ref_time);
+    if (motionModelIsTooFast(scanTime, speed)) {
+      hasMotionModel = false;
+      state_.last_motion_model_output.reset();
+      resetNavStateMotion();
+      restartPlausibilityCheck();
+      state_.motion_model_implausible++;
+    } else if (!motionModelIsPlausible(scanTime, speed)) {
       hasMotionModel = false;
       state_.last_motion_model_output.reset();
       resetNavStateMotion();
@@ -1123,6 +1132,13 @@ void LidarOdometry::processLidarScan(  // NOLINT
           "(pathStep=%zu, timestamp=%s UTC)",
           state_.estimated_trajectory.size(), mrpt::system::dateTimeToString(this_obs_tim).c_str());
       }
+    }
+
+    // Rotation since the last registered pose, from the gyroscope:
+    if (
+      params_.gyro_rotation_prior.enabled && state_.last_lidar_pose_stamp.has_value() &&
+      state_.step_counter_post_relocalization == 0) {
+      applyGyroRotationPrior(in, mrpt::Clock::toDouble(scan_ref_time));
     }
 
     // Apply the IMU verticality constraint as a yaw-free, rank-2 observation
@@ -1602,6 +1618,7 @@ void LidarOdometry::processLidarScan(  // NOLINT
     if (icpIsGood) {
       state_.last_lidar_pose = out.found_pose_to_wrt_from;
       state_.last_lidar_pose_stamp = mrpt::Clock::toDouble(scan_ref_time);
+      state_.last_registered_lidar_pose = state_.last_lidar_pose.mean;
     } else if (usePrediction) {
       state_.last_lidar_pose.copyFrom(state_.last_motion_model_output->pose);
       state_.last_lidar_pose_stamp = mrpt::Clock::toDouble(scan_ref_time);
@@ -2170,6 +2187,7 @@ void LidarOdometry::startMapAtFirstScan(
   // spuriously fire a second keyframe on the very next scan):
   state_.last_lidar_pose = initPose;
   state_.last_lidar_pose_stamp = mrpt::Clock::toDouble(scan_ref_time);
+  state_.last_registered_lidar_pose = state_.last_lidar_pose.mean;
   if (!state_.kf_decider_simplemap) {
     state_.kf_decider_simplemap.emplace(params_.simplemap);
   }
@@ -2207,6 +2225,100 @@ void LidarOdometry::restartLocalMapFromScratch()
   }
 
   MRPT_LOG_WARN("Bad first ICP, re-starting from scratch with a new local map");
+}
+
+std::optional<mrpt::math::CMatrixDouble33> LidarOdometry::gyroAttitudeAtLocked(const double t) const
+{
+  const auto & buf = state_.gyro_attitude;
+  if (
+    buf.empty() || t < buf.front().stamp ||
+    t > buf.back().stamp + params_.gyro_rotation_prior.max_reading_gap) {
+    return std::nullopt;
+  }
+  auto it = std::upper_bound(
+    buf.begin(), buf.end(), t,
+    [](const double tt, const MethodState::GyroAttitude & g) { return tt < g.stamp; });
+  --it;
+  const double dt = t - it->stamp;
+  mrpt::math::CVectorFixedDouble<3> v;
+  v[0] = it->w.x * dt;
+  v[1] = it->w.y * dt;
+  v[2] = it->w.z * dt;
+  return it->R * mrpt::poses::Lie::SO<3>::exp(v);
+}
+
+void LidarOdometry::applyGyroRotationPrior(ICP_Input & in, const double scanTime)
+{
+  const auto & gp = params_.gyro_rotation_prior;
+  const double t0 = *state_.last_lidar_pose_stamp;
+  const double dt = scanTime - t0;
+  if (dt <= 0 || dt > gp.max_interval) {
+    return;
+  }
+  std::optional<mrpt::math::CMatrixDouble33> R0;
+  std::optional<mrpt::math::CMatrixDouble33> R1;
+  {
+    auto lckImu = mrpt::lockHelper(imu_state_mtx_);
+    R0 = gyroAttitudeAtLocked(t0);
+    R1 = gyroAttitudeAtLocked(scanTime);
+  }
+  if (!R0 || !R1) {
+    return;
+  }
+
+  // Rotation: last registered pose plus the gyroscope rotation since then.
+  // Translation: the motion model's (or the last pose's), as already guessed.
+  const mrpt::math::CMatrixDouble33 R(
+    state_.last_lidar_pose.mean.getRotationMatrix().asEigen() * R0->asEigen().transpose() *
+    R1->asEigen());
+  mrpt::poses::CPose3D mean(in.init_guess_local_wrt_global);
+  mean.setRotationMatrix(R);
+  in.init_guess_local_wrt_global = mean.asTPose();
+
+  if (!in.prior.has_value()) {
+    in.prior.emplace();
+    in.prior->mean = mean;
+    in.prior->cov_inv = mrpt::math::CMatrixDouble66::Zero();
+  } else {
+    set_icp_prior_mean(*in.prior, mean);
+  }
+
+  // Rotation block of the information, in the SE(3) tangent of the mean
+  // (indices 3-5, see IcpPrior.h), replaced by the gyroscope's:
+  const double sigma = mrpt::DEG2RAD(gp.sigma_deg + gp.sigma_deg_per_s * dt);
+  for (int i = 0; i < 6; i++) {
+    for (int j = 3; j < 6; j++) {
+      in.prior->cov_inv(i, j) = 0;
+      in.prior->cov_inv(j, i) = 0;
+    }
+  }
+  for (int j = 3; j < 6; j++) {
+    in.prior->cov_inv(j, j) = 1.0 / (sigma * sigma);
+  }
+}
+
+bool LidarOdometry::motionModelIsTooFast(const double scanTime, const double predictedSpeed)
+{
+  const double maxSpeed = params_.motion_model_max_speed;
+  if (maxSpeed <= 0) {
+    return false;
+  }
+  // The speed of the prediction, and the one implied by its pose since the last pose:
+  double impliedSpeed = 0;
+  if (state_.last_lidar_pose_stamp && scanTime > *state_.last_lidar_pose_stamp) {
+    const auto & predicted = state_.last_motion_model_output->pose.mean;
+    const double step =
+      (predicted.translation() - state_.last_lidar_pose.mean.translation()).norm();
+    impliedSpeed = step / (scanTime - *state_.last_lidar_pose_stamp);
+  }
+  if (predictedSpeed <= maxSpeed && impliedSpeed <= maxSpeed) {
+    return false;
+  }
+  MRPT_LOG_WARN_FMT(
+    "Not using the state estimator prediction, and resetting it: its speed (%.2f m/s, or %.2f "
+    "m/s from its pose) exceeds motion_model_max_speed (%.1f m/s)",
+    predictedSpeed, impliedSpeed, maxSpeed);
+  return true;
 }
 
 bool LidarOdometry::motionModelIsPlausible(const double scanTime, const double predictedSpeed)
@@ -2316,7 +2428,7 @@ void LidarOdometry::recoverFromStall()
 {
   MRPT_LOG_WARN_FMT(
     "Registration stalled for %u scans without a usable prediction: restarting the local map "
-    "at the last pose and resetting the state estimator",
+    "at the last registered pose and resetting the state estimator",
     state_.consecutive_stalled_scans);
 
 #if defined(MOLA_LO_HAS_LOCAL_MAP_REBUILD)
@@ -2326,9 +2438,10 @@ void LidarOdometry::recoverFromStall()
     auto lckMapContents = mrpt::lockHelper(local_map_content_mtx_);
     state_.local_map->clear();
   }
-  // The next scan starts the new map at this pose, as a first scan does. The
-  // trajectory is kept:
-  state_.initial_pose = state_.last_lidar_pose.mean;
+  // The next scan starts the new map at the last registered pose, as a first
+  // scan does: poses since then came from predictions, which may have run
+  // away. The trajectory is kept:
+  state_.initial_pose = state_.last_registered_lidar_pose.value_or(state_.last_lidar_pose.mean);
   state_.kf_decider_local_map.reset();
 
   // The estimator may hold a diverged state. The trajectory goes on in the
