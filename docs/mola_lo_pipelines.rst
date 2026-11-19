@@ -21,7 +21,7 @@ The best way to understand the different parts of this file is to browse the YAM
 provided for 3D LiDARs. Most of the times, comments in the YAML are self-explanatory.
 The 3D pipeline files are short: each one lists the :ref:`pipeline blocks <mola_lo_pipeline_blocks>` it is made of,
 and each block holds one part of the configuration (sensor inputs, ICP, local map, ...).
-In case of doubts, do not hesitate in `opening an issue <https://github.com/MOLAorg/mola/issues>`_ to ask.
+In case of doubts, do not hesitate to `open an issue <https://github.com/MOLAorg/mola/issues>`_ to ask.
 
 .. note::
 
@@ -37,7 +37,7 @@ In case of doubts, do not hesitate in `opening an issue <https://github.com/MOLA
 .. dropdown:: Specifying the pipeline file in MOLA-LO apps
    :icon: checklist
 
-   All MOLA-LO :ref:`GUI applications <mola_lo_apps>` defaults to using the symlink `lidar3d-default.yaml` which at presents
+   All MOLA-LO :ref:`GUI applications <mola_lo_apps>` default to the symlink ``lidar3d-default.yaml``, which at present
    points to the :ref:`3D LiDAR GICP pipeline <mola_3d_gicp_pipeline>`
    defined below. To use the alternative 2D pipeline or any other custom pipeline, please set the corresponding environment
    variable before invoking the :ref:`GUI application <mola_lo_apps>` (or derive your own script by copying and modifying the provided ones).
@@ -46,12 +46,13 @@ In case of doubts, do not hesitate in `opening an issue <https://github.com/MOLA
    .. code-block:: bash
 
       # Example using the 3D-NDT alternative pipeline:
-      PIPELINE_YAML=$(ros2 pkg prefix mola_lidar_odometry)/share/mola_lidar_odometry/pipelines/lidar3d-ndt.yaml \
+      MOLA_ODOMETRY_PIPELINE_YAML=$(ros2 pkg prefix mola_lidar_odometry)/share/mola_lidar_odometry/pipelines/lidar3d-ndt.yaml \
       MOLA_LOCAL_VOXELMAP_RESOLUTION=5.0 \
-      mola-lo-gui-rosbag  # [...]
+      mola-lo-gui-rosbag2  # [...]
 
-   If you use the `CLI interface <mola_lidar_odometry_cli>`_ instead, the pipeline file to use needs to be always explicitly
-   specified, there is none by default.
+   The ``mola-lo-cli-*`` wrappers use the same default and variable. If you call the
+   :ref:`CLI interface <mola_lidar_odometry_cli>` directly instead, the pipeline file must always be
+   given with ``-c``: there is none by default.
 
 
 |
@@ -101,10 +102,10 @@ ____________________________________________
 
 1. Generalized ICP (GICP) pipeline for 3D LiDAR (``lidar3d-gicp.yaml``)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-As of Oct 2025, this is the **default and recommended configuration** for most common sensor setups and environments.
+This is the **default and recommended configuration** for most common sensor setups and environments.
 
-A peer-reviewed paper describing this pipeline is in preparation, but very briefly, this pipeline defines a
-local map based on key-frames of point clouds, and exploits the Generalized ICP algorithm :cite:`segal2009gicp`.
+This pipeline keeps a local point cloud map around the vehicle (see :ref:`gicp_localmap_class` below), and exploits the
+Generalized ICP algorithm :cite:`segal2009gicp`.
 
 .. image:: https://mrpt.github.io/imgs/MOLA_LIO_Oxford_Spires_stairs.gif
 
@@ -212,7 +213,7 @@ ____________________________________________
 2. ICP pipeline for 3D LiDAR (``lidar3d-icp.yaml``)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 This was the **reference configuration** used for most examples in the MOLA-LO paper :cite:`blanco2025mola_lo`,
-and should work great out of the box for most common situations; although as of Oct 2025, the newer pipeline :ref:`lidar3d-gicp.yaml <mola_3d_gicp_pipeline>`
+and should work great out of the box for most common situations, although the newer pipeline :ref:`lidar3d-gicp.yaml <mola_3d_gicp_pipeline>`
 is now the default and recommended in general.
 
 As described in the paper :cite:`blanco2025mola_lo`, this pipeline defines a **voxel-based 3D point-cloud local map**,
@@ -288,7 +289,7 @@ ____________________________________________
 This alternative configuration uses an **occupancy voxel map** instead of point clouds
 as local map, and performs **ray-tracing** to accumulate evidence about the freeness
 or occupancy of voxels from 2D LiDAR scans.
-If it recommended to use wheels-based odometry to help the mapping process.
+It is recommended to use wheel odometry to help the mapping process.
 
 .. image:: https://mrpt.github.io/imgs/lidar2d-radish-demo.gif
 
@@ -658,8 +659,18 @@ extrinsics, and derives pitch and roll from the gravity direction.
 Sensor inputs: Wheels odometry (optional)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-- ``MOLA_ODOMETRY_NAME`` (Default: ``wheel_odom``): **Sensor label** (or regex) of the observations
-  with wheels odometry, if it exists.
+Wheel (or other) odometry readings are fused by the state estimator, not by the pipeline. The shipped
+launch files forward them under the **sensor label** ``MOLA_ODOM_SENSOR_LABEL`` (default ``odom_wheels``).
+The pipeline itself only uses an odometry label in these optional features:
+
+- ``MOLA_DESKEW_ODOMETRY_NAME`` (Default: empty, disabled): **Sensor label** of an odometry source (e.g. leg
+  or wheel odometry) whose velocity is used to de-skew each sweep, instead of the state estimator's.
+
+- ``MOLA_ODOM_VERTICALITY`` (Default: ``false``): use the attitude of an odometry source as a pitch/roll
+  constraint of the ICP prior, with ``MOLA_ODOM_VERTICALITY_LABEL`` (Default: ``odom_wheels``),
+  ``MOLA_ODOM_VERTICALITY_SIGMA_DEG`` (Default: ``1.0``) and ``MOLA_ODOM_VERTICALITY_MAX_AGE``
+  (Default: ``0.5`` [s]). That source must provide a full 3D pose (``nav_msgs/Odometry`` forwarded as a
+  robot pose), since planar odometry has no pitch or roll.
 
 Sensor inputs: GPS (GNSS) (optional)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -987,7 +998,14 @@ They have no effect on the ICP or NDT pipelines.
   ``mola::IncrementalPointCloud``: that map keeps the whole area around the robot, where ``MaxAngle`` also rejects
   the same surface seen from very different azimuths (e.g. ground), and it measured consistently worse there on
   hand-held sequences. ``SurfaceSide`` only rejects a pair when the matched point's neighborhood is actually flat
-  and both views are clearly (more than ~14.5 deg) off its plane.
+  and both views are clearly (more than ~14.5 deg) off its plane. ``ViewDirectionFilter::SurfaceSideGravityAligned``
+  (opt-in) is ``SurfaceSide`` except on near-horizontal surfaces (tilt under ~26 deg): when both views are steeper
+  than the surface's tilt by ~1.7 deg, the side of each one is the sign of its vertical component, even within the
+  ~14.5 deg where ``SurfaceSide`` does not judge. The top face of a floor slab seen at grazing incidence (e.g. from
+  the top of a staircase) is then not paired with its underside, mapped from below. Views closer to a sloped surface
+  than that fall back to ``SurfaceSide``. It needs a map frame whose +z axis points up, as with an IMU; in a tilted
+  map frame it could reject the same face seen at grazing incidence. It also needs a ``mola_metric_maps`` version
+  that has this mode: older ones reject the value, and cannot load maps saved with it.
 
 - ``MOLA_LOCALMAP_VIEW_DIRECTION_FILTER_ANGLE_DEG`` (Default: ``120`` [deg]): Maximum angle between the view
   directions of a pair, for ``ViewDirectionFilter::MaxAngle`` only.
