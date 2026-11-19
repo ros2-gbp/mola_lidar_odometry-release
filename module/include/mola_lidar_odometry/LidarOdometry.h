@@ -1233,10 +1233,17 @@ public:
      * Needs an IMU; 0 disables the check. */
     double motion_model_max_extra_acceleration = 10.0;
 
+    /** [m/s] A state estimator prediction faster than this, or whose pose is
+     * farther from the last pose than this speed allows, is never used, not
+     * even while the estimator settles after a start or reset; the estimator
+     * is reset. 0 disables it. */
+    double motion_model_max_speed = 100.0;
+
     /** Recovery from a stall: registration failed and the state estimator gave
      * no usable prediction, so the pose cannot move. After `after_n_scans` such
-     * consecutive scans, the local map restarts at the last pose and the state
-     * estimator is reset, so registration resumes. Never applied to a loaded
+     * consecutive scans, the local map restarts at the last registered pose
+     * (the last good ICP, or the start of the map) and the state estimator is
+     * reset, so registration resumes. Never applied to a loaded
      * map or with local map updates disabled. */
     struct StallRecovery
     {
@@ -1246,6 +1253,30 @@ public:
       void initialize(const Yaml & cfg);
     };
     StallRecovery stall_recovery;
+
+    /** ICP pose prior rotation from the gyroscope: the last registered pose
+     * rotated by the gyroscope rotation since then, with sigma `sigma_deg` plus
+     * `sigma_deg_per_s` times the interval (gyroscope bias). It replaces the
+     * rotation part of the motion-model prior, whose information is the
+     * absolute uncertainty of the predicted pose (a tie-breaker against the
+     * pairings). This relative one constrains the rotations the scene does not
+     * (e.g. yaw with few distinctive structures in view, where ICP slides and
+     * the slide enters the local map), while the pairings still win where the
+     * scene is well conditioned. Needs an IMU with angular velocity; off by
+     * default. */
+    struct GyroRotationPrior
+    {
+      bool enabled = true;
+      double sigma_deg = 0.05;
+      double sigma_deg_per_s = 0.5;
+      /// [s] A larger gap between gyroscope readings restarts the integration.
+      double max_reading_gap = 0.1;
+      /// [s] Longest interval since the last registered pose to use it.
+      double max_interval = 2.0;
+
+      void initialize(const Yaml & cfg);
+    };
+    GyroRotationPrior gyro_rotation_prior;
 
     /** When publishing pose updates, the reference frame for both, estimated robot poses, and the local map.*/
     std::string publish_reference_frame = "odom";
@@ -1662,6 +1693,10 @@ private:
 
     mrpt::poses::CPose3DPDFGaussian last_lidar_pose;  //!< in local map
 
+    /// The last pose registered by a good ICP, or where the map started: the
+    /// stall recovery restarts here, not at a pose that came from predictions.
+    std::optional<mrpt::poses::CPose3D> last_registered_lidar_pose;
+
     /// The instant `last_lidar_pose` refers to [s], if known (the reference
     /// time of the scan it was registered or predicted for).
     std::optional<double> last_lidar_pose_stamp;
@@ -1750,6 +1785,17 @@ private:
     };
     /// Recent IMU specific forces. Protected by imu_state_mtx_.
     std::deque<SpecificForce> recent_specific_force;
+
+    /// Gyroscope readings integrated into an attitude, in the vehicle frame.
+    struct GyroAttitude
+    {
+      double stamp = 0;               ///< [s]
+      mrpt::math::CMatrixDouble33 R;  ///< attitude since the integration start
+      mrpt::math::TVector3D w;        ///< [rad/s] angular velocity
+    };
+    /// Recent integrated gyroscope attitudes (Parameters::gyro_rotation_prior),
+    /// cleared on a gap. Protected by imu_state_mtx_.
+    std::deque<GyroAttitude> gyro_attitude;
 
     /// Run totals, reported once at shutdown. `registration_no_motion_model` is
     /// the one that had no aggregate before: the front end already logs a
@@ -2413,9 +2459,26 @@ private:
   /// empty-map start. Caller must hold state_mtx_.
   void restartLocalMapFromScratch();
 
+  /// Whether the prediction (last_motion_model_output) moves faster than
+  /// motion_model_max_speed, by its twist or its pose. Caller must hold state_mtx_.
+  bool motionModelIsTooFast(double scanTime, double predictedSpeed);
+
   /// Whether the change of the predicted speed since the previous scan agrees
   /// with the IMU. Caller must hold state_mtx_.
   bool motionModelIsPlausible(double scanTime, double predictedSpeed);
+
+  /** Gyroscope attitude at `t` (MethodState::gyro_attitude), or nothing if the
+   * readings do not cover it. Caller holds imu_state_mtx_. */
+  std::optional<mrpt::math::CMatrixDouble33> gyroAttitudeAtLocked(double t) const;
+
+  /** Parameters::gyro_rotation_prior: sets the rotation of the ICP
+   * initial guess and prior from the last registered pose and the gyroscope.
+   * Caller holds state_mtx_. */
+  void applyGyroRotationPrior(ICP_Input & in, double scanTime);
+
+  /** Integrates one (bias corrected) gyroscope reading into
+   * MethodState::gyro_attitude. Caller holds imu_state_mtx_. */
+  void integrateGyroAttitude(const mrpt::obs::CObservationIMU & imu);
 
   /// Restarts the local map at the current pose and resets the state
   /// estimator, keeping the trajectory. Caller must hold state_mtx_.
