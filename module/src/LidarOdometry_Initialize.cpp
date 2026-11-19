@@ -234,6 +234,7 @@ void LidarOdometry::initialize_frontend(const Yaml & c)
     YAML_LOAD_OPT(params_, imu_queue_max_size, uint32_t);
     YAML_LOAD_OPT(params_, min_motion_model_xyz_cov_inv, double);
     YAML_LOAD_OPT(params_, motion_model_max_extra_acceleration, double);
+    YAML_LOAD_OPT(params_, motion_model_max_speed, double);
 
     YAML_LOAD_OPT(params_, optimize_twist, bool);
     YAML_LOAD_OPT(params_, optimize_twist_rerun_min_trans, double);
@@ -250,6 +251,10 @@ void LidarOdometry::initialize_frontend(const Yaml & c)
 
     if (cfg.has("stall_recovery")) {
       params_.stall_recovery.initialize(cfg["stall_recovery"]);
+    }
+
+    if (cfg.has("gyro_rotation_prior")) {
+      params_.gyro_rotation_prior.initialize(cfg["gyro_rotation_prior"]);
     }
 
     if (cfg.has("diagnostics")) {
