@@ -1,3 +1,26 @@
+## mola_lidar_odometry (lyrical) - 3.6.0-1
+
+The packages in the `mola_lidar_odometry` repository were released into the `lyrical` distro by running `/home/jlblanco/.local/bin/bloom-release --rosdistro lyrical --track lyrical mola_lidar_odometry -y --no-web` on `Thu, 19 Nov 2026 23:45:10 -0000`
+
+The `mola_lidar_odometry` package was released.
+
+Version of package(s) in repository `mola_lidar_odometry`:
+
+- upstream repository: https://github.com/MOLAorg/mola_lidar_odometry.git
+- release repository: https://github.com/ros2-gbp/mola_lidar_odometry-release.git
+- rosdistro version: `3.5.0-1`
+- old version: `3.5.0-1`
+- new version: `3.6.0-1`
+
+Versions of tools used:
+
+- bloom version: `0.14.4`
+- catkin_pkg version: `1.1.1`
+- rosdep version: `0.27.0`
+- rosdistro version: `1.1.0`
+- vcstools version: `0.1.42`
+
+
 ## mola_lidar_odometry (jazzy) - 3.6.0-1
 
 The packages in the `mola_lidar_odometry` repository were released into the `jazzy` distro by running `/home/jlblanco/.local/bin/bloom-release --rosdistro jazzy --track jazzy mola_lidar_odometry -y --no-web` on `Thu, 19 Nov 2026 23:44:01 -0000`
