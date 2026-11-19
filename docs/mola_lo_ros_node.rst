@@ -1,10 +1,10 @@
-.. This file becomes embedded into root MOLA / ROS2API docs page, within the MOLA-LO node docs:
+.. This file is included from mola_lo_apps.rst (section: ROS 2 node).
 
 .. note::
 
    It is recommended to start with the tutorial on how to :ref:`build a map <building-maps>`.
 
-This launch file (`view sources <https://github.com/MOLAorg/mola_lidar_odometry/blob/develop/ros2-launchs/ros2-lidar-odometry.launch.py>`_)
+This launch file (`view sources <https://github.com/MOLAorg/mola_lidar_odometry/blob/develop/ros2-launchs/ros2-lidar-odometry.launch.py>`__)
 runs **MOLA-LO** live on point clouds received from a ROS 2 topic, **demonstrating a few features**:
 
 .. tip::
@@ -25,9 +25,11 @@ runs **MOLA-LO** live on point clouds received from a ROS 2 topic, **demonstrati
 
       .. code-block:: bash
 
-         # Minimal LO use case (requires correct LiDAR sensor /tf):
+         # Minimal LO use case (requires correct LiDAR sensor /tf), without
+         # wheel odometry, so map -> base_link is published (no "odom" frame):
          ros2 launch mola_lidar_odometry ros2-lidar-odometry.launch.py \
-            lidar_topic_name:=ouster/points
+            lidar_topic_name:=ouster/points \
+            publish_localization_following_rep105:=False
 
          # LO usage without sensor /tf:
          ros2 launch mola_lidar_odometry ros2-lidar-odometry.launch.py \
@@ -47,7 +49,8 @@ runs **MOLA-LO** live on point clouds received from a ROS 2 topic, **demonstrati
            mola_deskew_method:=MotionCompensationMethod::IMU \
            lidar_topic_name:=/ouster/points \
            imu_topic_name:=/ouster/imu \
-           mola_tf_base_link:=os_sensor
+           mola_tf_base_link:=os_sensor \
+           publish_localization_following_rep105:=False
 
    .. tab-item:: LIO usage (No /tf)
 
@@ -125,7 +128,7 @@ runs **MOLA-LO** live on point clouds received from a ROS 2 topic, **demonstrati
     To play a bag through the ROS 2 launch file with correct simulated time, use the
     ``use_sim_time:=true`` argument together with ``ros2 bag play --clock``.
     See the **Rosbag playback** tab above for the full example.
-    Note however than MOLA-LO GUI apps can directly read rosbags
+    Note however that MOLA-LO GUI apps can directly read rosbags
     without the need to replay them.
 
     .. code-block:: bash
@@ -248,6 +251,12 @@ runs **MOLA-LO** live on point clouds received from a ROS 2 topic, **demonstrati
       (default), the pipeline YAML fallback is used (``FixedPose``) and
       ``gnss_mode:=relocalize`` may switch it to ``FromStateEstimator``.
 
+    * ``initial_pose`` (default ``""``):
+      Known initial pose for ``InitLocalization::FixedPose``, as
+      ``"[x, y, z, yaw_deg, pitch_deg, roll_deg]"`` in the frame of the loaded map. If empty
+      (default), the pipeline YAML fallback is used (the origin, or ``MOLA_INITIAL_X``, ``_Y``,
+      ``_Z``, ``_YAW``, ``_PITCH``, ``_ROLL``).
+
     * ``lidar_scan_validity_minimum_point_count`` (default ``100``):
       Minimum number of points required in an incoming LiDAR scan for it to be processed;
       scans below this threshold are discarded.
@@ -258,6 +267,12 @@ runs **MOLA-LO** live on point clouds received from a ROS 2 topic, **demonstrati
 
     * ``lidar_topic_type`` (default ``PointCloud2``):
       The type of LiDAR topic to subscribe to. Options: ``PointCloud2`` or ``LaserScan``.
+
+    * ``localization_publish_tf_source`` (default ``""``):
+      Which localization source (``method``) is published to ``/tf``. If empty (default),
+      ``state_estimation`` with ``use_state_estimator:=True``, else ``lidar_odometry``.
+      With the smoother publishing ``map → odom`` itself (``MOLA_PUBLISH_MAP_TO_ODOM_TF=true``),
+      set it to ``state_estimation/map_odom``.
 
     * ``mola_bridge_odometry_frame`` (default ``odom``):
       BridgeROS2's odom ``/tf`` frame name (the REP-105 "odom" child or the parent of
@@ -280,7 +295,9 @@ runs **MOLA-LO** live on point clouds received from a ROS 2 topic, **demonstrati
       Optional path to a keyframes ``.simplemap`` file to load.
 
     * ``mola_lo_pipeline`` (default ``../pipelines/lidar3d-default.yaml``):
-      The LO pipeline configuration YAML file.
+      The LO pipeline configuration YAML file. A relative path is relative to the
+      installed ``share/mola_lidar_odometry/mola-cli-launchs/`` directory, so the
+      provided pipelines can be given as ``../pipelines/<name>.yaml``.
 
     * ``mola_lo_reference_frame`` (default ``map``):
       Parent ``/tf`` frame of the localization update emitted by MOLA-LO (the
@@ -321,7 +338,10 @@ runs **MOLA-LO** live on point clouds received from a ROS 2 topic, **demonstrati
 
     * ``publish_localization_following_rep105`` (default ``True``):
       Whether the bridge publishes localization TFs as ``map → odom`` (REP-105, true)
-      or directly ``map → base_link`` (false). REP-105 is incompatible with the smoother.
+      or directly ``map → base_link`` (false). REP-105 needs an ``odom → base_link`` from
+      another source (e.g. wheel odometry): set it to ``false`` if there is none. Recent bridge
+      versions fall back to ``map → base_link`` when no ``odom`` frame appears within a few
+      seconds. It works with both state estimators.
 
     * ``start_active`` (default ``True``):
       Whether MOLA-LO starts active (processing incoming sensor data) or idle.
@@ -362,6 +382,10 @@ runs **MOLA-LO** live on point clouds received from a ROS 2 topic, **demonstrati
 
     * ``use_namespace`` (default ``false``):
       Whether to apply ``namespace`` to the MOLA stack (remaps ``/tf`` and ``/tf_static``).
+
+    * ``use_namespaced_tf`` (default ``true``):
+      With ``use_namespace:=True``, whether ``/tf`` and ``/tf_static`` are also namespaced.
+      Set it to ``false`` for namespaced sensor topics with global ``/tf`` and ``/tf_static``.
 
     * ``use_rviz`` (default ``True``):
       Whether to launch RViz2 with the default ``lidar-odometry.rviz`` configuration.

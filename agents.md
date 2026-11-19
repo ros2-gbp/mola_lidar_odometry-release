@@ -506,7 +506,7 @@ otherwise the tree does not connect (tf2 "two unconnected trees"). LO's own pose
 are fed under `MOLA_LO_PUBLISH_REF_FRAME` (default `map`), so they do not create
 a separate odom source.
 
-## SharedKeyframeMap sink (central-map keyframe push, e.g. mola_mapper_3d)
+## SharedKeyframeMap sink (central-map keyframe push, e.g. mola_mapper)
 
 Separately from the dense `navstate_fuse` querying above, `LidarOdometry`
 optionally detects a `mola::SharedKeyframeMap` sink at init
@@ -530,11 +530,10 @@ distinct from `publish_reference_frame` (the frame the dense, every-scan
 anchor-once tie collide with the dense path's tie on the same
 (relocalization-seeded) keyframe, which threw
 `gtsam::IndeterminantLinearSystemException` at startup in real testing
-against KITTI through `mola_mapper_3d`'s
-`mola-cli-launchs/lidar_odometry_mapper3d_from_kitti.yaml`. See that
-package's agents.md ("Real end-to-end validation lessons") for the full list
-of bugs this integration surfaced, several of which were in `mola_mapper_3d`,
-not here -- but two structural changes live in this file:
+against KITTI through `mola_mapper`'s
+`mola-cli-launchs/lio_smoother_mapper_from_kitti.yaml`. Several of the bugs
+this integration surfaced were in `mola_mapper`, not here -- but two
+structural changes live in this file:
 `pushKeyframeToSharedKeyframeMap()`'s dedicated frame name, and the
 distance-checker `insert()` gating fix mentioned above.
 
@@ -729,9 +728,15 @@ the pose freezes for the rest of the run. Two guards, both in
   gravity removed), within `motion_model_max_extra_acceleration` times the
   interval; else the prediction is not used and the estimator is reset. Not
   checked for 1 s after a start or reset, while the estimator settles.
+- `motionModelIsTooFast()`: a prediction faster than `motion_model_max_speed`
+  (its twist, or its pose since the last pose) is rejected always, settling
+  included (a smoother started while moving predicted 3600 m/s within that
+  second; ICP failed and the pose followed the prediction for 700 m).
 - `recoverFromStall()`: after `stall_recovery.after_n_scans` scans with neither
-  a good ICP nor a prediction, the local map restarts at the last pose (the next
-  scan seeds it, through the first-scan path) and the estimator is reset.
+  a good ICP nor a prediction, the local map restarts at the last registered
+  pose (`last_registered_lidar_pose`: a good ICP or the map start, not a pose
+  from predictions; the next scan seeds it, through the first-scan path) and
+  the estimator is reset.
 
 Both reset the estimator: a diverged smoother does not recover on its own.
 They call `resetNavStateMotion()`, i.e. `reset_motion()` where `mola_kernel` has
@@ -747,6 +752,31 @@ Measured alternatives that failed: a bound from |f| + g alone (a slower runaway
 grew to 15 m/s under it), and comparing with the speed of the last registered
 poses instead of the previous prediction (registration jitter on flat surfaces
 flagged correct predictions).
+
+## Gyroscope rotation prior for ICP (`gyro_rotation_prior`)
+
+The motion-model ICP prior carries the estimator's ABSOLUTE pose uncertainty in
+the map frame (centimeters to meters, degrees), so it is one tie-breaking
+residual against thousands of pairings. Where the scene does not constrain a
+rotation (yaw with few distinctive structures in view) ICP slides, and the slide
+enters the local map, which then agrees with the next wrong registrations. With
+`gyro_rotation_prior.enabled` (`pipelines/blocks/acceptance.yaml`, on by
+default; inert without IMU readings), `consumePendingImu()` integrates the bias-corrected gyroscope, in the
+vehicle frame, into `state_.gyro_attitude` (restarted on reading gaps), and
+`applyGyroRotationPrior()` sets the rotation of the ICP initial guess and prior
+to the last registered pose times the gyroscope rotation since then, replacing
+the rotation block of the prior information with `1/sigma^2`, sigma = `sigma_deg`
++ `sigma_deg_per_s` * interval (uncorrected bias). Translation stays the motion
+model's. Not applied in the post-relocalization window.
+Ground robot, map-less, smoother with gyro-only preintegration: a 100 s yaw slide
+(-71 deg online) went from 27.5 m to 4.1 m max error, heading p90 42 -> 5 deg; a
+run without degeneracy unchanged. Default-on check: Oxford Spires 13 sequences x 3
+starts APE geomean 0.98-0.99 (simple and smoother; it also removed one divergent
+run), GrandTour 10 missions neutral (0.998 / 1.004).
+Refusing whole registrations on a LIO vs gyro
+disagreement instead was tried and dropped: a sliding window only bounds the
+drift rate, longer ones need the gyro bias first, and without a gyro-aware
+estimator the kept prediction has a wheel-odometry heading.
 
 ## Per-point time outliers (`point_time_outliers`, `PointTimeOutlierFilter`)
 
@@ -1431,6 +1461,7 @@ pipeline YAML, not read directly in C++.)
 | `MOLA_LO_DEBUG_ICP_QUALITY` | bool | false | `module/src/LidarOdometry_ProcessScan.cpp` | Trace ICP quality metrics per scan |
 | `MOLA_ICP_PRIOR_WEIGHT` | double | 1.0 (no change) | `pipelines/lidar3d-gicp.yaml` | Multiplies the information matrix of the pose prior handed to the ICP solver. The prior is one residual against as many residuals as there are pairings, so at unit weight it breaks ties rather than constraining anything. Raise it where the motion source is worth more than a single point pairing |
 | `MOLA_MAX_REGISTRATION_MAHALANOBIS` | double | 0 (off) | `pipelines/lidar3d-gicp.yaml` | Largest distance, in sigmas of the state estimator's predicted pose covariance, that a registration may sit from that prediction and still be accepted. Only meaningful if the estimator reports an honest covariance: a filter whose covariance is dominated by a constant floor can make the statistic poorly reflect the actual prediction error. A rejection here does not count as a bad ICP, so it cannot trigger the sustained-failure recovery path |
+| `MOLA_GYRO_ROTATION_PRIOR` / `_SIGMA_DEG` / `_SIGMA_DEG_PER_S` | bool / double / double | true / 0.05 / 0.5 | `pipelines/blocks/acceptance.yaml` | ICP prior rotation from the last registered pose and the gyroscope (see "Gyroscope rotation prior for ICP") |
 | `MOLA_LO_REG_GATE_LOG` | string | (empty = off) | `module/src/LidarOdometry_ProcessScan.cpp` | Path to a TSV dump, one row per scan: correction, predicted and ICP sigmas, and the Mahalanobis statistic, for choosing the threshold above from data. Same idiom as `MOLA_LO_MAP_GATE_LOG` |
 | `MOLA_LO_DISABLE_VERSION_CHECK` | bool | false | `module/src/LidarOdometry_Main.cpp` | Skips the daily online check for a newer release. Set in CI, so test coverage does not depend on network timing |
 | `MOLA_DROP_STALE_SCANS` | bool | true | all `pipelines/*.yaml` | false = lossless input queue (producer blocks instead of the queue evicting the older scan). `mola-lidar-odometry-cli` defaults it to false |
